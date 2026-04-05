@@ -5,9 +5,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import httpx
 import json
+import ast
 import csv
 import os
+import logging
 import time
+import asyncio
 from pathlib import Path
 import re
 import uuid
@@ -17,7 +20,7 @@ from pypdf import PdfReader
 from docx import Document
 from openpyxl import load_workbook
 
-from .budget import build_budget, trim_recent_messages
+from .budget import build_budget, estimate_tokens, trim_recent_messages
 from .store import load_conversation, save_conversation
 from .summarizer import summarize_messages
 from .rag import (
@@ -32,6 +35,7 @@ from .rag import (
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 app = FastAPI(title="Qonduit Memory Gateway")
+logger = logging.getLogger("qonduit.memory_gateway")
 
 
 @app.on_event("startup")
@@ -40,6 +44,10 @@ async def startup() -> None:
 
 
 LLAMA_BASE = "http://192.168.5.5:8080"
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = 10.0
+UPSTREAM_WRITE_TIMEOUT_SECONDS = 60.0
+UPSTREAM_POOL_TIMEOUT_SECONDS = 60.0
+STREAM_KEEPALIVE_INTERVAL_SECONDS = 2.0
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -88,17 +96,25 @@ DEFAULT_SYSTEM_PROMPT = (
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Any
 
 
 class GatewayChatRequest(BaseModel):
-    conversation_id: str
+    conversation_id: str | None = None
     messages: list[ChatMessage]
     model: str
-    context_size: int = Field(default=65536)
+    context_size: int | None = Field(default=None)
     max_tokens: int = Field(default=2048)
     temperature: float = Field(default=0.7)
+    stream: bool = False
+    user: str | None = None
     rag_collection: str | None = None
+
+    model_config = {"extra": "allow"}
+
+    def resolved_context_size(self) -> int:
+        value = self.context_size or 65536
+        return max(value, 1024)
 
 
 class RagIngestRequest(BaseModel):
@@ -125,6 +141,17 @@ class RagCollectionDeleteRequest(BaseModel):
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": "qonduit-memory-gateway"}
+
+
+@app.get("/v1/models")
+@app.get("/models")
+async def list_models() -> dict:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(f"{LLAMA_BASE}/v1/models")
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        data = r.json()
+    return data
 
 
 def get_request_user_id(request: Request) -> str:
@@ -297,7 +324,7 @@ def extract_text_from_file(file_path: str, suffix: str) -> str:
 def latest_user_text(messages: list[ChatMessage]) -> str:
     for msg in reversed(messages):
         if msg.role == "user":
-            return msg.content
+            return coerce_model_content_to_text(msg.content)
     return ""
 
 
@@ -329,6 +356,37 @@ def is_code_edit_request(text: str) -> bool:
     )
 
 
+def unwrap_structured_text_payload(text: str) -> str:
+    raw = text.strip()
+    if not raw.startswith("[") or "text" not in raw:
+        return text
+
+    parsed: Any | None = None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        try:
+            parsed = ast.literal_eval(raw)
+        except Exception:
+            return text
+
+    if not isinstance(parsed, list):
+        return text
+
+    parts: list[str] = []
+    for item in parsed:
+        if isinstance(item, dict):
+            kind = str(item.get("type", "")).lower()
+            if kind in {"text", "input_text"}:
+                value = item.get("text")
+                if isinstance(value, str) and value.strip():
+                    parts.append(value)
+
+    if not parts:
+        return text
+    return "\n".join(parts)
+
+
 def extract_requested_filename(text: str) -> str | None:
     patterns = [
         r"file:\s*([^\n\r]+)",
@@ -345,13 +403,14 @@ def extract_requested_filename(text: str) -> str | None:
 
 
 def extract_inline_file_contents(text: str) -> str:
+    normalized = unwrap_structured_text_payload(text)
     patterns = [
         r"Current file contents:\s*\n(?P<body>.*)$",
         r"Current file:\s*\n(?P<body>.*)$",
         r"<<<FILE\s*\n(?P<body>.*?)\nFILE\s*$",
     ]
     for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        match = re.search(pattern, normalized, flags=re.IGNORECASE | re.DOTALL)
         if match:
             body = match.group("body").strip("\n\r")
             if body.strip():
@@ -360,7 +419,7 @@ def extract_inline_file_contents(text: str) -> str:
 
 
 def extract_code_edit_instruction(text: str) -> str:
-    working = text
+    working = unwrap_structured_text_payload(text)
 
     working = re.sub(
         r"^\s*Code edit request for file:\s*[^\n\r]+\s*",
@@ -436,6 +495,29 @@ def build_code_edit_contract_system_prompt(requested_filename: str | None) -> st
     )
 
 
+def coerce_model_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+            elif isinstance(item, str) and item.strip():
+                parts.append(item)
+        return "\n".join(parts).strip()
+
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+
+    return str(content or "")
+
+
 def extract_json_object(raw: str) -> str | None:
     start = raw.find("{")
     end = raw.rfind("}")
@@ -471,7 +553,47 @@ def normalize_patch_confidence(value: Any) -> str:
     return "low"
 
 
-def parse_code_edit_response(raw: str, requested_filename: str | None) -> dict[str, Any]:
+def extract_fenced_code_block(raw: str) -> str:
+    blocks = re.findall(
+        r"```(?:[a-zA-Z0-9_+\-#.]+)?\s*\n(.*?)```",
+        raw,
+        flags=re.DOTALL,
+    )
+    cleaned_blocks = [block.strip("\n\r") for block in blocks if block.strip()]
+    if not cleaned_blocks:
+        return ""
+
+    cleaned_blocks.sort(key=len, reverse=True)
+    return cleaned_blocks[0]
+
+
+def build_non_json_code_edit_fallback(
+    raw: str,
+    requested_filename: str | None,
+) -> dict[str, Any] | None:
+    recovered = extract_fenced_code_block(raw)
+    if not recovered.strip():
+        return None
+
+    fallback_name = requested_filename or "modified_file.txt"
+    return {
+        "executive_summary": [
+            "Recovered a code-edit result from a non-JSON model response."
+        ],
+        "change_summary": [
+            "The model did not follow the JSON contract, so the gateway extracted "
+            "the largest fenced code block as the modified file content."
+        ],
+        "patch_confidence": "low",
+        "modified_file": {
+            "name": Path(fallback_name).name or "modified_file.txt",
+            "content": recovered,
+        },
+    }
+
+
+def parse_code_edit_response(raw: Any, requested_filename: str | None) -> dict[str, Any]:
+    raw_text = coerce_model_content_to_text(raw)
     default_name = requested_filename or "modified_file.txt"
     default = {
         "executive_summary": [
@@ -487,13 +609,19 @@ def parse_code_edit_response(raw: str, requested_filename: str | None) -> dict[s
         },
     }
 
-    blob = extract_json_object(raw)
+    blob = extract_json_object(raw_text)
     if not blob:
+        recovered = build_non_json_code_edit_fallback(raw_text, requested_filename)
+        if recovered is not None:
+            return recovered
         return default
 
     try:
         parsed = json.loads(blob)
     except Exception:
+        recovered = build_non_json_code_edit_fallback(raw_text, requested_filename)
+        if recovered is not None:
+            return recovered
         return default
 
     executive_summary = normalize_summary_lines(parsed.get("executive_summary"))
@@ -515,6 +643,17 @@ def parse_code_edit_response(raw: str, requested_filename: str | None) -> dict[s
         or parsed.get("modified_file_content")
         or ""
     )
+
+    if not modified_content.strip():
+        recovered_content = extract_fenced_code_block(raw_text)
+        if recovered_content.strip():
+            modified_content = recovered_content
+            if not change_summary:
+                change_summary = [
+                    "Recovered modified file content from a fenced code block "
+                    "because modified_file.content was empty."
+                ]
+            patch_confidence = "low"
 
     if not executive_summary:
         executive_summary = ["Prepared a code-edit response."]
@@ -584,6 +723,119 @@ def split_for_stream(text: str, chunk_size: int = 180) -> list[str]:
         parts.append(text[start:start + chunk_size])
         start += chunk_size
     return parts
+
+
+def strip_markdown_fences(text: str) -> str:
+    trimmed = text.strip()
+    if not trimmed.startswith("```"):
+        return trimmed
+
+    match = re.match(r"^```[^\n]*\n(?P<body>.*)\n```$", trimmed, flags=re.DOTALL)
+    if not match:
+        return trimmed
+    return match.group("body").strip("\n\r")
+
+
+def try_apply_extension_edit_locally(instruction: str, original_file: str) -> str | None:
+    lowered = instruction.lower()
+    if "add" not in lowered or "extension" not in lowered:
+        return None
+
+    ext_match = re.search(r"(\.[a-z0-9_+-]+)", instruction, flags=re.IGNORECASE)
+    if not ext_match:
+        return None
+    extension = ext_match.group(1).lower()
+
+    collection_match = re.search(
+        r"(?P<prefix>\b[A-Z_]*EXTENSIONS\b\s*=\s*)(?P<open>[\[\(\{])(?P<body>.*?)(?P<close>[\]\)\}])",
+        original_file,
+        flags=re.DOTALL,
+    )
+    if not collection_match:
+        return None
+
+    body = collection_match.group("body")
+    if re.search(rf"['\"]{re.escape(extension)}['\"]", body, flags=re.IGNORECASE):
+        return original_file
+
+    quote = "'" if "'" in body else '"'
+    updated_body = body.rstrip()
+    if updated_body and not updated_body.endswith(","):
+        updated_body = f"{updated_body},"
+
+    insertion = f"\n    {quote}{extension}{quote},"
+    replaced = (
+        f"{collection_match.group('prefix')}"
+        f"{collection_match.group('open')}"
+        f"{updated_body}{insertion}\n"
+        f"{collection_match.group('close')}"
+    )
+
+    start, end = collection_match.span()
+    return f"{original_file[:start]}{replaced}{original_file[end:]}"
+
+
+def looks_like_full_file_content(original_file: str, candidate_file: str) -> bool:
+    candidate = candidate_file.strip()
+    if not candidate:
+        return False
+
+    if len(candidate) < max(120, int(len(original_file) * 0.2)):
+        return False
+
+    if "\n" not in candidate and len(original_file) > 400:
+        return False
+
+    return True
+
+
+async def recover_modified_file_with_retry(
+    model: str,
+    requested_filename: str | None,
+    instruction: str,
+    original_file_contents: str,
+) -> str:
+    target_name = requested_filename or "modified_file.txt"
+    retry_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are repairing a failed code-edit response. "
+                "Return only the full updated file contents. "
+                "Do not return JSON. "
+                "Do not return markdown fences. "
+                "Do not explain anything."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Target file: {target_name}\n\n"
+                f"Edit instruction:\n{instruction.strip()}\n\n"
+                "Current file contents:\n"
+                f"{original_file_contents}"
+            ),
+        },
+    ]
+
+    retry_payload = {
+        "model": model,
+        "messages": retry_messages,
+        "max_tokens": 8192,
+        "temperature": 0.0,
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        retry_response = await client.post(
+            f"{LLAMA_BASE}/v1/chat/completions",
+            json=retry_payload,
+        )
+        retry_response.raise_for_status()
+        retry_data = retry_response.json()
+
+    raw_content = str(retry_data["choices"][0]["message"]["content"] or "")
+    return strip_markdown_fences(raw_content)
 
 
 @app.post("/rag/test-ingest")
@@ -742,22 +994,45 @@ async def rag_upload_document(
         raise HTTPException(status_code=500, detail=f"Failed to upload document: {e}")
 
 
+@app.get("/v1/chat/completions")
+@app.get("/chat/completions")
+async def chat_completions_help() -> dict:
+    return {
+        "ok": True,
+        "message": "Use POST /v1/chat/completions (or /chat/completions) with a JSON body.",
+    }
+
+
 @app.post("/v1/chat/completions")
-async def chat(req: GatewayChatRequest, request: Request) -> dict:
+@app.post("/chat/completions")
+async def chat(req: GatewayChatRequest, request: Request) -> Any:
     user_id = get_request_user_id(request)
-    state = load_conversation(req.conversation_id)
+    context_size = req.resolved_context_size()
+    conversation_id = (
+        (req.conversation_id or "").strip()
+        or (request.headers.get("X-Qonduit-Conversation", "").strip())
+        or (req.user or "").strip()
+        or "default"
+    )
+    state = load_conversation(conversation_id)
 
     prior_recent = state.get("recent_messages", [])
     summary = state.get("summary", "")
 
-    incoming = [m.model_dump() for m in req.messages]
+    incoming = [
+        {
+            "role": m.role,
+            "content": coerce_model_content_to_text(m.content),
+        }
+        for m in req.messages
+    ]
     combined_recent = prior_recent + incoming
 
     trimmed_recent, _ = trim_recent_messages(
         combined_recent,
         summary=summary,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
-        context_size=req.context_size,
+        context_size=context_size,
     )
 
     overflow_count = len(combined_recent) - len(trimmed_recent)
@@ -771,28 +1046,13 @@ async def chat(req: GatewayChatRequest, request: Request) -> dict:
         remaining_recent,
         summary=summary,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
-        context_size=req.context_size,
+        context_size=context_size,
     )
 
-    budget = build_budget(req.context_size)
+    budget = build_budget(context_size)
     max_tokens = min(req.max_tokens, budget.reserved_output)
 
     latest_text = latest_user_text(req.messages)
-    requested_filename = extract_requested_filename(latest_text)
-    code_edit_mode = is_code_edit_request(latest_text)
-    code_edit_instruction = extract_code_edit_instruction(latest_text) if code_edit_mode else ""
-    code_edit_file_contents = extract_inline_file_contents(latest_text) if code_edit_mode else ""
-
-    debug_code_edit_event(
-        "incoming_request",
-        conversation_id=req.conversation_id,
-        user_id=user_id,
-        latest_user_preview=_debug_preview(latest_text),
-        requested_filename=requested_filename or "",
-        code_edit_mode=code_edit_mode,
-        inline_file_chars=len(code_edit_file_contents),
-        inline_file_present=bool(code_edit_file_contents.strip()),
-    )
 
     rag_results = []
     rag_chunks = []
@@ -802,7 +1062,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> dict:
             rag_results = await search_documents(
                 latest_text,
                 limit=2,
-                collection=req.rag_collection or req.conversation_id,
+                collection=req.rag_collection or conversation_id,
                 user_id=user_id,
             )
             rag_chunks = [
@@ -815,13 +1075,6 @@ async def chat(req: GatewayChatRequest, request: Request) -> dict:
             rag_chunks = []
 
     rag_context = "\n\n".join(rag_chunks)
-
-    debug_code_edit_event(
-        "retrieval_result",
-        rag_results=len(rag_results),
-        rag_context_chars=len(rag_context),
-        rag_preview=_debug_preview(rag_context),
-    )
 
     final_messages = [
         {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
@@ -839,194 +1092,222 @@ async def chat(req: GatewayChatRequest, request: Request) -> dict:
             }
         )
 
-    recent_for_model = list(trimmed_recent)
-
-    if code_edit_mode:
-        final_messages.append(
-            {
-                "role": "system",
-                "content": build_code_edit_contract_system_prompt(requested_filename),
-            }
-        )
-
-        if recent_for_model and recent_for_model[-1].get("role") == "user":
-            recent_for_model = recent_for_model[:-1]
-
-        if code_edit_file_contents.strip():
-            recent_for_model.append(
-                {
-                    "role": "user",
-                    "content": build_code_edit_model_input(
-                        requested_filename,
-                        code_edit_instruction,
-                        code_edit_file_contents,
-                    ),
-                }
-            )
-
-    final_messages.extend(recent_for_model)
-
-    if code_edit_mode:
-        debug_code_edit_event(
-            "code_edit_model_input",
-            final_user_preview=_debug_preview(recent_for_model[-1]["content"]) if recent_for_model and recent_for_model[-1].get("role") == "user" else "",
-            final_user_chars=len(recent_for_model[-1]["content"]) if recent_for_model and recent_for_model[-1].get("role") == "user" else 0,
-        )
+    final_messages.extend(trimmed_recent)
 
     state["summary"] = summary
     state["recent_messages"] = trimmed_recent[-8:]
     state["last_model"] = req.model
-    state["last_context_size"] = req.context_size
+    state["last_context_size"] = context_size
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
-    save_conversation(req.conversation_id, state)
+    save_conversation(conversation_id, state)
 
     payload = {
         "model": req.model,
         "messages": final_messages,
         "max_tokens": max_tokens,
-        "temperature": min(req.temperature, 0.2) if code_edit_mode else req.temperature,
-        "stream": not code_edit_mode,
+        "temperature": req.temperature,
+        "stream": req.stream,
     }
 
     async def event_stream():
-        if code_edit_mode:
-            if not code_edit_file_contents.strip():
-                debug_code_edit_event(
-                    "code_edit_missing_file_contents",
-                    requested_filename=requested_filename or "",
-                    latest_user_preview=_debug_preview(latest_text),
-                )
-                parsed = {
-                    "executive_summary": [
-                        "No file contents were included with this code edit request."
-                    ],
-                    "change_summary": [
-                        "The gateway only received the instruction text, so no modified file could be produced."
-                    ],
-                    "patch_confidence": "low",
-                    "modified_file": {
-                        "name": requested_filename or "modified_file.txt",
-                        "content": "",
-                    },
-                }
-            else:
-                debug_code_edit_event(
-                    "code_edit_llama_request",
-                    requested_filename=requested_filename or "",
-                    instruction_preview=_debug_preview(code_edit_instruction),
-                    file_chars=len(code_edit_file_contents),
-                    final_message_count=len(final_messages),
-                )
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=payload)
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        stream_start = time.perf_counter()
+        emitted_chunks = 0
+        emitted_chars = 0
+        assistant_parts: list[str] = []
+        sent_done = False
+        timeout = httpx.Timeout(
+            connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+            read=None,
+            write=UPSTREAM_WRITE_TIMEOUT_SECONDS,
+            pool=UPSTREAM_POOL_TIMEOUT_SECONDS,
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{LLAMA_BASE}/v1/chat/completions",
+                    json=stream_payload,
+                ) as r:
+                    upstream_ms = int((time.perf_counter() - stream_start) * 1000)
+                    logger.info(
+                        "stream_upstream_response conversation_id=%s model=%s "
+                        "status=%s latency_ms=%s",
+                        conversation_id,
+                        req.model,
+                        r.status_code,
+                        upstream_ms,
+                    )
+
                     if r.status_code >= 400:
-                        raise HTTPException(status_code=r.status_code, detail=r.text)
-                    data = r.json()
+                        upstream_error = await r.aread()
+                        error_text = upstream_error.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                        yield sse_chunk(
+                            req.model,
+                            content=f"Upstream error ({r.status_code}): "
+                            f"{error_text}",
+                        )
+                        yield sse_chunk(req.model, finish_reason="stop")
+                        yield "data: [DONE]\n\n"
+                        return
 
-                raw_assistant = data["choices"][0]["message"]["content"]
-                parsed = parse_code_edit_response(raw_assistant, requested_filename)
+                    upstream_lines = r.aiter_lines()
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(
+                                anext(upstream_lines),
+                                timeout=STREAM_KEEPALIVE_INTERVAL_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            yield ": keep-alive\n\n"
+                            continue
+                        except StopAsyncIteration:
+                            break
 
-                debug_code_edit_event(
-                    "code_edit_llama_response",
-                    raw_preview=_debug_preview(raw_assistant),
-                    parsed_filename=parsed.get("modified_file", {}).get("name", ""),
-                    parsed_content_chars=len(str(parsed.get("modified_file", {}).get("content", ""))),
-                    patch_confidence=parsed.get("patch_confidence", ""),
-                )
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            continue
 
-            artifact = None
-            modified_file = parsed.get("modified_file", {})
-            if isinstance(modified_file, dict):
-                modified_name = str(modified_file.get("name") or requested_filename or "modified_file.txt")
-                modified_content = str(modified_file.get("content") or "")
-                if modified_content.strip():
-                    artifact = save_code_edit_artifact(user_id, modified_name, modified_content)
+                        data_line = line[5:].strip()
+                        if not data_line:
+                            continue
 
-            debug_code_edit_event(
-                "code_edit_artifact",
-                artifact_saved=bool(artifact),
-                artifact_name=artifact.get("name", "") if artifact else "",
-                artifact_path=artifact.get("saved_path", "") if artifact else "",
+                        if data_line == "[DONE]":
+                            sent_done = True
+                            yield "data: [DONE]\n\n"
+                            break
+
+                        emitted_chunks += 1
+                        yield f"data: {data_line}\n\n"
+
+                        try:
+                            parsed = json.loads(data_line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = parsed.get("choices", [])
+                        if not choices:
+                            continue
+
+                        delta = choices[0].get("delta", {})
+                        text_delta = coerce_model_content_to_text(
+                            delta.get("content", ""),
+                        )
+                        if text_delta:
+                            emitted_chars += len(text_delta)
+                            assistant_parts.append(text_delta)
+
+                    if not sent_done:
+                        yield sse_chunk(req.model, finish_reason="stop")
+                        yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.exception(
+                "stream_request_failed conversation_id=%s model=%s error=%s",
+                conversation_id,
+                req.model,
+                str(e),
             )
-
-            summary_text = format_code_edit_summary(parsed, artifact)
-
-            for chunk in split_for_stream(summary_text):
-                yield sse_chunk(req.model, content=chunk)
-
+            yield sse_chunk(req.model, content=f"Gateway streaming error: {str(e)}")
             yield sse_chunk(req.model, finish_reason="stop")
             yield "data: [DONE]\n\n"
-
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": summary_text,
-                "qonduit_code_edit": {
-                    "executive_summary": parsed["executive_summary"],
-                    "change_summary": parsed["change_summary"],
-                    "patch_confidence": parsed["patch_confidence"],
-                },
-            }
-
-            if artifact is not None:
-                assistant_message["qonduit_artifact"] = artifact
-
-            state["summary"] = summary
-            state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
-            state["last_model"] = req.model
-            state["last_context_size"] = req.context_size
-            state["last_prompt_tokens"] = prompt_tokens
-            state["last_reserved_output"] = budget.reserved_output
-            save_conversation(req.conversation_id, state)
             return
 
-        assistant_text_parts = []
-
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST", f"{LLAMA_BASE}/v1/chat/completions", json=payload) as r:
-                if r.status_code >= 400:
-                    body = await r.aread()
-                    raise HTTPException(status_code=r.status_code, detail=body.decode("utf-8", errors="ignore"))
-
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    yield line + "\n\n"
-
-                    if line.startswith("data: "):
-                        raw = line[6:].strip()
-                        if raw == "[DONE]":
-                            continue
-                        try:
-                            obj = json.loads(raw)
-                            delta = (
-                                obj.get("choices", [{}])[0]
-                                .get("delta", {})
-                                .get("content")
-                            )
-                            if delta:
-                                assistant_text_parts.append(delta)
-                        except Exception:
-                            pass
+        assistant_content = "".join(assistant_parts)
+        logger.info(
+            "stream_complete conversation_id=%s model=%s chunks=%s chars=%s",
+            conversation_id,
+            req.model,
+            emitted_chunks,
+            emitted_chars,
+        )
 
         assistant_message = {
             "role": "assistant",
-            "content": "".join(assistant_text_parts),
+            "content": assistant_content,
         }
 
         state["summary"] = summary
         state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
         state["last_model"] = req.model
-        state["last_context_size"] = req.context_size
+        state["last_context_size"] = context_size
         state["last_prompt_tokens"] = prompt_tokens
         state["last_reserved_output"] = budget.reserved_output
-        save_conversation(req.conversation_id, state)
+        save_conversation(conversation_id, state)
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
+    if req.stream:
+        logger.info(
+            "chat_request stream=true conversation_id=%s model=%s messages=%s",
+            conversation_id,
+            req.model,
+            len(req.messages),
+        )
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    non_stream_start = time.perf_counter()
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        data = r.json()
+    non_stream_ms = int((time.perf_counter() - non_stream_start) * 1000)
+    logger.info(
+        "chat_request stream=false conversation_id=%s model=%s latency_ms=%s messages=%s",
+        conversation_id,
+        req.model,
+        non_stream_ms,
+        len(req.messages),
     )
+
+    message_content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    assistant_content = coerce_model_content_to_text(message_content)
+
+    assistant_message = {
+        "role": "assistant",
+        "content": assistant_content,
+    }
+
+    state["summary"] = summary
+    state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
+    state["last_model"] = req.model
+    state["last_context_size"] = context_size
+    state["last_prompt_tokens"] = prompt_tokens
+    state["last_reserved_output"] = budget.reserved_output
+    save_conversation(conversation_id, state)
+
+    return {
+        "id": data.get("id", f"chatcmpl-qonduit-{uuid.uuid4().hex}"),
+        "object": "chat.completion",
+        "created": data.get("created", int(time.time())),
+        "model": data.get("model", req.model),
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": assistant_content,
+                },
+                "finish_reason": (
+                    data.get("choices", [{}])[0].get("finish_reason") or "stop"
+                ),
+            }
+        ],
+        "usage": data.get("usage", {}),
+    }
