@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import uuid
 import httpx
+import os
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 
-QDRANT_URL = "http://192.168.5.5:6333"
-EMBED_BASE = "http://192.168.5.5:8082"
+QDRANT_URL = os.getenv("QDRANT_URL", "http://192.168.5.5:6333").strip() or "http://192.168.5.5:6333"
+EMBED_BASE = os.getenv("EMBEDDING_BASE", "http://192.168.5.5:8082").strip() or "http://192.168.5.5:8082"
 
 COLLECTION_NAME = "qonduit_rag"
 VECTOR_SIZE = 384  # all-MiniLM-L6-v2 embeddings are 384-dimensional
