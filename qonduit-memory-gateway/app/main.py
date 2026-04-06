@@ -205,6 +205,13 @@ class EmbeddingsRequest(BaseModel):
     user: str | None = None
 
 
+class GithubWebhookStubRequest(BaseModel):
+    project_id: str
+    repo_path: str
+    branch: str | None = None
+    delivery_id: str | None = None
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": "qonduit-memory-gateway"}
@@ -1292,6 +1299,33 @@ async def rag_upload_document(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload document: {e}")
+
+
+@app.post("/internal/webhooks/github")
+async def github_webhook_stub(req: GithubWebhookStubRequest) -> dict:
+    """Webhook scaffold for repo ingestion automation.
+
+    This endpoint intentionally does not execute git/pull or ingestion directly.
+    It returns a deterministic contract that operators can wire to CI/job runners.
+    """
+    project_id = sanitize_identifier(req.project_id, DEFAULT_PROJECT_NAMESPACE)
+    branch = (req.branch or "").strip() or "main"
+    return {
+        "ok": True,
+        "message": "Webhook stub accepted. Trigger repo ingest job externally.",
+        "contract": {
+            "project_id": project_id,
+            "repo_path": req.repo_path,
+            "branch": branch,
+            "delivery_id": req.delivery_id,
+            "command": (
+                "python -m app.ingest_repo "
+                f"--project-id {project_id} "
+                f"--repo-path {req.repo_path} "
+                f"--branch {branch}"
+            ),
+        },
+    }
 
 
 @app.get("/v1/chat/completions")

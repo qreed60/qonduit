@@ -11,7 +11,8 @@ coding-focused memory quality.
 - **Phase 2 (Project-scoped memory isolation):** ✅ Completed on 2026-04-06.
 - **Phase 3 (Coding mode / technical memory):** ✅ Completed on 2026-04-06.
 - **Phase 4 (Embeddings + RAG scaffold):** ✅ Completed on 2026-04-06.
-- **Phases 5-7:** ⏳ Not started in code (deferred intentionally pending review).
+- **Phase 5 (Project repo ingestion):** ✅ Completed on 2026-04-06.
+- **Phases 6-7:** ⏳ Not started in code (deferred intentionally pending review).
 
 ---
 
@@ -216,16 +217,31 @@ non-standard body fields.
 
 ## Phase 5 — Project repo ingestion for GitHub-backed projects
 
-### Planned
+### Status
 
-- Build ingestion CLI/module for project repositories.
-- Chunk/embed/upsert repo data with strict project metadata.
-- Add stale chunk cleanup strategy where practical.
-- Add `docs/github_project_rag.md` and webhook contract/stub if needed.
+✅ Completed in code on 2026-04-06.
 
-### Risks
+### Implemented
 
-- Repository scale and chunking strategy can impact indexing time/cost.
+- Added project repo ingestion module/CLI: `python -m app.ingest_repo`.
+- Supports:
+  - `project_id`
+  - local repo path
+  - branch metadata and commit SHA capture
+  - include/exclude file walking rules
+  - source chunking and embedding
+  - upsert into project-scoped Qdrant collections
+  - practical stale chunk deletion for removed files in the same scope
+- Stores required per-chunk metadata (`project_id`, `repo_path`, `branch`,
+  `file_path`, `chunk_index`, `commit_sha`).
+- Added `docs/github_project_rag.md` with operator flow and CLI usage.
+- Added webhook automation scaffold endpoint contract:
+  - `POST /internal/webhooks/github`
+
+### Deferred
+
+- Full webhook-driven automation execution (git pull + job orchestration) remains
+  operator-managed and environment-dependent.
 
 ---
 
