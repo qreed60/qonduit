@@ -12,7 +12,8 @@ coding-focused memory quality.
 - **Phase 3 (Coding mode / technical memory):** ✅ Completed on 2026-04-06.
 - **Phase 4 (Embeddings + RAG scaffold):** ✅ Completed on 2026-04-06.
 - **Phase 5 (Project repo ingestion):** ✅ Completed on 2026-04-06.
-- **Phases 6-7:** ⏳ Not started in code (deferred intentionally pending review).
+- **Phase 6 (Native client compatibility):** ✅ Completed on 2026-04-06.
+- **Phase 7 (Cleanup/testing/operator docs):** ✅ Completed on 2026-04-06.
 
 ---
 
@@ -247,28 +248,48 @@ non-standard body fields.
 
 ## Phase 6 — Native client compatibility strategy
 
-### Planned
+### Status
 
-- Add model alias mapping for project-bound behavior.
-- Add endpoint/provider binding hooks for future multi-endpoint routing.
-- Ensure shared llama backend compatibility while exposing client-friendly
-  alias models.
-- Add `docs/native_client_compatibility.md`.
+✅ Completed in code on 2026-04-06.
 
-### Risks
+### Implemented
 
-- Alias-to-upstream mapping drift if not centrally validated.
+- Added native alias model behavior via `MODEL_ALIAS_CONFIG` mapping:
+  - alias model id -> upstream target model
+  - alias default `project_id`
+  - alias default mode
+  - optional `rag_enabled`
+- Added endpoint/provider binding support via `ENDPOINT_BINDINGS` (host ->
+  project/model/mode/rag defaults).
+- Updated `/v1/models` to expose alias models from both alias config and endpoint
+  binding config so native clients can refresh/select them.
+- Preserved shared llama backend usage by routing alias models to target upstream
+  model server-side while keeping OpenAI-style request body compatibility.
+- Added `docs/native_client_compatibility.md`.
+
+### Deferred
+
+- Multi-tenant auth/policy controls for endpoint-bound project routing remain
+  operator-managed.
 
 ---
 
 ## Phase 7 — Cleanup, testing, and operator docs
 
-### Planned
+### Status
 
-- Refactor for readability as needed.
-- Update setup and manual-steps documentation.
-- Expand tests and operator checklist.
+✅ Completed in code on 2026-04-06.
 
-### Risks
+### Implemented
 
-- Documentation can lag code if not maintained phase-by-phase.
+- Added `.env.example` with gateway, alias, endpoint-binding, and RAG settings.
+- Added `docs/setup.md` with bootstrap and validation flow.
+- Added `docs/manual_steps.md` explicitly listing manual items outside Codex
+  (DNS, Cloudflare, proxy routing, webhook/infra deployment) and an operator
+  checklist for llama/gateway/aliases/ingest/native clients.
+- Added/kept lightweight validation scripts through Phase 7 scope.
+
+### Deferred
+
+- Environment-specific production hardening (monitoring, autoscaling, secret
+  managers) remains deployment-specific.

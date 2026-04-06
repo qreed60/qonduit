@@ -111,6 +111,7 @@ MODEL_ALIAS_CONFIG = env_json("MODEL_ALIAS_CONFIG", {})
 PROJECT_DEFAULT_MODE_MAP = env_json("PROJECT_DEFAULT_MODE_MAP", {})
 PROJECT_HOST_BINDINGS = env_json("PROJECT_HOST_BINDINGS", {})
 RAG_PROJECT_FLAGS = env_json("RAG_PROJECT_FLAGS", {})
+ENDPOINT_BINDINGS = env_json("ENDPOINT_BINDINGS", {})
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -220,6 +221,44 @@ async def health() -> dict:
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models() -> dict:
+    alias_models = []
+    for alias_id, alias in MODEL_ALIAS_CONFIG.items():
+        if not isinstance(alias, dict):
+            continue
+        alias_models.append(
+            {
+                "id": alias_id,
+                "object": "model",
+                "owned_by": "qonduit-alias",
+                "metadata": {
+                    "project_id": alias.get("project_id"),
+                    "default_mode": alias.get("default_mode"),
+                    "target_model": alias.get("model"),
+                    "rag_enabled": alias.get("rag_enabled"),
+                },
+            }
+        )
+    for host, binding in ENDPOINT_BINDINGS.items():
+        if not isinstance(binding, dict):
+            continue
+        alias_id = str(binding.get("model_alias", "")).strip()
+        if not alias_id:
+            continue
+        alias_models.append(
+            {
+                "id": alias_id,
+                "object": "model",
+                "owned_by": "qonduit-endpoint-binding",
+                "metadata": {
+                    "host": host,
+                    "project_id": binding.get("project_id"),
+                    "default_mode": binding.get("default_mode"),
+                    "target_model": binding.get("model"),
+                    "rag_enabled": binding.get("rag_enabled"),
+                },
+            }
+        )
+
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.get(f"{LLAMA_BASE}/v1/models")
@@ -227,7 +266,8 @@ async def list_models() -> dict:
         logger.exception("models_proxy_connection_failed error=%s", str(exc))
         return {
             "object": "list",
-            "data": [
+            "data": alias_models
+            + [
                 {
                     "id": "qonduit-default",
                     "object": "model",
@@ -245,7 +285,18 @@ async def list_models() -> dict:
         raise upstream_error(response.status_code, response.text)
 
     try:
-        return response.json()
+        upstream = response.json()
+        if isinstance(upstream, dict):
+            data = upstream.get("data")
+            if isinstance(data, list):
+                merged = list(data)
+                seen = {str(item.get("id")) for item in merged if isinstance(item, dict)}
+                for alias_model in alias_models:
+                    if alias_model["id"] not in seen:
+                        merged.append(alias_model)
+                upstream["data"] = merged
+                return upstream
+        return {"object": "list", "data": alias_models}
     except ValueError:
         logger.error("models_proxy_invalid_json body=%s", response.text[:300])
         raise upstream_error(502, "Upstream /v1/models returned invalid JSON")
@@ -334,6 +385,32 @@ def model_alias_entry(model: str) -> dict[str, Any] | None:
     return None
 
 
+def endpoint_binding_entry(request: Request) -> dict[str, Any] | None:
+    host = (request.headers.get("host", "") or "").split(":")[0].strip().lower()
+    if not host:
+        return None
+    entry = ENDPOINT_BINDINGS.get(host)
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def resolve_effective_model(req: GatewayChatRequest, request: Request) -> str:
+    alias = model_alias_entry(req.model)
+    if alias is not None:
+        model_value = str(alias.get("model", "")).strip()
+        if model_value:
+            return model_value
+
+    binding = endpoint_binding_entry(request)
+    if binding is not None:
+        model_value = str(binding.get("model", "")).strip()
+        if model_value:
+            return model_value
+
+    return req.model
+
+
 def resolve_project_id(req: GatewayChatRequest, request: Request) -> str:
     header_project = request.headers.get("X-Project-ID", "").strip()
     if header_project:
@@ -347,6 +424,12 @@ def resolve_project_id(req: GatewayChatRequest, request: Request) -> str:
         alias_project = str(alias.get("project_id", "")).strip()
         if alias_project:
             return sanitize_identifier(alias_project, DEFAULT_PROJECT_NAMESPACE)
+
+    endpoint_binding = endpoint_binding_entry(request)
+    if endpoint_binding is not None:
+        binding_project = str(endpoint_binding.get("project_id", "")).strip()
+        if binding_project:
+            return sanitize_identifier(binding_project, DEFAULT_PROJECT_NAMESPACE)
 
     host = (request.headers.get("host", "") or "").split(":")[0].strip().lower()
     binding = PROJECT_HOST_BINDINGS.get(host)
@@ -377,6 +460,12 @@ def resolve_mode(req: GatewayChatRequest, request: Request, project_id: str) -> 
         alias_mode = str(alias.get("default_mode", "")).strip().lower()
         if alias_mode in {"chat", "coding"}:
             return alias_mode
+
+    endpoint_binding = endpoint_binding_entry(request)
+    if endpoint_binding is not None:
+        binding_mode = str(endpoint_binding.get("default_mode", "")).strip().lower()
+        if binding_mode in {"chat", "coding"}:
+            return binding_mode
 
     project_mode = PROJECT_DEFAULT_MODE_MAP.get(project_id)
     if isinstance(project_mode, str) and project_mode.strip().lower() in {"chat", "coding"}:
@@ -417,9 +506,24 @@ def is_technical_message(message: dict[str, Any]) -> bool:
     return any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in patterns)
 
 
-def should_enable_rag(project_id: str, mode: str) -> bool:
+def should_enable_rag(
+    project_id: str,
+    mode: str,
+    alias: dict[str, Any] | None = None,
+    binding: dict[str, Any] | None = None,
+) -> bool:
     if not RAG_ENABLED:
         return False
+
+    if alias is not None and "rag_enabled" in alias:
+        value = alias.get("rag_enabled")
+        if isinstance(value, bool):
+            return value
+
+    if binding is not None and "rag_enabled" in binding:
+        value = binding.get("rag_enabled")
+        if isinstance(value, bool):
+            return value
 
     project_flag = RAG_PROJECT_FLAGS.get(project_id)
     if isinstance(project_flag, bool):
@@ -1341,6 +1445,9 @@ async def chat_completions_help() -> dict:
 @app.post("/chat/completions")
 async def chat(req: GatewayChatRequest, request: Request) -> Any:
     user_id = get_request_user_id(request)
+    alias = model_alias_entry(req.model)
+    endpoint_binding = endpoint_binding_entry(request)
+    effective_model = resolve_effective_model(req, request)
     project_id = resolve_project_id(req, request)
     conversation_id = resolve_conversation_id(req, request)
     state = load_conversation(conversation_id, project_id=project_id)
@@ -1373,7 +1480,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
     if overflow_count > 0:
         older = combined_recent[:overflow_count]
-        summary = await summarize_messages(req.model, summary, older, mode=mode)
+        summary = await summarize_messages(effective_model, summary, older, mode=mode)
 
     remaining_recent = combined_recent[overflow_count:]
     trimmed_recent, prompt_tokens = trim_recent_messages(
@@ -1392,7 +1499,8 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     rag_results = []
     rag_chunks = []
 
-    if latest_text.strip() and should_enable_rag(project_id, mode):
+    rag_active = should_enable_rag(project_id, mode, alias=alias, binding=endpoint_binding)
+    if latest_text.strip() and rag_active:
         try:
             rag_results = await search_documents(
                 latest_text,
@@ -1434,7 +1542,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     state["project_id"] = project_id
     state["conversation_id"] = conversation_id
     state["recent_messages"] = trimmed_recent[-recent_window:]
-    state["last_model"] = req.model
+    state["last_model"] = effective_model
     state["last_context_size"] = context_size
     state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
@@ -1443,13 +1551,14 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "mode": mode,
         "project_id": project_id,
         "rag_collection": (req.rag_collection or "").strip() or project_id,
-        "rag_enabled": should_enable_rag(project_id, mode),
-        "model_alias": req.model,
+        "rag_enabled": rag_active,
+        "request_model": req.model,
+        "effective_model": effective_model,
     }
     save_conversation(conversation_id, state, project_id=project_id)
 
     payload = {
-        "model": req.model,
+        "model": effective_model,
         "messages": final_messages,
         "max_tokens": max_tokens,
         "temperature": req.temperature,
@@ -1583,7 +1692,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         state["project_id"] = project_id
         state["conversation_id"] = conversation_id
         state["recent_messages"] = (trimmed_recent + [assistant_message])[-recent_window:]
-        state["last_model"] = req.model
+        state["last_model"] = effective_model
         state["last_context_size"] = context_size
         state["last_mode"] = mode
         state["last_prompt_tokens"] = prompt_tokens
@@ -1592,8 +1701,9 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             "mode": mode,
             "project_id": project_id,
             "rag_collection": (req.rag_collection or "").strip() or project_id,
-            "rag_enabled": should_enable_rag(project_id, mode),
-            "model_alias": req.model,
+            "rag_enabled": rag_active,
+            "request_model": req.model,
+            "effective_model": effective_model,
         }
         save_conversation(conversation_id, state, project_id=project_id)
 
@@ -1601,7 +1711,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         logger.info(
             "chat_request stream=true conversation_id=%s model=%s messages=%s",
             conversation_id,
-            req.model,
+            effective_model,
             len(req.messages),
         )
         return StreamingResponse(
@@ -1621,7 +1731,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         logger.exception(
             "chat_upstream_connection_failed conversation_id=%s model=%s error=%s",
             conversation_id,
-            req.model,
+            effective_model,
             str(exc),
         )
         raise HTTPException(
@@ -1636,7 +1746,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         logger.error(
             "chat_upstream_error conversation_id=%s model=%s status=%s",
             conversation_id,
-            req.model,
+            effective_model,
             r.status_code,
         )
         raise upstream_error(r.status_code, r.text)
@@ -1647,7 +1757,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         logger.error(
             "chat_upstream_invalid_json conversation_id=%s model=%s body=%s",
             conversation_id,
-            req.model,
+            effective_model,
             r.text[:300],
         )
         raise HTTPException(
@@ -1658,7 +1768,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     logger.info(
         "chat_request stream=false conversation_id=%s model=%s latency_ms=%s messages=%s",
         conversation_id,
-        req.model,
+        effective_model,
         non_stream_ms,
         len(req.messages),
     )
@@ -1679,7 +1789,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     state["project_id"] = project_id
     state["conversation_id"] = conversation_id
     state["recent_messages"] = (trimmed_recent + [assistant_message])[-recent_window:]
-    state["last_model"] = req.model
+    state["last_model"] = effective_model
     state["last_context_size"] = context_size
     state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
@@ -1688,8 +1798,9 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "mode": mode,
         "project_id": project_id,
         "rag_collection": (req.rag_collection or "").strip() or project_id,
-        "rag_enabled": should_enable_rag(project_id, mode),
-        "model_alias": req.model,
+        "rag_enabled": rag_active,
+        "request_model": req.model,
+        "effective_model": effective_model,
     }
     save_conversation(conversation_id, state, project_id=project_id)
 
@@ -1697,7 +1808,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "id": data.get("id", f"chatcmpl-qonduit-{uuid.uuid4().hex}"),
         "object": "chat.completion",
         "created": data.get("created", int(time.time())),
-        "model": data.get("model", req.model),
+        "model": req.model,
         "choices": [
             {
                 "index": 0,
