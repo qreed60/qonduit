@@ -22,7 +22,7 @@ from docx import Document
 from openpyxl import load_workbook
 
 from .budget import build_budget, estimate_tokens, trim_recent_messages
-from .store import load_conversation, save_conversation
+from .store import DEFAULT_PROJECT_ID, load_conversation, save_conversation
 from .summarizer import summarize_messages
 from .rag import (
     ensure_collection,
@@ -30,8 +30,12 @@ from .rag import (
     search_documents,
     list_collections,
     create_collection_marker,
+    create_embeddings_response,
     qdrant,
     COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    RAG_ENABLED,
+    RAG_TOP_K,
 )
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
@@ -44,11 +48,12 @@ async def startup() -> None:
     ensure_collection()
     logger.info(
         "gateway_startup llama_base=%s default_context_size=%s default_mode=%s "
-        "gateway_data_dir=%s",
+        "gateway_data_dir=%s default_project=%s",
         LLAMA_BASE,
         DEFAULT_CONTEXT_SIZE,
         DEFAULT_MODE,
         GATEWAY_DATA_DIR,
+        DEFAULT_PROJECT_NAMESPACE,
     )
 
 
@@ -77,14 +82,35 @@ def env_int(name: str, default: int) -> int:
     return value
 
 
+def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("invalid_json_env name=%s raw=%s", name, raw[:200])
+        return default
+    if not isinstance(parsed, dict):
+        logger.warning("invalid_json_env_type name=%s expected=dict", name)
+        return default
+    return parsed
+
+
 LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
 DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
 DEFAULT_MODE = env_str("DEFAULT_MODE", "chat")
 GATEWAY_DATA_DIR = env_str("GATEWAY_DATA_DIR", "/app/data")
+DEFAULT_PROJECT_NAMESPACE = env_str("DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID)
+PROJECT_DEFAULT_MODE = env_str("PROJECT_DEFAULT_MODE", DEFAULT_MODE)
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = 10.0
 UPSTREAM_WRITE_TIMEOUT_SECONDS = 60.0
 UPSTREAM_POOL_TIMEOUT_SECONDS = 60.0
 STREAM_KEEPALIVE_INTERVAL_SECONDS = 2.0
+MODEL_ALIAS_CONFIG = env_json("MODEL_ALIAS_CONFIG", {})
+PROJECT_DEFAULT_MODE_MAP = env_json("PROJECT_DEFAULT_MODE_MAP", {})
+PROJECT_HOST_BINDINGS = env_json("PROJECT_HOST_BINDINGS", {})
+RAG_PROJECT_FLAGS = env_json("RAG_PROJECT_FLAGS", {})
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -138,6 +164,7 @@ class ChatMessage(BaseModel):
 
 class GatewayChatRequest(BaseModel):
     conversation_id: str | None = None
+    project_id: str | None = None
     messages: list[ChatMessage]
     model: str
     context_size: int | None = Field(default=None)
@@ -170,6 +197,12 @@ class RagCollectionCreateRequest(BaseModel):
 
 class RagCollectionDeleteRequest(BaseModel):
     name: str
+
+
+class EmbeddingsRequest(BaseModel):
+    input: str | list[str]
+    model: str | None = None
+    user: str | None = None
 
 
 @app.get("/health")
@@ -209,6 +242,26 @@ async def list_models() -> dict:
     except ValueError:
         logger.error("models_proxy_invalid_json body=%s", response.text[:300])
         raise upstream_error(502, "Upstream /v1/models returned invalid JSON")
+
+
+@app.post("/v1/embeddings")
+async def embeddings(req: EmbeddingsRequest) -> dict:
+    try:
+        return await create_embeddings_response(req.input, model=req.model or EMBEDDING_MODEL)
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code if error.response is not None else 502
+        detail = error.response.text if error.response is not None else str(error)
+        logger.error("embeddings_upstream_error status=%s detail=%s", status, detail[:300])
+        raise upstream_error(status, detail)
+    except Exception as error:
+        logger.exception("embeddings_request_failed error=%s", str(error))
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Failed to generate embeddings",
+                "detail": str(error),
+            },
+        )
 
 
 def get_request_user_id(request: Request) -> str:
@@ -258,6 +311,124 @@ def resolve_context_size(req: GatewayChatRequest, state: dict[str, Any]) -> int:
         return last_size
 
     return DEFAULT_CONTEXT_SIZE
+
+
+def sanitize_identifier(value: str | None, fallback: str) -> str:
+    cleaned = "".join(c for c in (value or "") if c.isalnum() or c in ("-", "_"))
+    if not cleaned:
+        return fallback
+    return cleaned
+
+
+def model_alias_entry(model: str) -> dict[str, Any] | None:
+    entry = MODEL_ALIAS_CONFIG.get(model)
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def resolve_project_id(req: GatewayChatRequest, request: Request) -> str:
+    header_project = request.headers.get("X-Project-ID", "").strip()
+    if header_project:
+        return sanitize_identifier(header_project, DEFAULT_PROJECT_NAMESPACE)
+
+    if (req.project_id or "").strip():
+        return sanitize_identifier(req.project_id, DEFAULT_PROJECT_NAMESPACE)
+
+    alias = model_alias_entry(req.model)
+    if alias is not None:
+        alias_project = str(alias.get("project_id", "")).strip()
+        if alias_project:
+            return sanitize_identifier(alias_project, DEFAULT_PROJECT_NAMESPACE)
+
+    host = (request.headers.get("host", "") or "").split(":")[0].strip().lower()
+    binding = PROJECT_HOST_BINDINGS.get(host)
+    if isinstance(binding, str) and binding.strip():
+        return sanitize_identifier(binding.strip(), DEFAULT_PROJECT_NAMESPACE)
+
+    return sanitize_identifier(DEFAULT_PROJECT_NAMESPACE, DEFAULT_PROJECT_NAMESPACE)
+
+
+def request_project_id(request: Request) -> str:
+    header_project = request.headers.get("X-Project-ID", "").strip()
+    if header_project:
+        return sanitize_identifier(header_project, DEFAULT_PROJECT_NAMESPACE)
+    return sanitize_identifier(DEFAULT_PROJECT_NAMESPACE, DEFAULT_PROJECT_NAMESPACE)
+
+
+def resolve_mode(req: GatewayChatRequest, request: Request, project_id: str) -> str:
+    requested_mode = (req.mode or "").strip().lower()
+    if requested_mode in {"chat", "coding"}:
+        return requested_mode
+
+    header_mode = request.headers.get("X-Gateway-Mode", "").strip().lower()
+    if header_mode in {"chat", "coding"}:
+        return header_mode
+
+    alias = model_alias_entry(req.model)
+    if alias is not None:
+        alias_mode = str(alias.get("default_mode", "")).strip().lower()
+        if alias_mode in {"chat", "coding"}:
+            return alias_mode
+
+    project_mode = PROJECT_DEFAULT_MODE_MAP.get(project_id)
+    if isinstance(project_mode, str) and project_mode.strip().lower() in {"chat", "coding"}:
+        return project_mode.strip().lower()
+
+    env_mode = PROJECT_DEFAULT_MODE.strip().lower()
+    if env_mode in {"chat", "coding"}:
+        return env_mode
+
+    return "chat"
+
+
+def system_prompt_for_mode(mode: str) -> str:
+    if mode == "coding":
+        return (
+            "You are Qonduit in CODING mode. "
+            "Prioritize correctness, exact technical details, and reproducible steps. "
+            "Preserve exact file paths, function/class names, commands, errors, and constraints. "
+            "When uncertain, state assumptions briefly and propose the next verification command."
+        )
+    return DEFAULT_SYSTEM_PROMPT
+
+
+def is_technical_message(message: dict[str, Any]) -> bool:
+    content = str(message.get("content", ""))
+    if not content.strip():
+        return False
+    patterns = [
+        r"```",
+        r"\bTraceback\b",
+        r"\bException\b",
+        r"\bError\b",
+        r"\bFAILED\b",
+        r"\b(?:[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|dart|go|rs|java|kt|json|yaml|yml|toml|ini|sh|md))\b",
+        r"\b(?:python|pytest|pip|poetry|npm|pnpm|yarn|cargo|go|flutter|dart|make|uvicorn)\b",
+        r"\b(?:must|do not|don't|cannot|can't|required|constraint)\b",
+    ]
+    return any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def should_enable_rag(project_id: str, mode: str) -> bool:
+    if not RAG_ENABLED:
+        return False
+
+    project_flag = RAG_PROJECT_FLAGS.get(project_id)
+    if isinstance(project_flag, bool):
+        return project_flag
+    if isinstance(project_flag, str):
+        normalized = project_flag.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+
+    mode_flag = RAG_PROJECT_FLAGS.get(f"mode:{mode}")
+    if isinstance(mode_flag, bool):
+        return mode_flag
+
+    return True
 
 
 def upstream_error(status_code: int, detail: str) -> HTTPException:
@@ -952,6 +1123,7 @@ async def recover_modified_file_with_retry(
 @app.post("/rag/test-ingest")
 async def rag_test_ingest(req: RagIngestRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     doc_id = await add_document(
         text=req.text,
         metadata={
@@ -960,6 +1132,8 @@ async def rag_test_ingest(req: RagIngestRequest, request: Request) -> dict:
             "document_name": req.document_name,
         },
         user_id=user_id,
+        collection=req.collection,
+        project_id=project_id,
     )
     return {"ok": True, "id": doc_id}
 
@@ -967,11 +1141,13 @@ async def rag_test_ingest(req: RagIngestRequest, request: Request) -> dict:
 @app.post("/rag/test-search")
 async def rag_test_search(req: RagSearchRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     results = await search_documents(
         req.query,
         limit=req.limit,
         collection=req.collection,
         user_id=user_id,
+        project_id=project_id,
     )
     return {"ok": True, "results": results}
 
@@ -979,23 +1155,29 @@ async def rag_test_search(req: RagSearchRequest, request: Request) -> dict:
 @app.get("/rag/collections")
 async def rag_list_collections(request: Request) -> dict:
     user_id = get_request_user_id(request)
-    return {"ok": True, "collections": list_collections(user_id=user_id)}
+    project_id = request_project_id(request)
+    return {
+        "ok": True,
+        "collections": list_collections(user_id=user_id, project_id=project_id),
+    }
 
 
 @app.post("/rag/collections/create")
 async def rag_create_collection(req: RagCollectionCreateRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Collection name cannot be empty")
 
-    await create_collection_marker(name, user_id=user_id)
+    await create_collection_marker(name, user_id=user_id, project_id=project_id)
     return {"ok": True, "collection": name}
 
 
 @app.post("/rag/collections/delete")
 async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     collection_name = req.name.strip()
     if not collection_name:
         raise HTTPException(status_code=400, detail="Collection name cannot be empty")
@@ -1004,7 +1186,7 @@ async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Reques
 
     try:
         points, _ = qdrant.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=f"{COLLECTION_NAME}__{project_id}",
             scroll_filter=Filter(
                 must=[
                     FieldCondition(
@@ -1014,6 +1196,10 @@ async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Reques
                     FieldCondition(
                         key="user_id",
                         match=MatchValue(value=user_id),
+                    ),
+                    FieldCondition(
+                        key="project_id",
+                        match=MatchValue(value=project_id),
                     ),
                 ]
             ),
@@ -1025,7 +1211,7 @@ async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Reques
         point_ids = [p.id for p in points if p.id is not None]
         if point_ids:
             qdrant.delete(
-                collection_name=COLLECTION_NAME,
+                collection_name=f"{COLLECTION_NAME}__{project_id}",
                 points_selector=point_ids,
             )
             deleted_points = len(point_ids)
@@ -1052,6 +1238,7 @@ async def rag_upload_document(
     ensure_upload_dir()
 
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     collection_name = collection.strip()
     if not collection_name:
         raise HTTPException(status_code=400, detail="Collection cannot be empty")
@@ -1091,6 +1278,8 @@ async def rag_upload_document(
                     "saved_path": saved_path,
                 },
                 user_id=user_id,
+                collection=collection_name,
+                project_id=project_id,
             )
             chunk_ids.append(chunk_id)
 
@@ -1118,10 +1307,13 @@ async def chat_completions_help() -> dict:
 @app.post("/chat/completions")
 async def chat(req: GatewayChatRequest, request: Request) -> Any:
     user_id = get_request_user_id(request)
+    project_id = resolve_project_id(req, request)
     conversation_id = resolve_conversation_id(req, request)
-    state = load_conversation(conversation_id)
+    state = load_conversation(conversation_id, project_id=project_id)
     context_size = resolve_context_size(req, state)
-    mode = req.mode or DEFAULT_MODE
+    mode = resolve_mode(req, request, project_id)
+    system_prompt = system_prompt_for_mode(mode)
+    recent_window = 16 if mode == "coding" else 8
 
     prior_recent = state.get("recent_messages", [])
     summary = state.get("summary", "")
@@ -1138,22 +1330,24 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     trimmed_recent, _ = trim_recent_messages(
         combined_recent,
         summary=summary,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         context_size=context_size,
+        protect_message=is_technical_message if mode == "coding" else None,
     )
 
     overflow_count = len(combined_recent) - len(trimmed_recent)
 
     if overflow_count > 0:
         older = combined_recent[:overflow_count]
-        summary = await summarize_messages(req.model, summary, older)
+        summary = await summarize_messages(req.model, summary, older, mode=mode)
 
     remaining_recent = combined_recent[overflow_count:]
     trimmed_recent, prompt_tokens = trim_recent_messages(
         remaining_recent,
         summary=summary,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         context_size=context_size,
+        protect_message=is_technical_message if mode == "coding" else None,
     )
 
     budget = build_budget(context_size)
@@ -1164,13 +1358,14 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     rag_results = []
     rag_chunks = []
 
-    if latest_text.strip():
+    if latest_text.strip() and should_enable_rag(project_id, mode):
         try:
             rag_results = await search_documents(
                 latest_text,
-                limit=2,
-                collection=req.rag_collection or conversation_id,
+                limit=RAG_TOP_K,
+                collection=req.rag_collection or project_id,
                 user_id=user_id,
+                project_id=project_id,
             )
             rag_chunks = [
                 item["text"].strip()
@@ -1184,7 +1379,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     rag_context = "\n\n".join(rag_chunks)
 
     final_messages = [
-        {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "system", "content": f"Rolling summary:\n{summary or '(none)'}"},
     ]
 
@@ -1202,13 +1397,22 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     final_messages.extend(trimmed_recent)
 
     state["summary"] = summary
-    state["recent_messages"] = trimmed_recent[-8:]
+    state["project_id"] = project_id
+    state["conversation_id"] = conversation_id
+    state["recent_messages"] = trimmed_recent[-recent_window:]
     state["last_model"] = req.model
     state["last_context_size"] = context_size
     state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
-    save_conversation(conversation_id, state)
+    state["metadata"] = {
+        "mode": mode,
+        "project_id": project_id,
+        "rag_collection": (req.rag_collection or "").strip() or project_id,
+        "rag_enabled": should_enable_rag(project_id, mode),
+        "model_alias": req.model,
+    }
+    save_conversation(conversation_id, state, project_id=project_id)
 
     payload = {
         "model": req.model,
@@ -1342,13 +1546,22 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         }
 
         state["summary"] = summary
-        state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
+        state["project_id"] = project_id
+        state["conversation_id"] = conversation_id
+        state["recent_messages"] = (trimmed_recent + [assistant_message])[-recent_window:]
         state["last_model"] = req.model
         state["last_context_size"] = context_size
         state["last_mode"] = mode
         state["last_prompt_tokens"] = prompt_tokens
         state["last_reserved_output"] = budget.reserved_output
-        save_conversation(conversation_id, state)
+        state["metadata"] = {
+            "mode": mode,
+            "project_id": project_id,
+            "rag_collection": (req.rag_collection or "").strip() or project_id,
+            "rag_enabled": should_enable_rag(project_id, mode),
+            "model_alias": req.model,
+        }
+        save_conversation(conversation_id, state, project_id=project_id)
 
     if req.stream:
         logger.info(
@@ -1429,13 +1642,22 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     }
 
     state["summary"] = summary
-    state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
+    state["project_id"] = project_id
+    state["conversation_id"] = conversation_id
+    state["recent_messages"] = (trimmed_recent + [assistant_message])[-recent_window:]
     state["last_model"] = req.model
     state["last_context_size"] = context_size
     state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
-    save_conversation(conversation_id, state)
+    state["metadata"] = {
+        "mode": mode,
+        "project_id": project_id,
+        "rag_collection": (req.rag_collection or "").strip() or project_id,
+        "rag_enabled": should_enable_rag(project_id, mode),
+        "model_alias": req.model,
+    }
+    save_conversation(conversation_id, state, project_id=project_id)
 
     return {
         "id": data.get("id", f"chatcmpl-qonduit-{uuid.uuid4().hex}"),

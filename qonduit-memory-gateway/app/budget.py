@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import tiktoken
 
@@ -87,6 +87,7 @@ def trim_recent_messages(
     summary: str,
     system_prompt: str,
     context_size: int,
+    protect_message: Callable[[dict], bool] | None = None,
 ) -> tuple[list[dict], int]:
     budget = build_budget(context_size)
     working = list(messages)
@@ -95,7 +96,17 @@ def trim_recent_messages(
         total = total_prompt_tokens(system_prompt, summary, working)
         if total <= budget.prompt_target:
             return working, total
-        working.pop(0)
+
+        remove_index = 0
+        if protect_message is not None:
+            removable_index = -1
+            for idx, msg in enumerate(working):
+                if not protect_message(msg):
+                    removable_index = idx
+                    break
+            if removable_index >= 0:
+                remove_index = removable_index
+        working.pop(remove_index)
 
     total = total_prompt_tokens(system_prompt, summary, [])
     return [], total

@@ -8,7 +8,10 @@ coding-focused memory quality.
 
 - **Phase 0 (Analyze and Document):** ✅ Completed on 2026-04-05.
 - **Phase 1 (OpenAI-Compatible Chat Baseline):** ✅ Completed on 2026-04-05.
-- **Phases 2-7:** ⏳ Not started in code (deferred intentionally pending review).
+- **Phase 2 (Project-scoped memory isolation):** ✅ Completed on 2026-04-06.
+- **Phase 3 (Coding mode / technical memory):** ✅ Completed on 2026-04-06.
+- **Phase 4 (Embeddings + RAG scaffold):** ✅ Completed on 2026-04-06.
+- **Phases 5-7:** ⏳ Not started in code (deferred intentionally pending review).
 
 ---
 
@@ -127,49 +130,87 @@ non-standard body fields.
 
 ## Phase 2 — Project-scoped memory isolation
 
-### Planned
+### Status
 
-- Introduce internal `project_id` with strict storage isolation.
-- Add project resolution via header/request/model alias hooks.
-- Move storage layout to `project_id + conversation_id` namespace.
-- Include migration handling for older flat conversation files.
-- Add `docs/project_isolation.md`.
+✅ Completed in code on 2026-04-06.
 
-### Risks
+### Implemented
 
-- Migration complexity and potential accidental cross-project access if
-  fallback rules are ambiguous.
+- Added `project_id` support end-to-end in gateway request handling and storage.
+- Added project binding precedence hooks:
+  1. `X-Project-ID` header
+  2. request `project_id`
+  3. model alias mapping (`MODEL_ALIAS_CONFIG`)
+  4. host binding hooks (`PROJECT_HOST_BINDINGS`)
+  5. safe default namespace (`DEFAULT_PROJECT_ID`)
+- Migrated storage layout to `.../conversations/<project_id>/<conversation_id>.json`.
+- Added transparent migration support from legacy flat conversation files.
+- Persisted `project_id`, `conversation_id`, `last_context_size`, `last_mode`, and
+  `metadata` fields for future project RAG integration.
+- Added dedicated documentation in `docs/project_isolation.md`.
+
+### Deferred
+
+- Full project alias registry and endpoint-specific routing controls are left for
+  later native-client phases.
 
 ---
 
 ## Phase 3 — Coding mode / technical memory
 
-### Planned
+### Status
 
-- Add explicit `chat` vs `coding` modes and precedence rules.
-- Mode-aware prompts and summarization/trimming.
-- Preserve critical technical details in coding summaries.
-- Add validation for mode-aware behavior and persistence.
+✅ Completed in code on 2026-04-06.
 
-### Risks
+### Implemented
 
-- Overly aggressive preservation can increase token pressure and latency.
+- Added explicit `chat` / `coding` mode handling with precedence:
+  1. request `mode`
+  2. `X-Gateway-Mode` header
+  3. model alias default mode
+  4. per-project mode map (`PROJECT_DEFAULT_MODE_MAP`)
+  5. env default (`PROJECT_DEFAULT_MODE` then `DEFAULT_MODE`)
+- Added separate system prompt behavior for coding mode.
+- Replaced generic coding summarization with deterministic technical summaries
+  that preserve file paths, symbols, API endpoints, commands, errors/logs,
+  active task, decisions, constraints, and unresolved issues.
+- Expanded coding-mode recent-message retention window.
+- Added technical-message protection during trimming (code fences, errors, file
+  names/extensions, constraints, commands).
+- Added dedicated documentation in `docs/coding_mode.md`.
+- Added a validation helper script for project persistence + mode behavior.
+
+### Deferred
+
+- Additional weighting/ranking for technical snippets can be expanded in later
+  phases if needed.
 
 ---
 
 ## Phase 4 — OpenAI-compatible embeddings + RAG scaffold
 
-### Planned
+### Status
 
-- Add `POST /v1/embeddings` OpenAI-compatible endpoint.
-- Introduce RAG service abstraction with project-scoped retrieval.
-- Add config for Qdrant and embeddings.
-- Integrate optional retrieval into chat completion prompt assembly.
-- Add `docs/rag_architecture.md`.
+✅ Completed in code on 2026-04-06.
 
-### Risks
+### Implemented
 
-- External dependency variability (Qdrant/embedding availability).
+- Added `POST /v1/embeddings` with OpenAI-compatible request/response passthrough behavior.
+- Added a clean adapter (`EmbeddingBackend`) and project-scoped RAG service abstraction (`ProjectScopedRagService`).
+- Added environment-driven config for:
+  - `QDRANT_URL`
+  - `QDRANT_API_KEY`
+  - `EMBEDDING_BASE`
+  - `EMBEDDING_MODEL`
+  - `RAG_TOP_K`
+  - `RAG_ENABLED`
+- Enforced project-scoped retrieval by using one Qdrant collection per project namespace.
+- Integrated optional retrieval into chat prompt assembly with mode/project-aware enable checks.
+- Added `docs/rag_architecture.md` describing architecture and setup.
+
+### Deferred
+
+- Full live Qdrant verification depends on environment-provided infrastructure; service abstraction and setup docs are included for operators.
 
 ---
 
