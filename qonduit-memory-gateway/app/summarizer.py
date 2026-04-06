@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import httpx
 import logging
+import os
 
-LLAMA_BASE = "http://192.168.5.5:8080"
+LLAMA_BASE = os.getenv("LLAMA_BASE", "http://192.168.5.5:8080").strip() or "http://192.168.5.5:8080"
 logger = logging.getLogger("qonduit.memory_gateway")
 
 
