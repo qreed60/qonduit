@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import uuid
 from typing import Any
+from hashlib import sha256
 
 from pypdf import PdfReader
 from docx import Document
@@ -41,9 +42,45 @@ logger = logging.getLogger("qonduit.memory_gateway")
 @app.on_event("startup")
 async def startup() -> None:
     ensure_collection()
+    logger.info(
+        "gateway_startup llama_base=%s default_context_size=%s default_mode=%s "
+        "gateway_data_dir=%s",
+        LLAMA_BASE,
+        DEFAULT_CONTEXT_SIZE,
+        DEFAULT_MODE,
+        GATEWAY_DATA_DIR,
+    )
 
 
-LLAMA_BASE = "http://192.168.5.5:8080"
+def env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    cleaned = value.strip()
+    return cleaned or default
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid_int_env name=%s raw=%s fallback=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
+DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
+DEFAULT_MODE = env_str("DEFAULT_MODE", "chat")
+GATEWAY_DATA_DIR = env_str("GATEWAY_DATA_DIR", "/app/data")
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = 10.0
 UPSTREAM_WRITE_TIMEOUT_SECONDS = 60.0
 UPSTREAM_POOL_TIMEOUT_SECONDS = 60.0
@@ -109,12 +146,9 @@ class GatewayChatRequest(BaseModel):
     stream: bool = False
     user: str | None = None
     rag_collection: str | None = None
+    mode: str | None = None
 
     model_config = {"extra": "allow"}
-
-    def resolved_context_size(self) -> int:
-        value = self.context_size or 65536
-        return max(value, 1024)
 
 
 class RagIngestRequest(BaseModel):
@@ -146,18 +180,95 @@ async def health() -> dict:
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models() -> dict:
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(f"{LLAMA_BASE}/v1/models")
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        data = r.json()
-    return data
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(f"{LLAMA_BASE}/v1/models")
+    except httpx.RequestError as exc:
+        logger.exception("models_proxy_connection_failed error=%s", str(exc))
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "qonduit-default",
+                    "object": "model",
+                    "owned_by": "qonduit",
+                }
+            ],
+        }
+
+    if response.status_code >= 400:
+        logger.error(
+            "models_proxy_upstream_error status=%s body=%s",
+            response.status_code,
+            response.text[:300],
+        )
+        raise upstream_error(response.status_code, response.text)
+
+    try:
+        return response.json()
+    except ValueError:
+        logger.error("models_proxy_invalid_json body=%s", response.text[:300])
+        raise upstream_error(502, "Upstream /v1/models returned invalid JSON")
 
 
 def get_request_user_id(request: Request) -> str:
     raw = request.headers.get("X-Qonduit-User", "").strip().lower()
     safe = "".join(c for c in raw if c.isalnum() or c in ("-", "_"))
     return safe or "default"
+
+
+def build_fallback_conversation_id(req: GatewayChatRequest, request: Request) -> str:
+    seed_payload = {
+        "model": req.model,
+        "messages": [
+            {"role": msg.role, "content": coerce_model_content_to_text(msg.content)}
+            for msg in req.messages
+        ],
+        "user_agent": request.headers.get("user-agent", ""),
+    }
+    digest = sha256(
+        json.dumps(seed_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"session-{digest[:16]}"
+
+
+def resolve_conversation_id(req: GatewayChatRequest, request: Request) -> str:
+    header_id = (
+        request.headers.get("X-Conversation-ID", "").strip()
+        or request.headers.get("X-Qonduit-Conversation", "").strip()
+    )
+    if header_id:
+        return header_id
+
+    if (req.user or "").strip():
+        return req.user.strip()
+
+    if (req.conversation_id or "").strip():
+        return req.conversation_id.strip()
+
+    return build_fallback_conversation_id(req, request)
+
+
+def resolve_context_size(req: GatewayChatRequest, state: dict[str, Any]) -> int:
+    if req.context_size is not None:
+        return max(int(req.context_size), 1024)
+
+    last_size = state.get("last_context_size")
+    if isinstance(last_size, int) and last_size >= 1024:
+        return last_size
+
+    return DEFAULT_CONTEXT_SIZE
+
+
+def upstream_error(status_code: int, detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "message": "Upstream request failed",
+            "upstream_status": status_code,
+            "detail": detail,
+        },
+    )
 
 
 def ensure_upload_dir() -> None:
@@ -1007,14 +1118,10 @@ async def chat_completions_help() -> dict:
 @app.post("/chat/completions")
 async def chat(req: GatewayChatRequest, request: Request) -> Any:
     user_id = get_request_user_id(request)
-    context_size = req.resolved_context_size()
-    conversation_id = (
-        (req.conversation_id or "").strip()
-        or (request.headers.get("X-Qonduit-Conversation", "").strip())
-        or (req.user or "").strip()
-        or "default"
-    )
+    conversation_id = resolve_conversation_id(req, request)
     state = load_conversation(conversation_id)
+    context_size = resolve_context_size(req, state)
+    mode = req.mode or DEFAULT_MODE
 
     prior_recent = state.get("recent_messages", [])
     summary = state.get("summary", "")
@@ -1098,6 +1205,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     state["recent_messages"] = trimmed_recent[-8:]
     state["last_model"] = req.model
     state["last_context_size"] = context_size
+    state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
     save_conversation(conversation_id, state)
@@ -1237,6 +1345,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
         state["last_model"] = req.model
         state["last_context_size"] = context_size
+        state["last_mode"] = mode
         state["last_prompt_tokens"] = prompt_tokens
         state["last_reserved_output"] = budget.reserved_output
         save_conversation(conversation_id, state)
@@ -1258,11 +1367,46 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         )
 
     non_stream_start = time.perf_counter()
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=payload)
+    except httpx.RequestError as exc:
+        logger.exception(
+            "chat_upstream_connection_failed conversation_id=%s model=%s error=%s",
+            conversation_id,
+            req.model,
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Failed to connect to upstream chat backend",
+                "upstream": LLAMA_BASE,
+            },
+        )
+
+    if r.status_code >= 400:
+        logger.error(
+            "chat_upstream_error conversation_id=%s model=%s status=%s",
+            conversation_id,
+            req.model,
+            r.status_code,
+        )
+        raise upstream_error(r.status_code, r.text)
+
+    try:
         data = r.json()
+    except ValueError:
+        logger.error(
+            "chat_upstream_invalid_json conversation_id=%s model=%s body=%s",
+            conversation_id,
+            req.model,
+            r.text[:300],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream /v1/chat/completions returned invalid JSON",
+        )
     non_stream_ms = int((time.perf_counter() - non_stream_start) * 1000)
     logger.info(
         "chat_request stream=false conversation_id=%s model=%s latency_ms=%s messages=%s",
@@ -1288,6 +1432,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
     state["last_model"] = req.model
     state["last_context_size"] = context_size
+    state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
     save_conversation(conversation_id, state)

@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path("/app/data/conversations")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def _data_dir() -> Path:
+    root = os.getenv("GATEWAY_DATA_DIR", "/app/data").strip() or "/app/data"
+    path = Path(root) / "conversations"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _conv_path(conversation_id: str) -> Path:
     safe_id = "".join(c for c in conversation_id if c.isalnum() or c in ("-", "_"))
     if not safe_id:
         safe_id = "default"
-    return DATA_DIR / f"{safe_id}.json"
+    return _data_dir() / f"{safe_id}.json"
 
 
 def load_conversation(conversation_id: str) -> dict[str, Any]:

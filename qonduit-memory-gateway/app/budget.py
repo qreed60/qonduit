@@ -5,8 +5,10 @@ from typing import Iterable
 
 import tiktoken
 
-
-ENC = tiktoken.get_encoding("cl100k_base")
+try:
+    ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    ENC = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ def build_budget(context_size: int) -> DynamicBudget:
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
+    if ENC is None:
+        return max(1, len(text) // 4)
     return len(ENC.encode(text))
 
 
