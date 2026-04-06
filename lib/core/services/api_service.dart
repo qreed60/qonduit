@@ -3962,6 +3962,89 @@ class ApiService {
     return rebuilt;
   }
 
+  bool _isStandardTextOnlyModel(
+      String modelId,
+      Map<String, dynamic>? modelItem,
+      ) {
+    bool? capabilityValue(dynamic value) {
+      if (value is bool) return value;
+      if (value is String) {
+        final normalized = value.trim().toLowerCase();
+        if (normalized == 'true') return true;
+        if (normalized == 'false') return false;
+      }
+      return null;
+    }
+
+    try {
+      final capsA = modelItem?['capabilities'];
+      final capsB = (modelItem?['info'] as Map?)?['meta']?['capabilities'];
+      final vision = capabilityValue((capsA as Map?)?['vision']) ??
+          capabilityValue((capsB as Map?)?['vision']);
+      if (vision != null) {
+        return !vision;
+      }
+    } catch (_) {}
+
+    final lower = modelId.toLowerCase();
+    const likelyVisionTags = <String>[
+      'vision',
+      'vl',
+      'llava',
+      'qwen-vl',
+      'gpt-4o',
+      'omni',
+      'multimodal',
+    ];
+    return !likelyVisionTags.any(lower.contains);
+  }
+
+  String _coerceMessageContentToPlainText(dynamic content) {
+    if (content is String) {
+      return content;
+    }
+    if (content is List) {
+      final parts = <String>[];
+      for (final item in content) {
+        if (item is String && item.trim().isNotEmpty) {
+          parts.add(item.trim());
+          continue;
+        }
+        if (item is! Map) {
+          continue;
+        }
+        final type = item['type']?.toString();
+        if (type == 'text' || type == 'input_text') {
+          final text = item['text']?.toString().trim();
+          if (text != null && text.isNotEmpty) {
+            parts.add(text);
+          }
+        }
+      }
+      return parts.join('\n').trim();
+    }
+    if (content is Map) {
+      final text = content['text']?.toString();
+      if (text != null) {
+        return text;
+      }
+    }
+    return content?.toString() ?? '';
+  }
+
+  List<Map<String, dynamic>> _normalizeMessagesToTextOnly(
+      List<Map<String, dynamic>> messages,
+      ) {
+    return messages.map((msg) {
+      // Enforce text-only fallback for strict OpenAI-compatible backends:
+      // never forward files/non-text parts when this mode is active.
+      return <String, dynamic>{
+        'role': (msg['role'] ?? 'user').toString(),
+        'content': _coerceMessageContentToPlainText(msg['content']),
+      };
+    }).toList(growable: false);
+  }
+
 
   bool _shouldUseMemoryGateway({
     required List<Map<String, dynamic>> messages,
@@ -4153,9 +4236,22 @@ class ApiService {
     _streamCancelActions[messageId] = abort;
 
     final preparedMessages = await _prepareMessagesForMemoryGateway(messages);
+    final hasRagCollection =
+        ragCollection != null && ragCollection.trim().isNotEmpty;
+    final enforceTextOnlyForRag =
+        hasRagCollection && _isStandardTextOnlyModel(model, modelItem);
+    final requestMessages = enforceTextOnlyForRag
+        ? _normalizeMessagesToTextOnly(preparedMessages)
+        : preparedMessages;
+
+    if (enforceTextOnlyForRag) {
+      _traceApi(
+        'sendMessageSession: enforcing text-only RAG payload for model=$model',
+      );
+    }
 
     final useMemoryGateway = _shouldUseMemoryGateway(
-      messages: preparedMessages,
+      messages: requestMessages,
       toolIds: toolIds,
       filterIds: filterIds,
       skillIds: skillIds,
@@ -4173,7 +4269,7 @@ class ApiService {
     _traceApi(
       'sendMessageSession: useMemoryGateway=$useMemoryGateway '
           'model=$model conversationId=$conversationId '
-          'preparedLatestInline=${_looksLikeInlineCodeEditPayload((_latestUserMessage(preparedMessages)?['content'] ?? '').toString())}',
+          'preparedLatestInline=${_looksLikeInlineCodeEditPayload((_latestUserMessage(requestMessages)?['content'] ?? '').toString())}',
     );
 
     if (useMemoryGateway) {
@@ -4183,7 +4279,7 @@ class ApiService {
           : messageId;
 
       final gatewayData = _buildMemoryGatewayPayload(
-        messages: preparedMessages,
+        messages: requestMessages,
         model: model,
         conversationId: gatewayConversationId,
         contextSize: contextSize,
@@ -4234,7 +4330,9 @@ class ApiService {
     }
 
     final data = _buildChatCompletionPayload(
-      messages: messages,
+      messages: enforceTextOnlyForRag
+          ? requestMessages
+          : messages,
       model: model,
       messageId: messageId,
       sessionId: sessionId,
