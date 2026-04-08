@@ -1538,25 +1538,65 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
     rag_results = []
     rag_chunks = []
+    rag_namespace = (req.rag_collection or "").strip() or None
 
     rag_active = should_enable_rag(project_id, mode, alias=alias, binding=endpoint_binding)
+    logger.info(
+        "chat_rag_state conversation_id=%s project_id=%s rag_enabled=%s "
+        "namespace=%s request_model=%s effective_model=%s",
+        conversation_id,
+        project_id,
+        rag_active,
+        rag_namespace or "(none)",
+        req.model,
+        effective_model,
+    )
     if latest_text.strip() and rag_active:
         try:
+            used_user_fallback = False
             rag_results = await search_documents(
                 latest_text,
                 limit=RAG_TOP_K,
-                collection=req.rag_collection or project_id,
+                collection=rag_namespace,
                 user_id=user_id,
                 project_id=project_id,
             )
+            if not rag_results:
+                used_user_fallback = True
+                rag_results = await search_documents(
+                    latest_text,
+                    limit=RAG_TOP_K,
+                    collection=rag_namespace,
+                    user_id=None,
+                    project_id=project_id,
+                )
             rag_chunks = [
                 item["text"].strip()
                 for item in rag_results
                 if item.get("text", "").strip()
             ]
+            logger.info(
+                "chat_rag_retrieval conversation_id=%s project_id=%s "
+                "hit_count=%s fallback_without_user=%s",
+                conversation_id,
+                project_id,
+                len(rag_results),
+                "yes" if used_user_fallback else "no",
+            )
         except Exception:
+            logger.exception(
+                "chat_rag_retrieval_failed conversation_id=%s project_id=%s",
+                conversation_id,
+                project_id,
+            )
             rag_results = []
             rag_chunks = []
+    elif not rag_active:
+        logger.info(
+            "chat_rag_skipped_disabled conversation_id=%s project_id=%s",
+            conversation_id,
+            project_id,
+        )
 
     rag_context = "\n\n".join(rag_chunks)
 
@@ -1575,6 +1615,13 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 ),
             }
         )
+    logger.info(
+        "chat_rag_injection conversation_id=%s project_id=%s injected=%s snippets=%s",
+        conversation_id,
+        project_id,
+        bool(rag_context.strip()),
+        len(rag_chunks),
+    )
 
     final_messages.extend(trimmed_recent)
 
