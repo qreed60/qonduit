@@ -37,6 +37,7 @@ from .rag import (
     RAG_ENABLED,
     RAG_TOP_K,
 )
+from .projects import project_alias_cache
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 app = FastAPI(title="Qonduit Memory Gateway")
@@ -112,6 +113,9 @@ PROJECT_DEFAULT_MODE_MAP = env_json("PROJECT_DEFAULT_MODE_MAP", {})
 PROJECT_HOST_BINDINGS = env_json("PROJECT_HOST_BINDINGS", {})
 RAG_PROJECT_FLAGS = env_json("RAG_PROJECT_FLAGS", {})
 ENDPOINT_BINDINGS = env_json("ENDPOINT_BINDINGS", {})
+PROJECTS_ROOT = env_str("PROJECTS_ROOT", "/opt/projects")
+PROJECT_ALIAS_TARGET_MODEL = env_str("PROJECT_ALIAS_TARGET_MODEL", "Qwen3-Coder-Next-IQ4_NL")
+PROJECT_ALIAS_CACHE_TTL_SECONDS = max(env_int("PROJECT_ALIAS_CACHE_TTL_SECONDS", 60), 1)
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -221,43 +225,7 @@ async def health() -> dict:
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models() -> dict:
-    alias_models = []
-    for alias_id, alias in MODEL_ALIAS_CONFIG.items():
-        if not isinstance(alias, dict):
-            continue
-        alias_models.append(
-            {
-                "id": alias_id,
-                "object": "model",
-                "owned_by": "qonduit-alias",
-                "metadata": {
-                    "project_id": alias.get("project_id"),
-                    "default_mode": alias.get("default_mode"),
-                    "target_model": alias.get("model"),
-                    "rag_enabled": alias.get("rag_enabled"),
-                },
-            }
-        )
-    for host, binding in ENDPOINT_BINDINGS.items():
-        if not isinstance(binding, dict):
-            continue
-        alias_id = str(binding.get("model_alias", "")).strip()
-        if not alias_id:
-            continue
-        alias_models.append(
-            {
-                "id": alias_id,
-                "object": "model",
-                "owned_by": "qonduit-endpoint-binding",
-                "metadata": {
-                    "host": host,
-                    "project_id": binding.get("project_id"),
-                    "default_mode": binding.get("default_mode"),
-                    "target_model": binding.get("model"),
-                    "rag_enabled": binding.get("rag_enabled"),
-                },
-            }
-        )
+    alias_models = list(alias_models_for_models_endpoint())
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -379,10 +347,82 @@ def sanitize_identifier(value: str | None, fallback: str) -> str:
 
 
 def model_alias_entry(model: str) -> dict[str, Any] | None:
-    entry = MODEL_ALIAS_CONFIG.get(model)
+    entry = merged_alias_config().get(model)
     if isinstance(entry, dict):
         return entry
     return None
+
+
+def discovered_alias_config(force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    return project_alias_cache.get(
+        projects_root=PROJECTS_ROOT,
+        target_model=PROJECT_ALIAS_TARGET_MODEL,
+        ttl_seconds=PROJECT_ALIAS_CACHE_TTL_SECONDS,
+        force_refresh=force_refresh,
+    )
+
+
+def endpoint_alias_config() -> dict[str, dict[str, Any]]:
+    aliases: dict[str, dict[str, Any]] = {}
+    for host, binding in ENDPOINT_BINDINGS.items():
+        if not isinstance(binding, dict):
+            continue
+        alias_id = str(binding.get("model_alias", "")).strip()
+        if not alias_id:
+            continue
+        aliases[alias_id] = {
+            "model": binding.get("model"),
+            "project_id": binding.get("project_id"),
+            "default_mode": binding.get("default_mode"),
+            "rag_enabled": binding.get("rag_enabled"),
+            "source": "endpoint_binding",
+            "host": host,
+        }
+    return aliases
+
+
+def merged_alias_config() -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    merged.update(endpoint_alias_config())
+    for alias_id, alias in discovered_alias_config().items():
+        if alias_id not in merged:
+            merged[alias_id] = alias
+    merged.update(
+        {
+            alias_id: alias
+            for alias_id, alias in MODEL_ALIAS_CONFIG.items()
+            if isinstance(alias, dict)
+        }
+    )
+    return merged
+
+
+def alias_models_for_models_endpoint() -> list[dict[str, Any]]:
+    alias_models: list[dict[str, Any]] = []
+    for alias_id, alias in merged_alias_config().items():
+        owned_by = "qonduit-alias"
+        if alias.get("source") == "auto_discovered_repo":
+            owned_by = "qonduit-auto-discovery"
+        elif alias.get("source") == "endpoint_binding":
+            owned_by = "qonduit-endpoint-binding"
+        alias_models.append(
+            {
+                "id": alias_id,
+                "object": "model",
+                "owned_by": owned_by,
+                "metadata": {
+                    "project_id": alias.get("project_id"),
+                    "default_mode": alias.get("default_mode"),
+                    "target_model": alias.get("model"),
+                    "rag_enabled": alias.get("rag_enabled"),
+                    "source": alias.get("source"),
+                    "repo_path": alias.get("repo_path"),
+                    "branch": alias.get("branch"),
+                    "host": alias.get("host"),
+                },
+            }
+        )
+    return alias_models
 
 
 def endpoint_binding_entry(request: Request) -> dict[str, Any] | None:
