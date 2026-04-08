@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import hashlib
 import json
 import os
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +51,8 @@ DEFAULT_EXCLUDE_DIRS = {
     "venv",
     "__pycache__",
 }
+
+POINT_ID_NAMESPACE = uuid.UUID("af66e5f9-14d0-44bb-9df0-9f6d567865da")
 
 
 @dataclass
@@ -158,11 +160,24 @@ def _chunk_text(text: str, size: int, overlap: int) -> list[str]:
     return chunks
 
 
-def _point_id(project_id: str, branch: str, rel_path: str, chunk_index: int) -> str:
-    digest = hashlib.sha1(
-        f"{project_id}|{branch}|{rel_path}|{chunk_index}".encode("utf-8")
-    ).hexdigest()
-    return digest
+def _point_id(
+    project_id: str,
+    branch: str,
+    rel_path: str,
+    chunk_index: int,
+    repo_path: str,
+) -> str:
+    stable_key = "|".join(
+        [
+            _safe_id(project_id, "default"),
+            branch.strip() or "unknown",
+            rel_path.strip(),
+            str(chunk_index),
+            repo_path,
+            "repo_ingest",
+        ]
+    )
+    return str(uuid.uuid5(POINT_ID_NAMESPACE, stable_key))
 
 
 def _load_text(file_path: Path) -> str:
@@ -248,7 +263,13 @@ async def ingest_repository(config: IngestConfig) -> IngestStats:
                 project_id=config.project_id,
                 text=chunk,
                 metadata=metadata,
-                point_id=_point_id(config.project_id, config.branch, rel_path, index),
+                point_id=_point_id(
+                    config.project_id,
+                    config.branch,
+                    rel_path,
+                    index,
+                    str(config.repo_path.resolve()),
+                ),
                 namespace=config.branch,
                 user_id="repo_ingest",
             )
