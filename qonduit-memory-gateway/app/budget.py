@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import tiktoken
 
-
-ENC = tiktoken.get_encoding("cl100k_base")
+try:
+    ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    ENC = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ def build_budget(context_size: int) -> DynamicBudget:
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
+    if ENC is None:
+        return max(1, len(text) // 4)
     return len(ENC.encode(text))
 
 
@@ -83,6 +87,7 @@ def trim_recent_messages(
     summary: str,
     system_prompt: str,
     context_size: int,
+    protect_message: Callable[[dict], bool] | None = None,
 ) -> tuple[list[dict], int]:
     budget = build_budget(context_size)
     working = list(messages)
@@ -91,7 +96,17 @@ def trim_recent_messages(
         total = total_prompt_tokens(system_prompt, summary, working)
         if total <= budget.prompt_target:
             return working, total
-        working.pop(0)
+
+        remove_index = 0
+        if protect_message is not None:
+            removable_index = -1
+            for idx, msg in enumerate(working):
+                if not protect_message(msg):
+                    removable_index = idx
+                    break
+            if removable_index >= 0:
+                remove_index = removable_index
+        working.pop(remove_index)
 
     total = total_prompt_tokens(system_prompt, summary, [])
     return [], total
