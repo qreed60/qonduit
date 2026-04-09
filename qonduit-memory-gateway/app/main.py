@@ -38,15 +38,18 @@ from .rag import (
     RAG_TOP_K,
 )
 from .projects import project_alias_cache
+from .ingestion import IngestionManager
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 app = FastAPI(title="Qonduit Memory Gateway")
 logger = logging.getLogger("qonduit.memory_gateway")
+ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
 
 @app.on_event("startup")
 async def startup() -> None:
     ensure_collection()
+    await ingestion_manager.start()
     logger.info(
         "gateway_startup llama_base=%s default_context_size=%s default_mode=%s "
         "gateway_data_dir=%s default_project=%s",
@@ -56,6 +59,11 @@ async def startup() -> None:
         GATEWAY_DATA_DIR,
         DEFAULT_PROJECT_NAMESPACE,
     )
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await ingestion_manager.stop()
 
 
 def env_str(name: str, default: str) -> str:
@@ -116,8 +124,37 @@ ENDPOINT_BINDINGS = env_json("ENDPOINT_BINDINGS", {})
 PROJECTS_ROOT = env_str("PROJECTS_ROOT", "/opt/projects")
 PROJECT_ALIAS_TARGET_MODEL = env_str("PROJECT_ALIAS_TARGET_MODEL", "gpt-oss:20b")
 PROJECT_ALIAS_CACHE_TTL_SECONDS = max(env_int("PROJECT_ALIAS_CACHE_TTL_SECONDS", 60), 1)
+INGESTION_POLL_SECONDS = max(env_int("INGESTION_POLL_SECONDS", 2), 1)
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
+
+
+def _configure_ingestion_logger() -> None:
+    log_path = Path(GATEWAY_DATA_DIR) / "ingestion.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if any(
+        isinstance(handler, logging.FileHandler)
+        and getattr(handler, "baseFilename", "") == str(log_path)
+        for handler in ingestion_logger.handlers
+    ):
+        return
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    ingestion_logger.setLevel(logging.INFO)
+    ingestion_logger.addHandler(file_handler)
+    ingestion_logger.propagate = True
+
+
+_configure_ingestion_logger()
+ingestion_manager = IngestionManager(
+    data_dir=GATEWAY_DATA_DIR,
+    projects_root=PROJECTS_ROOT,
+    logger=ingestion_logger,
+    poll_seconds=float(INGESTION_POLL_SECONDS),
+)
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".json", ".csv",
@@ -217,9 +254,37 @@ class GithubWebhookStubRequest(BaseModel):
     delivery_id: str | None = None
 
 
+class IngestionEnqueueRequest(BaseModel):
+    project_id: str
+    repo_path: str | None = None
+    branch: str | None = None
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": "qonduit-memory-gateway"}
+
+
+@app.get("/v1/ingestion/status")
+async def ingestion_status_all() -> dict:
+    return await ingestion_manager.status_all()
+
+
+@app.get("/v1/ingestion/status/{project_id}")
+async def ingestion_status_project(project_id: str) -> dict:
+    return await ingestion_manager.status_project(project_id)
+
+
+@app.post("/v1/ingestion/enqueue")
+async def ingestion_enqueue(req: IngestionEnqueueRequest) -> dict:
+    result = await ingestion_manager.enqueue(
+        project_id=req.project_id,
+        repo_path=req.repo_path,
+        branch=req.branch,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
 
 
 @app.get("/v1/models")
