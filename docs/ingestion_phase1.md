@@ -52,6 +52,8 @@ Each project status includes:
 - `files_scanned`
 - `chunks_embedded`
 - `chunks_written`
+- `current_step`
+- `current_file`
 
 ## Manual helper scripts
 

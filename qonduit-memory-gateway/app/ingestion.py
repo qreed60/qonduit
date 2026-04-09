@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .ingest_repo import DEFAULT_INCLUDE, IngestConfig, ingest_repository
+from .ingest_repo import DEFAULT_INCLUDE, IngestConfig, ingest_repository_with_progress
 from .projects import discover_git_projects
 
 INGESTION_STATUS_FILE = "ingestion_status.json"
@@ -103,6 +103,8 @@ class IngestionStore:
             "files_scanned": 0,
             "chunks_embedded": 0,
             "chunks_written": 0,
+            "current_step": "idle",
+            "current_file": None,
         }
 
     async def load_status(self) -> dict[str, Any]:
@@ -182,6 +184,8 @@ class IngestionStore:
             repo_path=job.repo_path,
             branch=job.branch,
             last_error=None,
+            current_step="queued",
+            current_file=None,
         )
         return {"ok": True, "enqueued": True, "reason": "queued", "status": status}
 
@@ -344,6 +348,8 @@ class IngestionManager:
             files_scanned=0,
             chunks_embedded=0,
             chunks_written=0,
+            current_step="scanning_repo",
+            current_file=None,
         )
         self.logger.info(
             "ingestion_running project_id=%s repo_path=%s branch=%s",
@@ -364,7 +370,23 @@ class IngestionManager:
                 chunk_overlap=200,
                 commit_sha=_resolve_commit_sha(repo_path),
             )
-            stats = await ingest_repository(config)
+            async def on_progress(progress: dict[str, Any]) -> None:
+                await self.store.update_status(
+                    job.project_id,
+                    state="running",
+                    repo_path=job.repo_path,
+                    branch=config.branch,
+                    files_scanned=int(progress.get("files_scanned", 0)),
+                    chunks_embedded=int(progress.get("chunks_embedded", 0)),
+                    chunks_written=int(progress.get("chunks_written", 0)),
+                    current_step=str(progress.get("current_step", "running")),
+                    current_file=progress.get("current_file"),
+                )
+
+            stats = await ingest_repository_with_progress(
+                config,
+                progress_callback=on_progress,
+            )
             finished_at = _utc_now()
             await self.store.update_status(
                 job.project_id,
@@ -376,6 +398,8 @@ class IngestionManager:
                 files_scanned=stats.scanned_files,
                 chunks_embedded=stats.ingested_chunks,
                 chunks_written=stats.ingested_chunks,
+                current_step="complete",
+                current_file=None,
             )
             self.logger.info(
                 "ingestion_success project_id=%s files_scanned=%s chunks_written=%s",
@@ -392,6 +416,8 @@ class IngestionManager:
                 branch=job.branch,
                 last_finished_at=finished_at,
                 last_error=str(error),
+                current_step="failed",
+                current_file=None,
             )
             self.logger.exception(
                 "ingestion_failed project_id=%s error=%s",

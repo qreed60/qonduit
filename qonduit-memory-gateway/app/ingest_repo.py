@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import inspect
 import json
 import os
 import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from collections.abc import Awaitable
 
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -73,6 +75,9 @@ class IngestConfig:
     chunk_size: int
     chunk_overlap: int
     commit_sha: str
+
+
+ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 
@@ -233,16 +238,57 @@ async def _delete_stale_chunks(
 
 
 async def ingest_repository(config: IngestConfig) -> IngestStats:
+    return await ingest_repository_with_progress(config, progress_callback=None)
+
+
+async def ingest_repository_with_progress(
+    config: IngestConfig,
+    progress_callback: ProgressCallback | None,
+) -> IngestStats:
     stats = IngestStats()
     files = _walk_files(config)
     stats.scanned_files = len(files)
+    if progress_callback is not None:
+        result = progress_callback(
+            {
+                "current_step": "scanning_repo",
+                "files_scanned": stats.scanned_files,
+                "current_file": None,
+            }
+        )
+        if inspect.isawaitable(result):
+            await result
 
     rel_paths_seen: set[str] = set()
 
     for path in files:
         rel_path = path.relative_to(config.repo_path).as_posix()
+        if progress_callback is not None:
+            result = progress_callback(
+                {
+                    "current_step": "reading_file",
+                    "files_scanned": stats.scanned_files,
+                    "current_file": rel_path,
+                    "chunks_embedded": stats.ingested_chunks,
+                    "chunks_written": stats.ingested_chunks,
+                }
+            )
+            if inspect.isawaitable(result):
+                await result
         rel_paths_seen.add(rel_path)
         text = _load_text(path)
+        if progress_callback is not None:
+            result = progress_callback(
+                {
+                    "current_step": "chunking_file",
+                    "files_scanned": stats.scanned_files,
+                    "current_file": rel_path,
+                    "chunks_embedded": stats.ingested_chunks,
+                    "chunks_written": stats.ingested_chunks,
+                }
+            )
+            if inspect.isawaitable(result):
+                await result
         chunks = _chunk_text(text, config.chunk_size, config.chunk_overlap)
         if not chunks:
             continue
@@ -250,6 +296,18 @@ async def ingest_repository(config: IngestConfig) -> IngestStats:
         stats.ingested_files += 1
 
         for index, chunk in enumerate(chunks):
+            if progress_callback is not None:
+                result = progress_callback(
+                    {
+                        "current_step": "embedding_chunk",
+                        "files_scanned": stats.scanned_files,
+                        "current_file": rel_path,
+                        "chunks_embedded": stats.ingested_chunks,
+                        "chunks_written": stats.ingested_chunks,
+                    }
+                )
+                if inspect.isawaitable(result):
+                    await result
             metadata = {
                 "source": "repo_ingest",
                 "project_id": _safe_id(config.project_id, "default"),
@@ -274,11 +332,47 @@ async def ingest_repository(config: IngestConfig) -> IngestStats:
                 user_id="repo_ingest",
             )
             stats.ingested_chunks += 1
+            if progress_callback is not None:
+                result = progress_callback(
+                    {
+                        "current_step": "writing_chunk",
+                        "files_scanned": stats.scanned_files,
+                        "current_file": rel_path,
+                        "chunks_embedded": stats.ingested_chunks,
+                        "chunks_written": stats.ingested_chunks,
+                    }
+                )
+                if inspect.isawaitable(result):
+                    await result
 
+    if progress_callback is not None:
+        result = progress_callback(
+            {
+                "current_step": "deleting_stale_chunks",
+                "files_scanned": stats.scanned_files,
+                "current_file": None,
+                "chunks_embedded": stats.ingested_chunks,
+                "chunks_written": stats.ingested_chunks,
+            }
+        )
+        if inspect.isawaitable(result):
+            await result
     stats.deleted_chunks = await _delete_stale_chunks(
         config=config,
         existing_rel_paths=rel_paths_seen,
     )
+    if progress_callback is not None:
+        result = progress_callback(
+            {
+                "current_step": "complete",
+                "files_scanned": stats.scanned_files,
+                "current_file": None,
+                "chunks_embedded": stats.ingested_chunks,
+                "chunks_written": stats.ingested_chunks,
+            }
+        )
+        if inspect.isawaitable(result):
+            await result
     return stats
 
 
