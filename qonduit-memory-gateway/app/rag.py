@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 import httpx
+import os
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
