@@ -105,6 +105,21 @@ def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
         return default
     return parsed
 
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid_int_env name=%s raw=%s fallback=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
 
 LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
 DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
