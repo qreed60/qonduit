@@ -412,16 +412,40 @@ async def ingest_repository_with_progress(
             )
             events.put({"step": "embedding_chunk"})
             try:
+                logger.info(
+                    "chunk_embed_call_started project_id=%s file=%s chunk_index=%s timeout_seconds=%s",
+                    config.project_id,
+                    rel_path,
+                    index,
+                    config.embed_timeout_seconds,
+                )
                 vector = _embed_text_sync(
                     chunk,
                     timeout_seconds=config.embed_timeout_seconds,
                 )
-            except Exception:
+                logger.info(
+                    "chunk_embed_call_completed project_id=%s file=%s chunk_index=%s",
+                    config.project_id,
+                    rel_path,
+                    index,
+                )
+            except TimeoutError as error:
                 logger.warning(
                     "chunk_processing_timed_out project_id=%s file=%s chunk_index=%s phase=embedding",
                     config.project_id,
                     rel_path,
                     index,
+                )
+                raise TimeoutError(
+                    f"Chunk embed timeout for {rel_path} chunk={index}",
+                ) from error
+            except Exception as error:
+                logger.exception(
+                    "chunk_processing_exception project_id=%s file=%s chunk_index=%s phase=embedding error=%s",
+                    config.project_id,
+                    rel_path,
+                    index,
+                    str(error),
                 )
                 continue
             events.put({"step": "writing_chunk"})
@@ -442,6 +466,13 @@ async def ingest_repository_with_progress(
                 repo_path_value,
             )
             try:
+                logger.info(
+                    "chunk_upsert_call_started project_id=%s file=%s chunk_index=%s timeout_seconds=%s",
+                    config.project_id,
+                    rel_path,
+                    index,
+                    config.qdrant_timeout_seconds,
+                )
                 _qdrant_call_with_timeout(
                     qdrant.upsert,
                     config.qdrant_timeout_seconds,
@@ -454,12 +485,29 @@ async def ingest_repository_with_progress(
                         )
                     ],
                 )
-            except Exception:
+                logger.info(
+                    "chunk_upsert_call_completed project_id=%s file=%s chunk_index=%s",
+                    config.project_id,
+                    rel_path,
+                    index,
+                )
+            except TimeoutError as error:
                 logger.warning(
                     "chunk_processing_timed_out project_id=%s file=%s chunk_index=%s phase=upsert",
                     config.project_id,
                     rel_path,
                     index,
+                )
+                raise TimeoutError(
+                    f"Chunk upsert timeout for {rel_path} chunk={index}",
+                ) from error
+            except Exception as error:
+                logger.exception(
+                    "chunk_processing_exception project_id=%s file=%s chunk_index=%s phase=upsert error=%s",
+                    config.project_id,
+                    rel_path,
+                    index,
+                    str(error),
                 )
                 continue
             processed_chunks += 1
@@ -470,6 +518,12 @@ async def ingest_repository_with_progress(
         rel_path = path.relative_to(config.repo_path).as_posix()
         rel_paths_seen.add(rel_path)
         logger.info("file_processing_started project_id=%s file=%s", config.project_id, rel_path)
+        logger.info(
+            "file_processing_timeout_wrapper_started project_id=%s file=%s timeout_seconds=%s",
+            config.project_id,
+            rel_path,
+            config.file_timeout_seconds,
+        )
         event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         file_task = asyncio.create_task(
             asyncio.to_thread(_process_file_sync, path, rel_path, event_queue),
@@ -489,7 +543,55 @@ async def ingest_repository_with_progress(
                     else:
                         await _notify_progress(current_step=step, current_file=rel_path)
                 if file_task.done():
-                    chunks_for_file = file_task.result()
+                    try:
+                        chunks_for_file = file_task.result()
+                    except TimeoutError:
+                        stats.skipped_files += 1
+                        logger.warning(
+                            "file_processing_timed_out project_id=%s file=%s source=thread_timeout",
+                            config.project_id,
+                            rel_path,
+                        )
+                        logger.info(
+                            "file_processing_skipped project_id=%s file=%s reason=thread_timeout",
+                            config.project_id,
+                            rel_path,
+                        )
+                        await _notify_progress(
+                            current_step="reading_file",
+                            current_file=rel_path,
+                        )
+                        logger.info(
+                            "status_updated_skipped_file project_id=%s file=%s skipped_files=%s",
+                            config.project_id,
+                            rel_path,
+                            stats.skipped_files,
+                        )
+                        break
+                    except Exception as error:
+                        stats.skipped_files += 1
+                        logger.exception(
+                            "file_processing_exception project_id=%s file=%s error=%s",
+                            config.project_id,
+                            rel_path,
+                            str(error),
+                        )
+                        logger.info(
+                            "file_processing_skipped project_id=%s file=%s reason=exception",
+                            config.project_id,
+                            rel_path,
+                        )
+                        await _notify_progress(
+                            current_step="reading_file",
+                            current_file=rel_path,
+                        )
+                        logger.info(
+                            "status_updated_skipped_file project_id=%s file=%s skipped_files=%s",
+                            config.project_id,
+                            rel_path,
+                            stats.skipped_files,
+                        )
+                        break
                     if chunks_for_file > 0:
                         stats.ingested_files += 1
                     break
@@ -512,6 +614,12 @@ async def ingest_repository_with_progress(
             )
             file_task.cancel()
             await _notify_progress(current_step="reading_file", current_file=rel_path)
+            logger.info(
+                "status_updated_skipped_file project_id=%s file=%s skipped_files=%s",
+                config.project_id,
+                rel_path,
+                stats.skipped_files,
+            )
             continue
 
     if progress_callback is not None:

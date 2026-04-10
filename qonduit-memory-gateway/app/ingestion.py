@@ -466,6 +466,10 @@ class IngestionManager:
                         current_step="failed",
                     )
                     self.logger.error(
+                        "status_updated_failed project_id=%s reason=stalled_timeout",
+                        job.project_id,
+                    )
+                    self.logger.error(
                         "ingestion_stalled_timeout project_id=%s elapsed=%s timeout=%s",
                         job.project_id,
                         int(elapsed),
@@ -505,6 +509,10 @@ class IngestionManager:
                 last_error=str(error),
                 current_step="failed",
                 current_file=None,
+            )
+            self.logger.error(
+                "status_updated_failed project_id=%s reason=exception",
+                job.project_id,
             )
             self.logger.exception(
                 "ingestion_failed project_id=%s error=%s",
