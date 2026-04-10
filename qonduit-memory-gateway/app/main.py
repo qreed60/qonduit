@@ -105,6 +105,19 @@ def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
         return default
     return parsed
 
+def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("invalid_json_env name=%s raw=%s", name, raw[:200])
+        return default
+    if not isinstance(parsed, dict):
+        logger.warning("invalid_json_env_type name=%s expected=dict", name)
+        return default
+    return parsed
 
 LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
 DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
