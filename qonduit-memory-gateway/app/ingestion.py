@@ -10,7 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .ingest_repo import DEFAULT_INCLUDE, IngestConfig, ingest_repository_with_progress
+from .ingest_repo import (
+    DEFAULT_EXCLUDE_PATTERNS,
+    DEFAULT_INCLUDE,
+    DEFAULT_MAX_FILE_BYTES,
+    IngestConfig,
+    ingest_repository_with_progress,
+)
 from .projects import discover_git_projects
 
 INGESTION_STATUS_FILE = "ingestion_status.json"
@@ -365,10 +371,11 @@ class IngestionManager:
                 repo_path=repo_path,
                 branch=job.branch or _resolve_branch(repo_path, None),
                 include_patterns=list(DEFAULT_INCLUDE),
-                exclude_patterns=[],
+                exclude_patterns=list(DEFAULT_EXCLUDE_PATTERNS),
                 chunk_size=1200,
                 chunk_overlap=200,
                 commit_sha=_resolve_commit_sha(repo_path),
+                max_file_bytes=DEFAULT_MAX_FILE_BYTES,
             )
             async def on_progress(progress: dict[str, Any]) -> None:
                 await self.store.update_status(

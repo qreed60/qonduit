@@ -9,6 +9,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable
 from collections.abc import Awaitable
 
@@ -40,6 +41,26 @@ DEFAULT_INCLUDE = [
     "*.sh",
     "*.sql",
 ]
+
+# Exclude generated/minified/vendor-heavy paths by default to avoid wasting
+# embedding budget and to prevent ingestion stalls on very large artifacts.
+# Operators can override via --exclude when needed.
+DEFAULT_EXCLUDE_PATTERNS = [
+    "**/*.min.js",
+    "**/*.min.css",
+    "**/node_modules/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/.gradle/**",
+    "**/.dart_tool/**",
+    "**/coverage/**",
+    "**/.git/**",
+    "**/*.map",
+    "**/vendor/**",
+    "**/third_party/**",
+]
+
+DEFAULT_MAX_FILE_BYTES = 1_500_000
 
 DEFAULT_EXCLUDE_DIRS = {
     ".git",
@@ -75,6 +96,7 @@ class IngestConfig:
     chunk_size: int
     chunk_overlap: int
     commit_sha: str
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
 
 
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -117,7 +139,11 @@ def _resolve_branch(repo_path: Path, explicit_branch: str | None) -> str:
 
 
 def _matches_any(path: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+    posix_path = PurePosixPath(path)
+    return any(
+        fnmatch.fnmatch(path, pattern) or posix_path.match(pattern)
+        for pattern in patterns
+    )
 
 
 def _walk_files(config: IngestConfig) -> list[Path]:
@@ -141,7 +167,14 @@ def _walk_files(config: IngestConfig) -> list[Path]:
                 continue
             if not _matches_any(rel_file, config.include_patterns):
                 continue
-            files.append(config.repo_path / rel_file)
+            full_path = config.repo_path / rel_file
+            try:
+                size = full_path.stat().st_size
+            except OSError:
+                continue
+            if size > config.max_file_bytes:
+                continue
+            files.append(full_path)
 
     return sorted(files)
 
@@ -382,9 +415,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-path", required=True)
     parser.add_argument("--branch", default=None)
     parser.add_argument("--include", default=",".join(DEFAULT_INCLUDE))
-    parser.add_argument("--exclude", default="")
+    parser.add_argument("--exclude", default=",".join(DEFAULT_EXCLUDE_PATTERNS))
     parser.add_argument("--chunk-size", type=int, default=1200)
     parser.add_argument("--chunk-overlap", type=int, default=200)
+    parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
     return parser.parse_args()
 
 
@@ -405,10 +439,11 @@ async def _run_cli() -> int:
         repo_path=repo_path,
         branch=branch,
         include_patterns=include_patterns or DEFAULT_INCLUDE,
-        exclude_patterns=exclude_patterns,
+        exclude_patterns=exclude_patterns or DEFAULT_EXCLUDE_PATTERNS,
         chunk_size=max(200, args.chunk_size),
         chunk_overlap=max(0, min(args.chunk_overlap, args.chunk_size // 2)),
         commit_sha=commit_sha,
+        max_file_bytes=max(1_000, args.max_file_bytes),
     )
 
     stats = await ingest_repository(config)

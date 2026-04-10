@@ -25,6 +25,28 @@ python -m app.ingest_repo \
 - `--exclude` (optional): comma-separated exclude globs.
 - `--chunk-size` (optional): chunk size in characters (default `1200`).
 - `--chunk-overlap` (optional): overlap in characters (default `200`).
+- `--max-file-bytes` (optional): max file size in bytes before skipping
+  (default `1500000`).
+
+### Default exclusion safety filters
+
+To keep coding-focused RAG useful and avoid stalls on generated/minified assets,
+repo ingestion excludes these globs by default:
+
+- `**/*.min.js`
+- `**/*.min.css`
+- `**/node_modules/**`
+- `**/build/**`
+- `**/dist/**`
+- `**/.gradle/**`
+- `**/.dart_tool/**`
+- `**/coverage/**`
+- `**/.git/**`
+- `**/*.map`
+- `**/vendor/**`
+- `**/third_party/**`
+
+These defaults preserve source/docs while skipping large generated/vendor files.
 
 ## Stored metadata per chunk
 
