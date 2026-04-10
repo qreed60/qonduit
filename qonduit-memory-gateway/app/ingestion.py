@@ -25,6 +25,18 @@ INGESTION_LOG_FILE = "ingestion.log"
 STATUS_STATES = {"idle", "queued", "running", "success", "failed"}
 
 
+def _get_file_timeout_seconds() -> float:
+    """Get per-file timeout from env var INGESTION_FILE_TIMEOUT_SECONDS."""
+    raw = os.getenv("INGESTION_FILE_TIMEOUT_SECONDS")
+    if raw is None:
+        return 120.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    return max(10.0, value)
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -109,6 +121,7 @@ class IngestionStore:
             "files_scanned": 0,
             "chunks_embedded": 0,
             "chunks_written": 0,
+            "skipped_files": 0,
             "current_step": "idle",
             "current_file": None,
         }
@@ -366,6 +379,7 @@ class IngestionManager:
 
         try:
             repo_path = Path(job.repo_path).resolve()
+            file_timeout_seconds = _get_file_timeout_seconds()
             config = IngestConfig(
                 project_id=job.project_id,
                 repo_path=repo_path,
@@ -376,19 +390,44 @@ class IngestionManager:
                 chunk_overlap=200,
                 commit_sha=_resolve_commit_sha(repo_path),
                 max_file_bytes=DEFAULT_MAX_FILE_BYTES,
+                file_timeout_seconds=file_timeout_seconds,
             )
+
+            last_progress_at = _utc_now()
+
             async def on_progress(progress: dict[str, Any]) -> None:
-                await self.store.update_status(
-                    job.project_id,
-                    state="running",
-                    repo_path=job.repo_path,
-                    branch=config.branch,
-                    files_scanned=int(progress.get("files_scanned", 0)),
-                    chunks_embedded=int(progress.get("chunks_embedded", 0)),
-                    chunks_written=int(progress.get("chunks_written", 0)),
-                    current_step=str(progress.get("current_step", "running")),
-                    current_file=progress.get("current_file"),
-                )
+                nonlocal last_progress_at
+                current_step = str(progress.get("current_step", "running"))
+
+                # Track skipped_files from progress updates
+                skipped = int(progress.get("skipped_files", 0))
+
+                update_kwargs: dict[str, Any] = {
+                    "state": "running",
+                    "repo_path": job.repo_path,
+                    "branch": config.branch,
+                    "files_scanned": int(progress.get("files_scanned", 0)),
+                    "chunks_embedded": int(progress.get("chunks_embedded", 0)),
+                    "chunks_written": int(progress.get("chunks_written", 0)),
+                    "current_step": current_step,
+                    "current_file": progress.get("current_file"),
+                }
+
+                # Include skipped_files if present
+                if skipped > 0:
+                    update_kwargs["skipped_files"] = skipped
+
+                # Log timeout events
+                if current_step == "file_processing_skipped":
+                    self.logger.info(
+                        "file_processing_timed_out project_id=%s file=%s reason=%s",
+                        job.project_id,
+                        progress.get("current_file"),
+                        progress.get("skip_reason", "timeout"),
+                    )
+                    last_progress_at = _utc_now()
+
+                await self.store.update_status(job.project_id, **update_kwargs)
 
             stats = await ingest_repository_with_progress(
                 config,
@@ -405,14 +444,16 @@ class IngestionManager:
                 files_scanned=stats.scanned_files,
                 chunks_embedded=stats.ingested_chunks,
                 chunks_written=stats.ingested_chunks,
+                skipped_files=stats.skipped_files,
                 current_step="complete",
                 current_file=None,
             )
             self.logger.info(
-                "ingestion_success project_id=%s files_scanned=%s chunks_written=%s",
+                "ingestion_success project_id=%s files_scanned=%s chunks_written=%s skipped_files=%s",
                 job.project_id,
                 stats.scanned_files,
                 stats.ingested_chunks,
+                stats.skipped_files,
             )
         except Exception as error:
             finished_at = _utc_now()

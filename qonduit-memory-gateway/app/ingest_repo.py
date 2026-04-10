@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import fnmatch
 import inspect
 import json
 import os
 import subprocess
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Callable
@@ -84,6 +85,7 @@ class IngestStats:
     ingested_files: int = 0
     ingested_chunks: int = 0
     deleted_chunks: int = 0
+    skipped_files: int = 0
 
 
 @dataclass
@@ -97,6 +99,7 @@ class IngestConfig:
     chunk_overlap: int
     commit_sha: str
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
+    file_timeout_seconds: float = 120.0
 
 
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -296,87 +299,37 @@ async def ingest_repository_with_progress(
 
     for path in files:
         rel_path = path.relative_to(config.repo_path).as_posix()
-        if progress_callback is not None:
-            result = progress_callback(
-                {
-                    "current_step": "reading_file",
-                    "files_scanned": stats.scanned_files,
-                    "current_file": rel_path,
-                    "chunks_embedded": stats.ingested_chunks,
-                    "chunks_written": stats.ingested_chunks,
-                }
-            )
-            if inspect.isawaitable(result):
-                await result
-        rel_paths_seen.add(rel_path)
-        text = _load_text(path)
-        if progress_callback is not None:
-            result = progress_callback(
-                {
-                    "current_step": "chunking_file",
-                    "files_scanned": stats.scanned_files,
-                    "current_file": rel_path,
-                    "chunks_embedded": stats.ingested_chunks,
-                    "chunks_written": stats.ingested_chunks,
-                }
-            )
-            if inspect.isawaitable(result):
-                await result
-        chunks = _chunk_text(text, config.chunk_size, config.chunk_overlap)
-        if not chunks:
-            continue
 
-        stats.ingested_files += 1
-
-        for index, chunk in enumerate(chunks):
-            if progress_callback is not None:
-                result = progress_callback(
-                    {
-                        "current_step": "embedding_chunk",
-                        "files_scanned": stats.scanned_files,
-                        "current_file": rel_path,
-                        "chunks_embedded": stats.ingested_chunks,
-                        "chunks_written": stats.ingested_chunks,
-                    }
-                )
-                if inspect.isawaitable(result):
-                    await result
-            metadata = {
-                "source": "repo_ingest",
-                "project_id": _safe_id(config.project_id, "default"),
-                "repo_path": str(config.repo_path.resolve()),
-                "branch": config.branch,
-                "file_path": rel_path,
-                "chunk_index": index,
-                "commit_sha": config.commit_sha,
-            }
-            await rag_service.add_document(
-                project_id=config.project_id,
-                text=chunk,
-                metadata=metadata,
-                point_id=_point_id(
-                    config.project_id,
-                    config.branch,
-                    rel_path,
-                    index,
-                    str(config.repo_path.resolve()),
+        # Process each file with a timeout to prevent wedging
+        try:
+            await asyncio.wait_for(
+                _process_single_file(
+                    path=path,
+                    config=config,
+                    stats=stats,
+                    rel_paths_seen=rel_paths_seen,
+                    progress_callback=progress_callback,
                 ),
-                namespace=config.branch,
-                user_id="repo_ingest",
+                timeout=config.file_timeout_seconds,
             )
-            stats.ingested_chunks += 1
+        except asyncio.TimeoutError:
+            # File timed out - skip it and continue
+            stats.skipped_files += 1
             if progress_callback is not None:
                 result = progress_callback(
                     {
-                        "current_step": "writing_chunk",
+                        "current_step": "file_processing_skipped",
                         "files_scanned": stats.scanned_files,
                         "current_file": rel_path,
                         "chunks_embedded": stats.ingested_chunks,
                         "chunks_written": stats.ingested_chunks,
+                        "skipped_files": stats.skipped_files,
+                        "skip_reason": "timeout",
                     }
                 )
                 if inspect.isawaitable(result):
                     await result
+            # Continue to next file - do not fail the entire job
 
     if progress_callback is not None:
         result = progress_callback(
@@ -409,6 +362,107 @@ async def ingest_repository_with_progress(
     return stats
 
 
+async def _process_single_file(
+    *,
+    path: Path,
+    config: IngestConfig,
+    stats: IngestStats,
+    rel_paths_seen: set[str],
+    progress_callback: ProgressCallback | None,
+) -> None:
+    """Process a single file. Raises TimeoutError if it takes too long."""
+    rel_path = path.relative_to(config.repo_path).as_posix()
+
+    # Step 1: reading_file
+    if progress_callback is not None:
+        result = progress_callback(
+            {
+                "current_step": "reading_file",
+                "files_scanned": stats.scanned_files,
+                "current_file": rel_path,
+                "chunks_embedded": stats.ingested_chunks,
+                "chunks_written": stats.ingested_chunks,
+            }
+        )
+        if inspect.isawaitable(result):
+            await result
+
+    rel_paths_seen.add(rel_path)
+    text = _load_text(path)
+
+    # Step 2: chunking_file
+    if progress_callback is not None:
+        result = progress_callback(
+            {
+                "current_step": "chunking_file",
+                "files_scanned": stats.scanned_files,
+                "current_file": rel_path,
+                "chunks_embedded": stats.ingested_chunks,
+                "chunks_written": stats.ingested_chunks,
+            }
+        )
+        if inspect.isawaitable(result):
+            await result
+
+    chunks = _chunk_text(text, config.chunk_size, config.chunk_overlap)
+    if not chunks:
+        return
+
+    stats.ingested_files += 1
+
+    for index, chunk in enumerate(chunks):
+        if progress_callback is not None:
+            result = progress_callback(
+                {
+                    "current_step": "embedding_chunk",
+                    "files_scanned": stats.scanned_files,
+                    "current_file": rel_path,
+                    "chunks_embedded": stats.ingested_chunks,
+                    "chunks_written": stats.ingested_chunks,
+                }
+            )
+            if inspect.isawaitable(result):
+                await result
+
+        metadata = {
+            "source": "repo_ingest",
+            "project_id": _safe_id(config.project_id, "default"),
+            "repo_path": str(config.repo_path.resolve()),
+            "branch": config.branch,
+            "file_path": rel_path,
+            "chunk_index": index,
+            "commit_sha": config.commit_sha,
+        }
+        await rag_service.add_document(
+            project_id=config.project_id,
+            text=chunk,
+            metadata=metadata,
+            point_id=_point_id(
+                config.project_id,
+                config.branch,
+                rel_path,
+                index,
+                str(config.repo_path.resolve()),
+            ),
+            namespace=config.branch,
+            user_id="repo_ingest",
+        )
+        stats.ingested_chunks += 1
+
+        if progress_callback is not None:
+            result = progress_callback(
+                {
+                    "current_step": "writing_chunk",
+                    "files_scanned": stats.scanned_files,
+                    "current_file": rel_path,
+                    "chunks_embedded": stats.ingested_chunks,
+                    "chunks_written": stats.ingested_chunks,
+                }
+            )
+            if inspect.isawaitable(result):
+                await result
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest a repo into project-scoped RAG")
     parser.add_argument("--project-id", required=True)
@@ -419,6 +473,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=1200)
     parser.add_argument("--chunk-overlap", type=int, default=200)
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
+    parser.add_argument("--file-timeout-seconds", type=float, default=120.0)
     return parser.parse_args()
 
 
@@ -444,6 +499,7 @@ async def _run_cli() -> int:
         chunk_overlap=max(0, min(args.chunk_overlap, args.chunk_size // 2)),
         commit_sha=commit_sha,
         max_file_bytes=max(1_000, args.max_file_bytes),
+        file_timeout_seconds=max(10.0, args.file_timeout_seconds),
     )
 
     stats = await ingest_repository(config)
@@ -459,6 +515,7 @@ async def _run_cli() -> int:
                 "ingested_files": stats.ingested_files,
                 "ingested_chunks": stats.ingested_chunks,
                 "deleted_stale_chunks": stats.deleted_chunks,
+                "skipped_files": stats.skipped_files,
             },
             indent=2,
         )
