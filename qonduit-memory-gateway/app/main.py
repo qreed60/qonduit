@@ -46,6 +46,10 @@ logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
 
+# Track in-flight stream requests for fallback retry
+_in_flight_streams: dict[str, dict[str, Any]] = {}
+
+
 @app.on_event("startup")
 async def startup() -> None:
     ensure_collection()
