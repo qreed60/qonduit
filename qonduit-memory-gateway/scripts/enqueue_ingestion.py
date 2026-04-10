@@ -11,7 +11,7 @@ def main() -> int:
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--repo-path")
     parser.add_argument("--branch")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8090")
     args = parser.parse_args()
 
     payload = {

@@ -9,30 +9,32 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.py~
-*.pyc~
-*.pyo~
 .Python
 env/
 venv/
 .venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
+.ENV
+.python-version
+
+# Logs
 *.log
-*.pot
-*.mo
-Moe/
-tags
-TAGS
-id-tags
-id-TAGS
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Coverage
+.coverage
+htmlcov/
+.coverage.*
+.coverage.xml
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
 Thumbs.db
 ```

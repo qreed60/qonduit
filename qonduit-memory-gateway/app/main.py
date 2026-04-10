@@ -275,6 +275,12 @@ async def ingestion_status_project(project_id: str) -> dict:
     return await ingestion_manager.status_project(project_id)
 
 
+@app.get("/v1/ingestion/debug")
+async def ingestion_debug_state() -> dict:
+    """Return full debug state including queue, active job, and history."""
+    return await ingestion_manager.debug_state()
+
+
 @app.post("/v1/ingestion/enqueue")
 async def ingestion_enqueue(req: IngestionEnqueueRequest) -> dict:
     result = await ingestion_manager.enqueue(
