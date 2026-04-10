@@ -15,13 +15,14 @@ from pathlib import Path
 import re
 import uuid
 from typing import Any
+from hashlib import sha256
 
 from pypdf import PdfReader
 from docx import Document
 from openpyxl import load_workbook
 
 from .budget import build_budget, estimate_tokens, trim_recent_messages
-from .store import load_conversation, save_conversation
+from .store import DEFAULT_PROJECT_ID, load_conversation, save_conversation
 from .summarizer import summarize_messages
 from .rag import (
     ensure_collection,
@@ -29,27 +30,135 @@ from .rag import (
     search_documents,
     list_collections,
     create_collection_marker,
+    create_embeddings_response,
     qdrant,
     COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    RAG_ENABLED,
+    RAG_TOP_K,
 )
+from .projects import project_alias_cache
+from .ingestion import IngestionManager
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 app = FastAPI(title="Qonduit Memory Gateway")
 logger = logging.getLogger("qonduit.memory_gateway")
+ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
 
 @app.on_event("startup")
 async def startup() -> None:
     ensure_collection()
+    await ingestion_manager.start()
+    logger.info(
+        "gateway_startup llama_base=%s default_context_size=%s default_mode=%s "
+        "gateway_data_dir=%s default_project=%s",
+        LLAMA_BASE,
+        DEFAULT_CONTEXT_SIZE,
+        DEFAULT_MODE,
+        GATEWAY_DATA_DIR,
+        DEFAULT_PROJECT_NAMESPACE,
+    )
 
 
-LLAMA_BASE = "http://192.168.5.5:8080"
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await ingestion_manager.stop()
+
+
+def env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    cleaned = value.strip()
+    return cleaned or default
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid_int_env name=%s raw=%s fallback=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("invalid_json_env name=%s raw=%s", name, raw[:200])
+        return default
+    if not isinstance(parsed, dict):
+        logger.warning("invalid_json_env_type name=%s expected=dict", name)
+        return default
+    return parsed
+
+
+LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
+DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
+DEFAULT_MODE = env_str("DEFAULT_MODE", "chat")
+GATEWAY_DATA_DIR = env_str("GATEWAY_DATA_DIR", "/app/data")
+DEFAULT_PROJECT_NAMESPACE = env_str("DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID)
+PROJECT_DEFAULT_MODE = env_str("PROJECT_DEFAULT_MODE", DEFAULT_MODE)
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = 10.0
 UPSTREAM_WRITE_TIMEOUT_SECONDS = 60.0
 UPSTREAM_POOL_TIMEOUT_SECONDS = 60.0
 STREAM_KEEPALIVE_INTERVAL_SECONDS = 2.0
+MODEL_ALIAS_CONFIG = env_json("MODEL_ALIAS_CONFIG", {})
+PROJECT_DEFAULT_MODE_MAP = env_json("PROJECT_DEFAULT_MODE_MAP", {})
+PROJECT_HOST_BINDINGS = env_json("PROJECT_HOST_BINDINGS", {})
+RAG_PROJECT_FLAGS = env_json("RAG_PROJECT_FLAGS", {})
+ENDPOINT_BINDINGS = env_json("ENDPOINT_BINDINGS", {})
+PROJECTS_ROOT = env_str("PROJECTS_ROOT", "/opt/projects")
+PROJECT_ALIAS_TARGET_MODEL = env_str("PROJECT_ALIAS_TARGET_MODEL", "gpt-oss:20b")
+PROJECT_ALIAS_CACHE_TTL_SECONDS = max(env_int("PROJECT_ALIAS_CACHE_TTL_SECONDS", 60), 1)
+INGESTION_POLL_SECONDS = max(env_int("INGESTION_POLL_SECONDS", 2), 1)
+INGESTION_STALL_TIMEOUT_SECONDS = max(env_int("INGESTION_STALL_TIMEOUT_SECONDS", 600), 30)
+INGESTION_FILE_TIMEOUT_SECONDS = max(env_int("INGESTION_FILE_TIMEOUT_SECONDS", 120), 1)
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
+
+
+def _configure_ingestion_logger() -> None:
+    log_path = Path(GATEWAY_DATA_DIR) / "ingestion.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if any(
+        isinstance(handler, logging.FileHandler)
+        and getattr(handler, "baseFilename", "") == str(log_path)
+        for handler in ingestion_logger.handlers
+    ):
+        return
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    ingestion_logger.setLevel(logging.INFO)
+    ingestion_logger.addHandler(file_handler)
+    ingestion_logger.propagate = True
+
+
+_configure_ingestion_logger()
+ingestion_manager = IngestionManager(
+    data_dir=GATEWAY_DATA_DIR,
+    projects_root=PROJECTS_ROOT,
+    logger=ingestion_logger,
+    poll_seconds=float(INGESTION_POLL_SECONDS),
+    stall_timeout_seconds=INGESTION_STALL_TIMEOUT_SECONDS,
+    file_timeout_seconds=INGESTION_FILE_TIMEOUT_SECONDS,
+)
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".json", ".csv",
@@ -101,6 +210,7 @@ class ChatMessage(BaseModel):
 
 class GatewayChatRequest(BaseModel):
     conversation_id: str | None = None
+    project_id: str | None = None
     messages: list[ChatMessage]
     model: str
     context_size: int | None = Field(default=None)
@@ -109,12 +219,9 @@ class GatewayChatRequest(BaseModel):
     stream: bool = False
     user: str | None = None
     rag_collection: str | None = None
+    mode: str | None = None
 
     model_config = {"extra": "allow"}
-
-    def resolved_context_size(self) -> int:
-        value = self.context_size or 65536
-        return max(value, 1024)
 
 
 class RagIngestRequest(BaseModel):
@@ -138,26 +245,432 @@ class RagCollectionDeleteRequest(BaseModel):
     name: str
 
 
+class EmbeddingsRequest(BaseModel):
+    input: str | list[str]
+    model: str | None = None
+    user: str | None = None
+
+
+class GithubWebhookStubRequest(BaseModel):
+    project_id: str
+    repo_path: str
+    branch: str | None = None
+    delivery_id: str | None = None
+
+
+class IngestionEnqueueRequest(BaseModel):
+    project_id: str
+    repo_path: str | None = None
+    branch: str | None = None
+
+
+class IngestionFailRequest(BaseModel):
+    reason: str | None = None
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": "qonduit-memory-gateway"}
 
 
+@app.get("/v1/ingestion/status")
+async def ingestion_status_all() -> dict:
+    return await ingestion_manager.status_all()
+
+
+@app.get("/v1/ingestion/status/{project_id}")
+async def ingestion_status_project(project_id: str) -> dict:
+    return await ingestion_manager.status_project(project_id)
+
+
+@app.post("/v1/ingestion/enqueue")
+async def ingestion_enqueue(req: IngestionEnqueueRequest) -> dict:
+    result = await ingestion_manager.enqueue(
+        project_id=req.project_id,
+        repo_path=req.repo_path,
+        branch=req.branch,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+@app.post("/v1/ingestion/fail/{project_id}")
+async def ingestion_force_fail(project_id: str, req: IngestionFailRequest) -> dict:
+    reason = (req.reason or "").strip() or "Manually failed by operator"
+    status = await ingestion_manager.force_fail_project(project_id, reason=reason)
+    return {"ok": True, "project_id": project_id, "status": status}
+
+
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models() -> dict:
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(f"{LLAMA_BASE}/v1/models")
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        data = r.json()
-    return data
+    alias_models = list(alias_models_for_models_endpoint())
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(f"{LLAMA_BASE}/v1/models")
+    except httpx.RequestError as exc:
+        logger.exception("models_proxy_connection_failed error=%s", str(exc))
+        return {
+            "object": "list",
+            "data": alias_models
+            + [
+                {
+                    "id": "qonduit-default",
+                    "object": "model",
+                    "owned_by": "qonduit",
+                }
+            ],
+        }
+
+    if response.status_code >= 400:
+        logger.error(
+            "models_proxy_upstream_error status=%s body=%s",
+            response.status_code,
+            response.text[:300],
+        )
+        raise upstream_error(response.status_code, response.text)
+
+    try:
+        upstream = response.json()
+        if isinstance(upstream, dict):
+            data = upstream.get("data")
+            if isinstance(data, list):
+                merged = list(data)
+                seen = {str(item.get("id")) for item in merged if isinstance(item, dict)}
+                for alias_model in alias_models:
+                    if alias_model["id"] not in seen:
+                        merged.append(alias_model)
+                upstream["data"] = merged
+                return upstream
+        return {"object": "list", "data": alias_models}
+    except ValueError:
+        logger.error("models_proxy_invalid_json body=%s", response.text[:300])
+        raise upstream_error(502, "Upstream /v1/models returned invalid JSON")
+
+
+@app.post("/v1/embeddings")
+async def embeddings(req: EmbeddingsRequest) -> dict:
+    try:
+        return await create_embeddings_response(req.input, model=req.model or EMBEDDING_MODEL)
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code if error.response is not None else 502
+        detail = error.response.text if error.response is not None else str(error)
+        logger.error("embeddings_upstream_error status=%s detail=%s", status, detail[:300])
+        raise upstream_error(status, detail)
+    except Exception as error:
+        logger.exception("embeddings_request_failed error=%s", str(error))
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Failed to generate embeddings",
+                "detail": str(error),
+            },
+        )
 
 
 def get_request_user_id(request: Request) -> str:
     raw = request.headers.get("X-Qonduit-User", "").strip().lower()
     safe = "".join(c for c in raw if c.isalnum() or c in ("-", "_"))
     return safe or "default"
+
+
+def build_fallback_conversation_id(req: GatewayChatRequest, request: Request) -> str:
+    seed_payload = {
+        "model": req.model,
+        "messages": [
+            {"role": msg.role, "content": coerce_model_content_to_text(msg.content)}
+            for msg in req.messages
+        ],
+        "user_agent": request.headers.get("user-agent", ""),
+    }
+    digest = sha256(
+        json.dumps(seed_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"session-{digest[:16]}"
+
+
+def resolve_conversation_id(req: GatewayChatRequest, request: Request) -> str:
+    header_id = (
+        request.headers.get("X-Conversation-ID", "").strip()
+        or request.headers.get("X-Qonduit-Conversation", "").strip()
+    )
+    if header_id:
+        return header_id
+
+    if (req.user or "").strip():
+        return req.user.strip()
+
+    if (req.conversation_id or "").strip():
+        return req.conversation_id.strip()
+
+    return build_fallback_conversation_id(req, request)
+
+
+def resolve_context_size(req: GatewayChatRequest, state: dict[str, Any]) -> int:
+    if req.context_size is not None:
+        return max(int(req.context_size), 1024)
+
+    last_size = state.get("last_context_size")
+    if isinstance(last_size, int) and last_size >= 1024:
+        return last_size
+
+    return DEFAULT_CONTEXT_SIZE
+
+
+def sanitize_identifier(value: str | None, fallback: str) -> str:
+    cleaned = "".join(c for c in (value or "") if c.isalnum() or c in ("-", "_"))
+    if not cleaned:
+        return fallback
+    return cleaned
+
+
+def model_alias_entry(model: str) -> dict[str, Any] | None:
+    entry = merged_alias_config().get(model)
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def discovered_alias_config(force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    return project_alias_cache.get(
+        projects_root=PROJECTS_ROOT,
+        target_model=PROJECT_ALIAS_TARGET_MODEL,
+        ttl_seconds=PROJECT_ALIAS_CACHE_TTL_SECONDS,
+        force_refresh=force_refresh,
+    )
+
+
+def endpoint_alias_config() -> dict[str, dict[str, Any]]:
+    aliases: dict[str, dict[str, Any]] = {}
+    for host, binding in ENDPOINT_BINDINGS.items():
+        if not isinstance(binding, dict):
+            continue
+        alias_id = str(binding.get("model_alias", "")).strip()
+        if not alias_id:
+            continue
+        aliases[alias_id] = {
+            "model": binding.get("model"),
+            "project_id": binding.get("project_id"),
+            "default_mode": binding.get("default_mode"),
+            "rag_enabled": binding.get("rag_enabled"),
+            "source": "endpoint_binding",
+            "host": host,
+        }
+    return aliases
+
+
+def merged_alias_config() -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    merged.update(endpoint_alias_config())
+    for alias_id, alias in discovered_alias_config().items():
+        if alias_id not in merged:
+            merged[alias_id] = alias
+    merged.update(
+        {
+            alias_id: alias
+            for alias_id, alias in MODEL_ALIAS_CONFIG.items()
+            if isinstance(alias, dict)
+        }
+    )
+    return merged
+
+
+def alias_models_for_models_endpoint() -> list[dict[str, Any]]:
+    alias_models: list[dict[str, Any]] = []
+    for alias_id, alias in merged_alias_config().items():
+        owned_by = "qonduit-alias"
+        if alias.get("source") == "auto_discovered_repo":
+            owned_by = "qonduit-auto-discovery"
+        elif alias.get("source") == "endpoint_binding":
+            owned_by = "qonduit-endpoint-binding"
+        alias_models.append(
+            {
+                "id": alias_id,
+                "object": "model",
+                "owned_by": owned_by,
+                "metadata": {
+                    "project_id": alias.get("project_id"),
+                    "default_mode": alias.get("default_mode"),
+                    "target_model": alias.get("model"),
+                    "rag_enabled": alias.get("rag_enabled"),
+                    "source": alias.get("source"),
+                    "repo_path": alias.get("repo_path"),
+                    "branch": alias.get("branch"),
+                    "host": alias.get("host"),
+                },
+            }
+        )
+    return alias_models
+
+
+def endpoint_binding_entry(request: Request) -> dict[str, Any] | None:
+    host = (request.headers.get("host", "") or "").split(":")[0].strip().lower()
+    if not host:
+        return None
+    entry = ENDPOINT_BINDINGS.get(host)
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def resolve_effective_model(req: GatewayChatRequest, request: Request) -> str:
+    alias = model_alias_entry(req.model)
+    if alias is not None:
+        model_value = str(alias.get("model", "")).strip()
+        if model_value:
+            return model_value
+
+    binding = endpoint_binding_entry(request)
+    if binding is not None:
+        model_value = str(binding.get("model", "")).strip()
+        if model_value:
+            return model_value
+
+    return req.model
+
+
+def resolve_project_id(req: GatewayChatRequest, request: Request) -> str:
+    header_project = request.headers.get("X-Project-ID", "").strip()
+    if header_project:
+        return sanitize_identifier(header_project, DEFAULT_PROJECT_NAMESPACE)
+
+    if (req.project_id or "").strip():
+        return sanitize_identifier(req.project_id, DEFAULT_PROJECT_NAMESPACE)
+
+    alias = model_alias_entry(req.model)
+    if alias is not None:
+        alias_project = str(alias.get("project_id", "")).strip()
+        if alias_project:
+            return sanitize_identifier(alias_project, DEFAULT_PROJECT_NAMESPACE)
+
+    endpoint_binding = endpoint_binding_entry(request)
+    if endpoint_binding is not None:
+        binding_project = str(endpoint_binding.get("project_id", "")).strip()
+        if binding_project:
+            return sanitize_identifier(binding_project, DEFAULT_PROJECT_NAMESPACE)
+
+    host = (request.headers.get("host", "") or "").split(":")[0].strip().lower()
+    binding = PROJECT_HOST_BINDINGS.get(host)
+    if isinstance(binding, str) and binding.strip():
+        return sanitize_identifier(binding.strip(), DEFAULT_PROJECT_NAMESPACE)
+
+    return sanitize_identifier(DEFAULT_PROJECT_NAMESPACE, DEFAULT_PROJECT_NAMESPACE)
+
+
+def request_project_id(request: Request) -> str:
+    header_project = request.headers.get("X-Project-ID", "").strip()
+    if header_project:
+        return sanitize_identifier(header_project, DEFAULT_PROJECT_NAMESPACE)
+    return sanitize_identifier(DEFAULT_PROJECT_NAMESPACE, DEFAULT_PROJECT_NAMESPACE)
+
+
+def resolve_mode(req: GatewayChatRequest, request: Request, project_id: str) -> str:
+    requested_mode = (req.mode or "").strip().lower()
+    if requested_mode in {"chat", "coding"}:
+        return requested_mode
+
+    header_mode = request.headers.get("X-Gateway-Mode", "").strip().lower()
+    if header_mode in {"chat", "coding"}:
+        return header_mode
+
+    alias = model_alias_entry(req.model)
+    if alias is not None:
+        alias_mode = str(alias.get("default_mode", "")).strip().lower()
+        if alias_mode in {"chat", "coding"}:
+            return alias_mode
+
+    endpoint_binding = endpoint_binding_entry(request)
+    if endpoint_binding is not None:
+        binding_mode = str(endpoint_binding.get("default_mode", "")).strip().lower()
+        if binding_mode in {"chat", "coding"}:
+            return binding_mode
+
+    project_mode = PROJECT_DEFAULT_MODE_MAP.get(project_id)
+    if isinstance(project_mode, str) and project_mode.strip().lower() in {"chat", "coding"}:
+        return project_mode.strip().lower()
+
+    env_mode = PROJECT_DEFAULT_MODE.strip().lower()
+    if env_mode in {"chat", "coding"}:
+        return env_mode
+
+    return "chat"
+
+
+def system_prompt_for_mode(mode: str) -> str:
+    if mode == "coding":
+        return (
+            "You are Qonduit in CODING mode. "
+            "Prioritize correctness, exact technical details, and reproducible steps. "
+            "Preserve exact file paths, function/class names, commands, errors, and constraints. "
+            "When uncertain, state assumptions briefly and propose the next verification command."
+        )
+    return DEFAULT_SYSTEM_PROMPT
+
+
+def is_technical_message(message: dict[str, Any]) -> bool:
+    content = str(message.get("content", ""))
+    if not content.strip():
+        return False
+    patterns = [
+        r"```",
+        r"\bTraceback\b",
+        r"\bException\b",
+        r"\bError\b",
+        r"\bFAILED\b",
+        r"\b(?:[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|dart|go|rs|java|kt|json|yaml|yml|toml|ini|sh|md))\b",
+        r"\b(?:python|pytest|pip|poetry|npm|pnpm|yarn|cargo|go|flutter|dart|make|uvicorn)\b",
+        r"\b(?:must|do not|don't|cannot|can't|required|constraint)\b",
+    ]
+    return any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def should_enable_rag(
+    project_id: str,
+    mode: str,
+    alias: dict[str, Any] | None = None,
+    binding: dict[str, Any] | None = None,
+) -> bool:
+    if not RAG_ENABLED:
+        return False
+
+    if alias is not None and "rag_enabled" in alias:
+        value = alias.get("rag_enabled")
+        if isinstance(value, bool):
+            return value
+
+    if binding is not None and "rag_enabled" in binding:
+        value = binding.get("rag_enabled")
+        if isinstance(value, bool):
+            return value
+
+    project_flag = RAG_PROJECT_FLAGS.get(project_id)
+    if isinstance(project_flag, bool):
+        return project_flag
+    if isinstance(project_flag, str):
+        normalized = project_flag.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+
+    mode_flag = RAG_PROJECT_FLAGS.get(f"mode:{mode}")
+    if isinstance(mode_flag, bool):
+        return mode_flag
+
+    return True
+
+
+def upstream_error(status_code: int, detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "message": "Upstream request failed",
+            "upstream_status": status_code,
+            "detail": detail,
+        },
+    )
 
 
 def ensure_upload_dir() -> None:
@@ -841,6 +1354,7 @@ async def recover_modified_file_with_retry(
 @app.post("/rag/test-ingest")
 async def rag_test_ingest(req: RagIngestRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     doc_id = await add_document(
         text=req.text,
         metadata={
@@ -849,6 +1363,8 @@ async def rag_test_ingest(req: RagIngestRequest, request: Request) -> dict:
             "document_name": req.document_name,
         },
         user_id=user_id,
+        collection=req.collection,
+        project_id=project_id,
     )
     return {"ok": True, "id": doc_id}
 
@@ -856,11 +1372,13 @@ async def rag_test_ingest(req: RagIngestRequest, request: Request) -> dict:
 @app.post("/rag/test-search")
 async def rag_test_search(req: RagSearchRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     results = await search_documents(
         req.query,
         limit=req.limit,
         collection=req.collection,
         user_id=user_id,
+        project_id=project_id,
     )
     return {"ok": True, "results": results}
 
@@ -868,23 +1386,29 @@ async def rag_test_search(req: RagSearchRequest, request: Request) -> dict:
 @app.get("/rag/collections")
 async def rag_list_collections(request: Request) -> dict:
     user_id = get_request_user_id(request)
-    return {"ok": True, "collections": list_collections(user_id=user_id)}
+    project_id = request_project_id(request)
+    return {
+        "ok": True,
+        "collections": list_collections(user_id=user_id, project_id=project_id),
+    }
 
 
 @app.post("/rag/collections/create")
 async def rag_create_collection(req: RagCollectionCreateRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Collection name cannot be empty")
 
-    await create_collection_marker(name, user_id=user_id)
+    await create_collection_marker(name, user_id=user_id, project_id=project_id)
     return {"ok": True, "collection": name}
 
 
 @app.post("/rag/collections/delete")
 async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Request) -> dict:
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     collection_name = req.name.strip()
     if not collection_name:
         raise HTTPException(status_code=400, detail="Collection name cannot be empty")
@@ -893,7 +1417,7 @@ async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Reques
 
     try:
         points, _ = qdrant.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=f"{COLLECTION_NAME}__{project_id}",
             scroll_filter=Filter(
                 must=[
                     FieldCondition(
@@ -903,6 +1427,10 @@ async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Reques
                     FieldCondition(
                         key="user_id",
                         match=MatchValue(value=user_id),
+                    ),
+                    FieldCondition(
+                        key="project_id",
+                        match=MatchValue(value=project_id),
                     ),
                 ]
             ),
@@ -914,7 +1442,7 @@ async def rag_delete_collection(req: RagCollectionDeleteRequest, request: Reques
         point_ids = [p.id for p in points if p.id is not None]
         if point_ids:
             qdrant.delete(
-                collection_name=COLLECTION_NAME,
+                collection_name=f"{COLLECTION_NAME}__{project_id}",
                 points_selector=point_ids,
             )
             deleted_points = len(point_ids)
@@ -941,6 +1469,7 @@ async def rag_upload_document(
     ensure_upload_dir()
 
     user_id = get_request_user_id(request)
+    project_id = request_project_id(request)
     collection_name = collection.strip()
     if not collection_name:
         raise HTTPException(status_code=400, detail="Collection cannot be empty")
@@ -980,6 +1509,8 @@ async def rag_upload_document(
                     "saved_path": saved_path,
                 },
                 user_id=user_id,
+                collection=collection_name,
+                project_id=project_id,
             )
             chunk_ids.append(chunk_id)
 
@@ -992,6 +1523,33 @@ async def rag_upload_document(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload document: {e}")
+
+
+@app.post("/internal/webhooks/github")
+async def github_webhook_stub(req: GithubWebhookStubRequest) -> dict:
+    """Webhook scaffold for repo ingestion automation.
+
+    This endpoint intentionally does not execute git/pull or ingestion directly.
+    It returns a deterministic contract that operators can wire to CI/job runners.
+    """
+    project_id = sanitize_identifier(req.project_id, DEFAULT_PROJECT_NAMESPACE)
+    branch = (req.branch or "").strip() or "main"
+    return {
+        "ok": True,
+        "message": "Webhook stub accepted. Trigger repo ingest job externally.",
+        "contract": {
+            "project_id": project_id,
+            "repo_path": req.repo_path,
+            "branch": branch,
+            "delivery_id": req.delivery_id,
+            "command": (
+                "python -m app.ingest_repo "
+                f"--project-id {project_id} "
+                f"--repo-path {req.repo_path} "
+                f"--branch {branch}"
+            ),
+        },
+    }
 
 
 @app.get("/v1/chat/completions")
@@ -1007,14 +1565,16 @@ async def chat_completions_help() -> dict:
 @app.post("/chat/completions")
 async def chat(req: GatewayChatRequest, request: Request) -> Any:
     user_id = get_request_user_id(request)
-    context_size = req.resolved_context_size()
-    conversation_id = (
-        (req.conversation_id or "").strip()
-        or (request.headers.get("X-Qonduit-Conversation", "").strip())
-        or (req.user or "").strip()
-        or "default"
-    )
-    state = load_conversation(conversation_id)
+    alias = model_alias_entry(req.model)
+    endpoint_binding = endpoint_binding_entry(request)
+    effective_model = resolve_effective_model(req, request)
+    project_id = resolve_project_id(req, request)
+    conversation_id = resolve_conversation_id(req, request)
+    state = load_conversation(conversation_id, project_id=project_id)
+    context_size = resolve_context_size(req, state)
+    mode = resolve_mode(req, request, project_id)
+    system_prompt = system_prompt_for_mode(mode)
+    recent_window = 16 if mode == "coding" else 8
 
     prior_recent = state.get("recent_messages", [])
     summary = state.get("summary", "")
@@ -1031,22 +1591,24 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     trimmed_recent, _ = trim_recent_messages(
         combined_recent,
         summary=summary,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         context_size=context_size,
+        protect_message=is_technical_message if mode == "coding" else None,
     )
 
     overflow_count = len(combined_recent) - len(trimmed_recent)
 
     if overflow_count > 0:
         older = combined_recent[:overflow_count]
-        summary = await summarize_messages(req.model, summary, older)
+        summary = await summarize_messages(effective_model, summary, older, mode=mode)
 
     remaining_recent = combined_recent[overflow_count:]
     trimmed_recent, prompt_tokens = trim_recent_messages(
         remaining_recent,
         summary=summary,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         context_size=context_size,
+        protect_message=is_technical_message if mode == "coding" else None,
     )
 
     budget = build_budget(context_size)
@@ -1056,28 +1618,70 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
     rag_results = []
     rag_chunks = []
+    rag_namespace = (req.rag_collection or "").strip() or None
 
-    if latest_text.strip():
+    rag_active = should_enable_rag(project_id, mode, alias=alias, binding=endpoint_binding)
+    logger.info(
+        "chat_rag_state conversation_id=%s project_id=%s rag_enabled=%s "
+        "namespace=%s request_model=%s effective_model=%s",
+        conversation_id,
+        project_id,
+        rag_active,
+        rag_namespace or "(none)",
+        req.model,
+        effective_model,
+    )
+    if latest_text.strip() and rag_active:
         try:
+            used_user_fallback = False
             rag_results = await search_documents(
                 latest_text,
-                limit=2,
-                collection=req.rag_collection or conversation_id,
+                limit=RAG_TOP_K,
+                collection=rag_namespace,
                 user_id=user_id,
+                project_id=project_id,
             )
+            if not rag_results:
+                used_user_fallback = True
+                rag_results = await search_documents(
+                    latest_text,
+                    limit=RAG_TOP_K,
+                    collection=rag_namespace,
+                    user_id=None,
+                    project_id=project_id,
+                )
             rag_chunks = [
                 item["text"].strip()
                 for item in rag_results
                 if item.get("text", "").strip()
             ]
+            logger.info(
+                "chat_rag_retrieval conversation_id=%s project_id=%s "
+                "hit_count=%s fallback_without_user=%s",
+                conversation_id,
+                project_id,
+                len(rag_results),
+                "yes" if used_user_fallback else "no",
+            )
         except Exception:
+            logger.exception(
+                "chat_rag_retrieval_failed conversation_id=%s project_id=%s",
+                conversation_id,
+                project_id,
+            )
             rag_results = []
             rag_chunks = []
+    elif not rag_active:
+        logger.info(
+            "chat_rag_skipped_disabled conversation_id=%s project_id=%s",
+            conversation_id,
+            project_id,
+        )
 
     rag_context = "\n\n".join(rag_chunks)
 
     final_messages = [
-        {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "system", "content": f"Rolling summary:\n{summary or '(none)'}"},
     ]
 
@@ -1091,19 +1695,37 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 ),
             }
         )
+    logger.info(
+        "chat_rag_injection conversation_id=%s project_id=%s injected=%s snippets=%s",
+        conversation_id,
+        project_id,
+        bool(rag_context.strip()),
+        len(rag_chunks),
+    )
 
     final_messages.extend(trimmed_recent)
 
     state["summary"] = summary
-    state["recent_messages"] = trimmed_recent[-8:]
-    state["last_model"] = req.model
+    state["project_id"] = project_id
+    state["conversation_id"] = conversation_id
+    state["recent_messages"] = trimmed_recent[-recent_window:]
+    state["last_model"] = effective_model
     state["last_context_size"] = context_size
+    state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
-    save_conversation(conversation_id, state)
+    state["metadata"] = {
+        "mode": mode,
+        "project_id": project_id,
+        "rag_collection": (req.rag_collection or "").strip() or project_id,
+        "rag_enabled": rag_active,
+        "request_model": req.model,
+        "effective_model": effective_model,
+    }
+    save_conversation(conversation_id, state, project_id=project_id)
 
     payload = {
-        "model": req.model,
+        "model": effective_model,
         "messages": final_messages,
         "max_tokens": max_tokens,
         "temperature": req.temperature,
@@ -1234,18 +1856,29 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         }
 
         state["summary"] = summary
-        state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
-        state["last_model"] = req.model
+        state["project_id"] = project_id
+        state["conversation_id"] = conversation_id
+        state["recent_messages"] = (trimmed_recent + [assistant_message])[-recent_window:]
+        state["last_model"] = effective_model
         state["last_context_size"] = context_size
+        state["last_mode"] = mode
         state["last_prompt_tokens"] = prompt_tokens
         state["last_reserved_output"] = budget.reserved_output
-        save_conversation(conversation_id, state)
+        state["metadata"] = {
+            "mode": mode,
+            "project_id": project_id,
+            "rag_collection": (req.rag_collection or "").strip() or project_id,
+            "rag_enabled": rag_active,
+            "request_model": req.model,
+            "effective_model": effective_model,
+        }
+        save_conversation(conversation_id, state, project_id=project_id)
 
     if req.stream:
         logger.info(
             "chat_request stream=true conversation_id=%s model=%s messages=%s",
             conversation_id,
-            req.model,
+            effective_model,
             len(req.messages),
         )
         return StreamingResponse(
@@ -1258,16 +1891,51 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         )
 
     non_stream_start = time.perf_counter()
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=payload)
+    except httpx.RequestError as exc:
+        logger.exception(
+            "chat_upstream_connection_failed conversation_id=%s model=%s error=%s",
+            conversation_id,
+            effective_model,
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Failed to connect to upstream chat backend",
+                "upstream": LLAMA_BASE,
+            },
+        )
+
+    if r.status_code >= 400:
+        logger.error(
+            "chat_upstream_error conversation_id=%s model=%s status=%s",
+            conversation_id,
+            effective_model,
+            r.status_code,
+        )
+        raise upstream_error(r.status_code, r.text)
+
+    try:
         data = r.json()
+    except ValueError:
+        logger.error(
+            "chat_upstream_invalid_json conversation_id=%s model=%s body=%s",
+            conversation_id,
+            effective_model,
+            r.text[:300],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream /v1/chat/completions returned invalid JSON",
+        )
     non_stream_ms = int((time.perf_counter() - non_stream_start) * 1000)
     logger.info(
         "chat_request stream=false conversation_id=%s model=%s latency_ms=%s messages=%s",
         conversation_id,
-        req.model,
+        effective_model,
         non_stream_ms,
         len(req.messages),
     )
@@ -1285,18 +1953,29 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     }
 
     state["summary"] = summary
-    state["recent_messages"] = (trimmed_recent + [assistant_message])[-8:]
-    state["last_model"] = req.model
+    state["project_id"] = project_id
+    state["conversation_id"] = conversation_id
+    state["recent_messages"] = (trimmed_recent + [assistant_message])[-recent_window:]
+    state["last_model"] = effective_model
     state["last_context_size"] = context_size
+    state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
-    save_conversation(conversation_id, state)
+    state["metadata"] = {
+        "mode": mode,
+        "project_id": project_id,
+        "rag_collection": (req.rag_collection or "").strip() or project_id,
+        "rag_enabled": rag_active,
+        "request_model": req.model,
+        "effective_model": effective_model,
+    }
+    save_conversation(conversation_id, state, project_id=project_id)
 
     return {
         "id": data.get("id", f"chatcmpl-qonduit-{uuid.uuid4().hex}"),
         "object": "chat.completion",
         "created": data.get("created", int(time.time())),
-        "model": data.get("model", req.model),
+        "model": req.model,
         "choices": [
             {
                 "index": 0,
