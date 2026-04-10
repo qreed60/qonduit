@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import queue
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -15,9 +16,17 @@ from pathlib import PurePosixPath
 from typing import Any, Callable
 from collections.abc import Awaitable
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+import httpx
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
-from .rag import project_collection_name, qdrant, rag_service
+from .rag import EMBEDDING_BASE, EMBEDDING_MODEL, VECTOR_SIZE, project_collection_name, qdrant
 
 logger = logging.getLogger("qonduit.memory_gateway")
 
@@ -179,6 +188,12 @@ def _walk_files(config: IngestConfig) -> list[Path]:
             except OSError:
                 continue
             if size > config.max_file_bytes:
+                logger.info(
+                    "file_processing_skipped reason=max_file_bytes path=%s size=%s limit=%s",
+                    rel_file,
+                    size,
+                    config.max_file_bytes,
+                )
                 continue
             files.append(full_path)
 
@@ -226,6 +241,33 @@ def _point_id(
 
 def _load_text(file_path: Path) -> str:
     return file_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _ensure_project_collection(project_id: str) -> str:
+    collection_name = project_collection_name(project_id)
+    try:
+        qdrant.get_collection(collection_name)
+    except Exception:
+        qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        )
+    return collection_name
+
+
+def _embed_text_sync(text: str) -> list[float]:
+    payload = {"input": text, "model": EMBEDDING_MODEL}
+    with httpx.Client(timeout=120.0) as client:
+        response = client.post(f"{EMBEDDING_BASE.rstrip('/')}/v1/embeddings", json=payload)
+        response.raise_for_status()
+        data = response.json()
+    items = data.get("data", []) if isinstance(data, dict) else []
+    if not items:
+        raise ValueError("Embedding backend returned empty data")
+    vector = items[0].get("embedding")
+    if not isinstance(vector, list):
+        raise ValueError("Embedding backend returned invalid embedding payload")
+    return [float(value) for value in vector]
 
 
 async def _delete_stale_chunks(
@@ -320,60 +362,96 @@ async def ingest_repository_with_progress(
         if inspect.isawaitable(result):
             await result
 
-    async def _process_file(path: Path, rel_path: str) -> None:
-        await _notify_progress(current_step="reading_file", current_file=rel_path)
-        rel_paths_seen.add(rel_path)
+    def _process_file_sync(path: Path, rel_path: str, events: queue.Queue[dict[str, Any]]) -> int:
+        events.put({"step": "reading_file"})
         text = _load_text(path)
-        await _notify_progress(current_step="chunking_file", current_file=rel_path)
+        events.put({"step": "chunking_file"})
         chunks = _chunk_text(text, config.chunk_size, config.chunk_overlap)
         if not chunks:
-            return
+            return 0
 
-        stats.ingested_files += 1
-
+        collection_name = _ensure_project_collection(config.project_id)
+        repo_path_value = str(config.repo_path.resolve())
+        processed_chunks = 0
         for index, chunk in enumerate(chunks):
-            await _notify_progress(current_step="embedding_chunk", current_file=rel_path)
+            events.put({"step": "embedding_chunk"})
+            vector = _embed_text_sync(chunk)
+            events.put({"step": "writing_chunk"})
             metadata = {
                 "source": "repo_ingest",
                 "project_id": _safe_id(config.project_id, "default"),
-                "repo_path": str(config.repo_path.resolve()),
+                "repo_path": repo_path_value,
                 "branch": config.branch,
                 "file_path": rel_path,
                 "chunk_index": index,
                 "commit_sha": config.commit_sha,
             }
-            await rag_service.add_document(
-                project_id=config.project_id,
-                text=chunk,
-                metadata=metadata,
-                point_id=_point_id(
-                    config.project_id,
-                    config.branch,
-                    rel_path,
-                    index,
-                    str(config.repo_path.resolve()),
-                ),
-                namespace=config.branch,
-                user_id="repo_ingest",
+            point_id = _point_id(
+                config.project_id,
+                config.branch,
+                rel_path,
+                index,
+                repo_path_value,
             )
-            stats.ingested_chunks += 1
-            await _notify_progress(current_step="writing_chunk", current_file=rel_path)
+            qdrant.upsert(
+                collection_name=collection_name,
+                points=[
+                    PointStruct(
+                        id=point_id,
+                        vector=vector,
+                        payload={"text": chunk, **metadata},
+                    )
+                ],
+            )
+            processed_chunks += 1
+            events.put({"step": "chunk_written", "count": processed_chunks})
+        return processed_chunks
 
     for path in files:
         rel_path = path.relative_to(config.repo_path).as_posix()
+        rel_paths_seen.add(rel_path)
+        logger.info("file_processing_started project_id=%s file=%s", config.project_id, rel_path)
+        event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        file_task = asyncio.create_task(
+            asyncio.to_thread(_process_file_sync, path, rel_path, event_queue),
+        )
+        file_started_at = asyncio.get_event_loop().time()
         try:
-            await asyncio.wait_for(
-                _process_file(path, rel_path),
-                timeout=max(1, config.file_timeout_seconds),
-            )
+            while True:
+                while not event_queue.empty():
+                    event = event_queue.get_nowait()
+                    step = str(event.get("step", "reading_file"))
+                    if step == "chunk_written":
+                        stats.ingested_chunks += 1
+                        await _notify_progress(
+                            current_step="writing_chunk",
+                            current_file=rel_path,
+                        )
+                    else:
+                        await _notify_progress(current_step=step, current_file=rel_path)
+                if file_task.done():
+                    chunks_for_file = file_task.result()
+                    if chunks_for_file > 0:
+                        stats.ingested_files += 1
+                    break
+                elapsed = asyncio.get_event_loop().time() - file_started_at
+                if elapsed > max(1, config.file_timeout_seconds):
+                    raise asyncio.TimeoutError()
+                await asyncio.sleep(0.2)
         except asyncio.TimeoutError:
             stats.skipped_files += 1
             logger.warning(
-                "ingest_file_timeout_skip project_id=%s file=%s timeout_seconds=%s",
+                "file_processing_timed_out project_id=%s file=%s timeout_seconds=%s",
                 config.project_id,
                 rel_path,
                 config.file_timeout_seconds,
             )
+            logger.info(
+                "file_processing_skipped project_id=%s file=%s reason=timeout",
+                config.project_id,
+                rel_path,
+            )
+            file_task.cancel()
             await _notify_progress(current_step="reading_file", current_file=rel_path)
             continue
 

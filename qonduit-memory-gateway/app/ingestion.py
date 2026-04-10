@@ -236,6 +236,7 @@ class IngestionManager:
         poll_seconds: float = 2.0,
         stall_timeout_seconds: int = 600,
         file_timeout_seconds: int = 120,
+        max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     ) -> None:
         self.store = IngestionStore(data_dir)
         self.projects_root = projects_root
@@ -245,6 +246,7 @@ class IngestionManager:
         self.logger = logger
         self.stall_timeout_seconds = max(30, stall_timeout_seconds)
         self.file_timeout_seconds = max(1, file_timeout_seconds)
+        self.max_file_bytes = max(1_000, max_file_bytes)
 
     async def start(self) -> None:
         await self.store.save_status(await self.store.load_status())
@@ -395,7 +397,7 @@ class IngestionManager:
                 chunk_size=1200,
                 chunk_overlap=200,
                 commit_sha=_resolve_commit_sha(repo_path),
-                max_file_bytes=DEFAULT_MAX_FILE_BYTES,
+                max_file_bytes=self.max_file_bytes,
                 file_timeout_seconds=self.file_timeout_seconds,
             )
 
@@ -452,7 +454,7 @@ class IngestionManager:
                         current_step="failed",
                     )
                     self.logger.error(
-                        "ingestion_stalled project_id=%s elapsed=%s timeout=%s",
+                        "ingestion_stalled_timeout project_id=%s elapsed=%s timeout=%s",
                         job.project_id,
                         int(elapsed),
                         self.stall_timeout_seconds,

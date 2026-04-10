@@ -105,21 +105,19 @@ def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
         return default
     return parsed
 
-def env_int(name: str, default: int) -> int:
+def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
     raw = os.getenv(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
     try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "invalid_int_env name=%s raw=%s fallback=%s",
-            name,
-            raw,
-            default,
-        )
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("invalid_json_env name=%s raw=%s", name, raw[:200])
         return default
-    return value
+    if not isinstance(parsed, dict):
+        logger.warning("invalid_json_env_type name=%s expected=dict", name)
+        return default
+    return parsed
 
 LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
 DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
@@ -142,6 +140,7 @@ PROJECT_ALIAS_CACHE_TTL_SECONDS = max(env_int("PROJECT_ALIAS_CACHE_TTL_SECONDS",
 INGESTION_POLL_SECONDS = max(env_int("INGESTION_POLL_SECONDS", 2), 1)
 INGESTION_STALL_TIMEOUT_SECONDS = max(env_int("INGESTION_STALL_TIMEOUT_SECONDS", 600), 30)
 INGESTION_FILE_TIMEOUT_SECONDS = max(env_int("INGESTION_FILE_TIMEOUT_SECONDS", 120), 1)
+INGESTION_MAX_FILE_BYTES = max(env_int("INGESTION_MAX_FILE_BYTES", 1500000), 1000)
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -173,6 +172,7 @@ ingestion_manager = IngestionManager(
     poll_seconds=float(INGESTION_POLL_SECONDS),
     stall_timeout_seconds=INGESTION_STALL_TIMEOUT_SECONDS,
     file_timeout_seconds=INGESTION_FILE_TIMEOUT_SECONDS,
+    max_file_bytes=INGESTION_MAX_FILE_BYTES,
 )
 
 TEXT_EXTENSIONS = {

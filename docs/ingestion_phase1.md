@@ -63,10 +63,11 @@ Each project status includes:
   - if no heartbeat progress update occurs longer than this timeout,
     the running job is auto-failed (`state=failed`, `current_step=failed`).
 - `INGESTION_FILE_TIMEOUT_SECONDS` (default `120`):
-  - each file is processed with a timeout; timed-out files are skipped and
+  - each file is processed in a worker-thread boundary with timeout; timed-out files are skipped and
     ingestion continues.
 - Max file size safeguard:
-  - files above the default max text size are skipped during scanning.
+  - `INGESTION_MAX_FILE_BYTES` controls max text file size;
+    files above this limit are skipped during scanning.
 - Generated/minified defaults:
   - ingestion excludes common generated/minified/vendor paths by default.
 
