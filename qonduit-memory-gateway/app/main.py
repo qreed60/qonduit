@@ -50,6 +50,12 @@ ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 _in_flight_streams: dict[str, dict[str, Any]] = {}
 
 
+def _log_stream_event(event_type: str, conversation_id: str, model: str, **kwargs: Any) -> None:
+    """Log streaming events with consistent formatting."""
+    extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
+    logger.info(f"stream_{event_type} conversation_id={conversation_id} model={model} {extra}".strip())
+
+
 @app.on_event("startup")
 async def startup() -> None:
     ensure_collection()
