@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import fnmatch
 import inspect
 import json
@@ -112,6 +113,8 @@ class IngestConfig:
     commit_sha: str
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
     file_timeout_seconds: int = 120
+    embed_timeout_seconds: int = 30
+    qdrant_timeout_seconds: int = 20
 
 
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -243,21 +246,38 @@ def _load_text(file_path: Path) -> str:
     return file_path.read_text(encoding="utf-8", errors="ignore")
 
 
-def _ensure_project_collection(project_id: str) -> str:
+def _qdrant_call_with_timeout(func: Callable[..., Any], timeout_seconds: int, **kwargs: Any) -> Any:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func, **kwargs)
+    try:
+        return future.result(timeout=max(1, timeout_seconds))
+    except concurrent.futures.TimeoutError as error:
+        raise TimeoutError(f"Qdrant call timed out after {timeout_seconds}s") from error
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _ensure_project_collection(project_id: str, timeout_seconds: int) -> str:
     collection_name = project_collection_name(project_id)
     try:
-        qdrant.get_collection(collection_name)
+        _qdrant_call_with_timeout(
+            qdrant.get_collection,
+            timeout_seconds,
+            collection_name=collection_name,
+        )
     except Exception:
-        qdrant.create_collection(
+        _qdrant_call_with_timeout(
+            qdrant.create_collection,
+            timeout_seconds,
             collection_name=collection_name,
             vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
         )
     return collection_name
 
 
-def _embed_text_sync(text: str) -> list[float]:
+def _embed_text_sync(text: str, timeout_seconds: int) -> list[float]:
     payload = {"input": text, "model": EMBEDDING_MODEL}
-    with httpx.Client(timeout=120.0) as client:
+    with httpx.Client(timeout=max(1, timeout_seconds)) as client:
         response = client.post(f"{EMBEDDING_BASE.rstrip('/')}/v1/embeddings", json=payload)
         response.raise_for_status()
         data = response.json()
@@ -277,7 +297,9 @@ async def _delete_stale_chunks(
 ) -> int:
     collection_name = project_collection_name(config.project_id)
     try:
-        hits, _ = qdrant.scroll(
+        hits, _ = _qdrant_call_with_timeout(
+            qdrant.scroll,
+            config.qdrant_timeout_seconds,
             collection_name=collection_name,
             scroll_filter=Filter(
                 must=[
@@ -314,7 +336,12 @@ async def _delete_stale_chunks(
             stale_ids.append(hit.id)
 
     if stale_ids:
-        qdrant.delete(collection_name=collection_name, points_selector=stale_ids)
+        _qdrant_call_with_timeout(
+            qdrant.delete,
+            config.qdrant_timeout_seconds,
+            collection_name=collection_name,
+            points_selector=stale_ids,
+        )
     return len(stale_ids)
 
 
@@ -370,12 +397,33 @@ async def ingest_repository_with_progress(
         if not chunks:
             return 0
 
-        collection_name = _ensure_project_collection(config.project_id)
+        collection_name = _ensure_project_collection(
+            config.project_id,
+            timeout_seconds=config.qdrant_timeout_seconds,
+        )
         repo_path_value = str(config.repo_path.resolve())
         processed_chunks = 0
         for index, chunk in enumerate(chunks):
+            logger.info(
+                "chunk_processing_started project_id=%s file=%s chunk_index=%s",
+                config.project_id,
+                rel_path,
+                index,
+            )
             events.put({"step": "embedding_chunk"})
-            vector = _embed_text_sync(chunk)
+            try:
+                vector = _embed_text_sync(
+                    chunk,
+                    timeout_seconds=config.embed_timeout_seconds,
+                )
+            except Exception:
+                logger.warning(
+                    "chunk_processing_timed_out project_id=%s file=%s chunk_index=%s phase=embedding",
+                    config.project_id,
+                    rel_path,
+                    index,
+                )
+                continue
             events.put({"step": "writing_chunk"})
             metadata = {
                 "source": "repo_ingest",
@@ -393,16 +441,27 @@ async def ingest_repository_with_progress(
                 index,
                 repo_path_value,
             )
-            qdrant.upsert(
-                collection_name=collection_name,
-                points=[
-                    PointStruct(
-                        id=point_id,
-                        vector=vector,
-                        payload={"text": chunk, **metadata},
-                    )
-                ],
-            )
+            try:
+                _qdrant_call_with_timeout(
+                    qdrant.upsert,
+                    config.qdrant_timeout_seconds,
+                    collection_name=collection_name,
+                    points=[
+                        PointStruct(
+                            id=point_id,
+                            vector=vector,
+                            payload={"text": chunk, **metadata},
+                        )
+                    ],
+                )
+            except Exception:
+                logger.warning(
+                    "chunk_processing_timed_out project_id=%s file=%s chunk_index=%s phase=upsert",
+                    config.project_id,
+                    rel_path,
+                    index,
+                )
+                continue
             processed_chunks += 1
             events.put({"step": "chunk_written", "count": processed_chunks})
         return processed_chunks

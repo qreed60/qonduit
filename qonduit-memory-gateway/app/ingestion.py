@@ -237,6 +237,8 @@ class IngestionManager:
         stall_timeout_seconds: int = 600,
         file_timeout_seconds: int = 120,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+        embed_timeout_seconds: int = 30,
+        qdrant_timeout_seconds: int = 20,
     ) -> None:
         self.store = IngestionStore(data_dir)
         self.projects_root = projects_root
@@ -247,6 +249,8 @@ class IngestionManager:
         self.stall_timeout_seconds = max(30, stall_timeout_seconds)
         self.file_timeout_seconds = max(1, file_timeout_seconds)
         self.max_file_bytes = max(1_000, max_file_bytes)
+        self.embed_timeout_seconds = max(1, embed_timeout_seconds)
+        self.qdrant_timeout_seconds = max(1, qdrant_timeout_seconds)
 
     async def start(self) -> None:
         await self.store.save_status(await self.store.load_status())
@@ -399,6 +403,14 @@ class IngestionManager:
                 commit_sha=_resolve_commit_sha(repo_path),
                 max_file_bytes=self.max_file_bytes,
                 file_timeout_seconds=self.file_timeout_seconds,
+                embed_timeout_seconds=min(
+                    self.embed_timeout_seconds,
+                    max(1, self.file_timeout_seconds - 5),
+                ),
+                qdrant_timeout_seconds=min(
+                    self.qdrant_timeout_seconds,
+                    max(1, self.file_timeout_seconds - 5),
+                ),
             )
 
             async def on_progress(progress: dict[str, Any]) -> None:

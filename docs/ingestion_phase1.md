@@ -65,6 +65,9 @@ Each project status includes:
 - `INGESTION_FILE_TIMEOUT_SECONDS` (default `120`):
   - each file is processed in a worker-thread boundary with timeout; timed-out files are skipped and
     ingestion continues.
+- `INGESTION_EMBED_TIMEOUT_SECONDS` and `INGESTION_QDRANT_TIMEOUT_SECONDS`:
+  - chunk-level embed/write guardrails; these are clamped below file timeout.
+  - timed-out chunks are skipped so one pathological chunk does not wedge a job.
 - Max file size safeguard:
   - `INGESTION_MAX_FILE_BYTES` controls max text file size;
     files above this limit are skipped during scanning.

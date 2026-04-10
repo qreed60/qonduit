@@ -141,6 +141,8 @@ INGESTION_POLL_SECONDS = max(env_int("INGESTION_POLL_SECONDS", 2), 1)
 INGESTION_STALL_TIMEOUT_SECONDS = max(env_int("INGESTION_STALL_TIMEOUT_SECONDS", 600), 30)
 INGESTION_FILE_TIMEOUT_SECONDS = max(env_int("INGESTION_FILE_TIMEOUT_SECONDS", 120), 1)
 INGESTION_MAX_FILE_BYTES = max(env_int("INGESTION_MAX_FILE_BYTES", 1500000), 1000)
+INGESTION_EMBED_TIMEOUT_SECONDS = max(env_int("INGESTION_EMBED_TIMEOUT_SECONDS", 30), 1)
+INGESTION_QDRANT_TIMEOUT_SECONDS = max(env_int("INGESTION_QDRANT_TIMEOUT_SECONDS", 20), 1)
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -173,6 +175,8 @@ ingestion_manager = IngestionManager(
     stall_timeout_seconds=INGESTION_STALL_TIMEOUT_SECONDS,
     file_timeout_seconds=INGESTION_FILE_TIMEOUT_SECONDS,
     max_file_bytes=INGESTION_MAX_FILE_BYTES,
+    embed_timeout_seconds=INGESTION_EMBED_TIMEOUT_SECONDS,
+    qdrant_timeout_seconds=INGESTION_QDRANT_TIMEOUT_SECONDS,
 )
 
 TEXT_EXTENSIONS = {
@@ -311,8 +315,11 @@ async def ingestion_enqueue(req: IngestionEnqueueRequest) -> dict:
 
 
 @app.post("/v1/ingestion/fail/{project_id}")
-async def ingestion_force_fail(project_id: str, req: IngestionFailRequest) -> dict:
-    reason = (req.reason or "").strip() or "Manually failed by operator"
+async def ingestion_force_fail(
+    project_id: str,
+    req: IngestionFailRequest | None = None,
+) -> dict:
+    reason = ((req.reason if req else "") or "").strip() or "Manually failed by operator"
     status = await ingestion_manager.force_fail_project(project_id, reason=reason)
     return {"ok": True, "project_id": project_id, "status": status}
 
