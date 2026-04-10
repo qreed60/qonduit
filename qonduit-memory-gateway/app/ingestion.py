@@ -109,8 +109,10 @@ class IngestionStore:
             "files_scanned": 0,
             "chunks_embedded": 0,
             "chunks_written": 0,
+            "skipped_files": 0,
             "current_step": "idle",
             "current_file": None,
+            "last_progress_at": None,
         }
 
     async def load_status(self) -> dict[str, Any]:
@@ -147,6 +149,17 @@ class IngestionStore:
         current = projects.get(safe_project)
         if not isinstance(current, dict):
             current = self._default_status_entry(safe_project)
+        progress_keys = {
+            "files_scanned",
+            "chunks_embedded",
+            "chunks_written",
+            "current_file",
+            "current_step",
+            "skipped_files",
+        }
+        if any(key in updates for key in progress_keys):
+            if any(updates.get(key) != current.get(key) for key in progress_keys if key in updates):
+                updates["last_progress_at"] = _utc_now()
         merged = {**current, **updates, "project_id": safe_project}
         state = str(merged.get("state", "idle")).lower()
         if state not in STATUS_STATES:
@@ -190,6 +203,7 @@ class IngestionStore:
             repo_path=job.repo_path,
             branch=job.branch,
             last_error=None,
+            skipped_files=0,
             current_step="queued",
             current_file=None,
         )
@@ -220,6 +234,8 @@ class IngestionManager:
         projects_root: str,
         logger: logging.Logger,
         poll_seconds: float = 2.0,
+        stall_timeout_seconds: int = 600,
+        file_timeout_seconds: int = 120,
     ) -> None:
         self.store = IngestionStore(data_dir)
         self.projects_root = projects_root
@@ -227,6 +243,8 @@ class IngestionManager:
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[Any] | None = None
         self.logger = logger
+        self.stall_timeout_seconds = max(30, stall_timeout_seconds)
+        self.file_timeout_seconds = max(1, file_timeout_seconds)
 
     async def start(self) -> None:
         await self.store.save_status(await self.store.load_status())
@@ -354,8 +372,10 @@ class IngestionManager:
             files_scanned=0,
             chunks_embedded=0,
             chunks_written=0,
+            skipped_files=0,
             current_step="scanning_repo",
             current_file=None,
+            last_progress_at=_utc_now(),
         )
         self.logger.info(
             "ingestion_running project_id=%s repo_path=%s branch=%s",
@@ -376,7 +396,9 @@ class IngestionManager:
                 chunk_overlap=200,
                 commit_sha=_resolve_commit_sha(repo_path),
                 max_file_bytes=DEFAULT_MAX_FILE_BYTES,
+                file_timeout_seconds=self.file_timeout_seconds,
             )
+
             async def on_progress(progress: dict[str, Any]) -> None:
                 await self.store.update_status(
                     job.project_id,
@@ -386,14 +408,57 @@ class IngestionManager:
                     files_scanned=int(progress.get("files_scanned", 0)),
                     chunks_embedded=int(progress.get("chunks_embedded", 0)),
                     chunks_written=int(progress.get("chunks_written", 0)),
+                    skipped_files=int(progress.get("skipped_files", 0)),
                     current_step=str(progress.get("current_step", "running")),
                     current_file=progress.get("current_file"),
                 )
 
-            stats = await ingest_repository_with_progress(
-                config,
-                progress_callback=on_progress,
+            ingest_task = asyncio.create_task(
+                ingest_repository_with_progress(
+                    config,
+                    progress_callback=on_progress,
+                )
             )
+            while True:
+                try:
+                    stats = await asyncio.wait_for(ingest_task, timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    status = await self.store.get_status(job.project_id)
+                    progress_at = str(status.get("last_progress_at") or "").strip()
+                    if not progress_at:
+                        continue
+                    try:
+                        progress_time = datetime.fromisoformat(progress_at)
+                    except ValueError:
+                        continue
+                    elapsed = (
+                        datetime.now(timezone.utc) - progress_time
+                    ).total_seconds()
+                    if elapsed <= self.stall_timeout_seconds:
+                        continue
+                    ingest_task.cancel()
+                    error_message = (
+                        "Ingestion stalled: no progress heartbeat for "
+                        f"{int(elapsed)}s (timeout={self.stall_timeout_seconds}s)."
+                    )
+                    await self.store.update_status(
+                        job.project_id,
+                        state="failed",
+                        repo_path=job.repo_path,
+                        branch=job.branch,
+                        last_finished_at=_utc_now(),
+                        last_error=error_message,
+                        current_step="failed",
+                    )
+                    self.logger.error(
+                        "ingestion_stalled project_id=%s elapsed=%s timeout=%s",
+                        job.project_id,
+                        int(elapsed),
+                        self.stall_timeout_seconds,
+                    )
+                    return
+
             finished_at = _utc_now()
             await self.store.update_status(
                 job.project_id,
@@ -405,6 +470,7 @@ class IngestionManager:
                 files_scanned=stats.scanned_files,
                 chunks_embedded=stats.ingested_chunks,
                 chunks_written=stats.ingested_chunks,
+                skipped_files=stats.skipped_files,
                 current_step="complete",
                 current_file=None,
             )
@@ -431,3 +497,16 @@ class IngestionManager:
                 job.project_id,
                 str(error),
             )
+
+    async def force_fail_project(
+        self,
+        project_id: str,
+        reason: str = "Manually failed by operator",
+    ) -> dict[str, Any]:
+        return await self.store.update_status(
+            project_id,
+            state="failed",
+            current_step="failed",
+            last_error=reason,
+            last_finished_at=_utc_now(),
+        )

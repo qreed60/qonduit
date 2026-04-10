@@ -54,6 +54,28 @@ Each project status includes:
 - `chunks_written`
 - `current_step`
 - `current_file`
+- `last_progress_at`
+- `skipped_files`
+
+## Timeout + skip behavior
+
+- `INGESTION_STALL_TIMEOUT_SECONDS` (default `600`):
+  - if no heartbeat progress update occurs longer than this timeout,
+    the running job is auto-failed (`state=failed`, `current_step=failed`).
+- `INGESTION_FILE_TIMEOUT_SECONDS` (default `120`):
+  - each file is processed with a timeout; timed-out files are skipped and
+    ingestion continues.
+- Max file size safeguard:
+  - files above the default max text size are skipped during scanning.
+- Generated/minified defaults:
+  - ingestion excludes common generated/minified/vendor paths by default.
+
+## Recovery behavior
+
+- Failed/stalled jobs are re-enqueueable.
+- If an operator wants immediate recovery control, use:
+  - `POST /v1/ingestion/fail/{project_id}`
+  - optional body: `{"reason":"manual reset"}`
 
 ## Manual helper scripts
 

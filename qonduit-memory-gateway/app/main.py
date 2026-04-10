@@ -105,6 +105,21 @@ def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
         return default
     return parsed
 
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid_int_env name=%s raw=%s fallback=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
 
 LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
 DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
@@ -125,6 +140,8 @@ PROJECTS_ROOT = env_str("PROJECTS_ROOT", "/opt/projects")
 PROJECT_ALIAS_TARGET_MODEL = env_str("PROJECT_ALIAS_TARGET_MODEL", "gpt-oss:20b")
 PROJECT_ALIAS_CACHE_TTL_SECONDS = max(env_int("PROJECT_ALIAS_CACHE_TTL_SECONDS", 60), 1)
 INGESTION_POLL_SECONDS = max(env_int("INGESTION_POLL_SECONDS", 2), 1)
+INGESTION_STALL_TIMEOUT_SECONDS = max(env_int("INGESTION_STALL_TIMEOUT_SECONDS", 600), 30)
+INGESTION_FILE_TIMEOUT_SECONDS = max(env_int("INGESTION_FILE_TIMEOUT_SECONDS", 120), 1)
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -154,6 +171,8 @@ ingestion_manager = IngestionManager(
     projects_root=PROJECTS_ROOT,
     logger=ingestion_logger,
     poll_seconds=float(INGESTION_POLL_SECONDS),
+    stall_timeout_seconds=INGESTION_STALL_TIMEOUT_SECONDS,
+    file_timeout_seconds=INGESTION_FILE_TIMEOUT_SECONDS,
 )
 
 TEXT_EXTENSIONS = {
@@ -260,6 +279,10 @@ class IngestionEnqueueRequest(BaseModel):
     branch: str | None = None
 
 
+class IngestionFailRequest(BaseModel):
+    reason: str | None = None
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": "qonduit-memory-gateway"}
@@ -285,6 +308,13 @@ async def ingestion_enqueue(req: IngestionEnqueueRequest) -> dict:
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result)
     return result
+
+
+@app.post("/v1/ingestion/fail/{project_id}")
+async def ingestion_force_fail(project_id: str, req: IngestionFailRequest) -> dict:
+    reason = (req.reason or "").strip() or "Manually failed by operator"
+    status = await ingestion_manager.force_fail_project(project_id, reason=reason)
+    return {"ok": True, "project_id": project_id, "status": status}
 
 
 @app.get("/v1/models")
