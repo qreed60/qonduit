@@ -11,15 +11,18 @@ def main() -> int:
         description="Print gateway ingestion status (all or one project)",
     )
     parser.add_argument("--project-id")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8090")
+    parser.add_argument("--debug", action="store_true", help="Show full debug state")
     args = parser.parse_args()
 
     base = args.base_url.rstrip("/")
-    target = (
-        f"{base}/v1/ingestion/status/{args.project_id}"
-        if args.project_id
-        else f"{base}/v1/ingestion/status"
-    )
+    if args.debug:
+        target = f"{base}/v1/ingestion/debug"
+    elif args.project_id:
+        target = f"{base}/v1/ingestion/status/{args.project_id}"
+    else:
+        target = f"{base}/v1/ingestion/status"
+    
     with urllib.request.urlopen(target, timeout=30) as response:
         data = response.read().decode("utf-8")
     print(json.dumps(json.loads(data), indent=2, sort_keys=True))

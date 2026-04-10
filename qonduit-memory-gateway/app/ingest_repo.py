@@ -373,11 +373,11 @@ async def _process_single_file(
     """Process a single file. Raises TimeoutError if it takes too long."""
     rel_path = path.relative_to(config.repo_path).as_posix()
 
-    # Step 1: reading_file
+    # Step 1: file_processing_started / reading_file
     if progress_callback is not None:
         result = progress_callback(
             {
-                "current_step": "reading_file",
+                "current_step": "file_processing_started",
                 "files_scanned": stats.scanned_files,
                 "current_file": rel_path,
                 "chunks_embedded": stats.ingested_chunks,

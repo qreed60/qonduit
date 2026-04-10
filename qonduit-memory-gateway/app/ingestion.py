@@ -21,8 +21,14 @@ from .projects import discover_git_projects
 
 INGESTION_STATUS_FILE = "ingestion_status.json"
 INGESTION_QUEUE_FILE = "ingestion_queue.json"
+INGESTION_HISTORY_FILE = "ingestion_history.json"
 INGESTION_LOG_FILE = "ingestion.log"
 STATUS_STATES = {"idle", "queued", "running", "success", "failed"}
+
+# Inference protection: optional delays to avoid starving inference
+INTER_FILE_DELAY_SECONDS = float(os.getenv("INGESTION_INTER_FILE_DELAY_SECONDS", "0"))
+INTER_CHUNK_DELAY_SECONDS = float(os.getenv("INGESTION_INTER_CHUNK_DELAY_SECONDS", "0"))
+MAX_ACTIVE_JOB_SECONDS = float(os.getenv("INGESTION_MAX_ACTIVE_JOB_SECONDS", "3600"))
 
 
 def _get_file_timeout_seconds() -> float:
@@ -107,7 +113,9 @@ class IngestionStore:
         self.data_dir = Path(data_dir).resolve()
         self.status_path = self.data_dir / INGESTION_STATUS_FILE
         self.queue_path = self.data_dir / INGESTION_QUEUE_FILE
+        self.history_path = self.data_dir / INGESTION_HISTORY_FILE
         self._lock = asyncio.Lock()
+        self._history_lock = asyncio.Lock()
 
     def _default_status_entry(self, project_id: str) -> dict[str, Any]:
         return {
@@ -141,6 +149,35 @@ class IngestionStore:
     async def save_queue(self, payload: dict[str, Any]) -> None:
         async with self._lock:
             _atomic_write_json(self.queue_path, payload)
+
+    async def load_history(self) -> dict[str, Any]:
+        async with self._history_lock:
+            return _read_json_or_default(self.history_path, {"completed": [], "failed": []})
+
+    async def save_history(self, payload: dict[str, Any]) -> None:
+        async with self._history_lock:
+            _atomic_write_json(self.history_path, payload)
+
+    async def add_history_entry(self, entry: dict[str, Any], state: str) -> None:
+        """Add a job to completed or failed history."""
+        history = await self.load_history()
+        history.setdefault("completed", [])
+        history.setdefault("failed", [])
+        
+        # Ensure entry has required fields
+        entry["project_id"] = _safe_project_id(entry.get("project_id", "unknown"))
+        entry["state"] = state
+        
+        if state == "success":
+            history["completed"].append(entry)
+            # Keep only last 100 completed jobs
+            history["completed"] = history["completed"][-100:]
+        elif state == "failed":
+            history["failed"].append(entry)
+            # Keep only last 100 failed jobs
+            history["failed"] = history["failed"][-100:]
+        
+        await self.save_history(history)
 
     async def get_status(self, project_id: str) -> dict[str, Any]:
         safe_project = _safe_project_id(project_id)
@@ -346,13 +383,69 @@ class IngestionManager:
             "queued_position": position,
         }
 
+    async def debug_state(self) -> dict[str, Any]:
+        """Return full debug state including queue, active job, and history."""
+        statuses = await self.store.load_status()
+        queue = await self.store.load_queue()
+        history = await self.store.load_history()
+        
+        jobs = queue.get("jobs", [])
+        queue_projects = []
+        if isinstance(jobs, list):
+            queue_projects = [
+                _safe_project_id(item.get("project_id"))
+                for item in jobs
+                if isinstance(item, dict)
+            ]
+        
+        # Find currently running job (if any)
+        active_job = None
+        projects = statuses.get("projects", {})
+        for proj_id, proj_status in projects.items():
+            if isinstance(proj_status, dict) and proj_status.get("state") == "running":
+                active_job = {
+                    "project_id": proj_id,
+                    **proj_status,
+                }
+                break
+        
+        completed = history.get("completed", [])[-20:]  # Last 20
+        failed = history.get("failed", [])[-20:]  # Last 20
+        
+        return {
+            "ok": True,
+            "queue_length": len(queue_projects),
+            "queue_project_ids": queue_projects,
+            "active_job": active_job,
+            "recent_completed": completed,
+            "recent_failed": failed,
+            "worker_state": "running" if self._task and not self._task.done() else "stopped",
+        }
+
     async def _worker_loop(self) -> None:
+        """Process queued jobs sequentially, one at a time."""
         while not self._stop_event.is_set():
             job = await self.store.pop_next_job()
             if job is None:
                 await asyncio.sleep(self.poll_seconds)
                 continue
+            
+            self.logger.info(
+                "job_started project_id=%s repo_path=%s branch=%s",
+                job.project_id,
+                job.repo_path,
+                job.branch,
+            )
             await self._run_job(job)
+            
+            # Small yield between jobs to avoid starving inference
+            if INTER_FILE_DELAY_SECONDS > 0:
+                await asyncio.sleep(INTER_FILE_DELAY_SECONDS)
+            
+            self.logger.info(
+                "next_job_will_start queue_depth=%d",
+                len((await self.store.load_queue()).get("jobs", [])),
+            )
 
     async def _run_job(self, job: IngestionJob) -> None:
         started_at = _utc_now()
@@ -429,11 +522,33 @@ class IngestionManager:
 
                 await self.store.update_status(job.project_id, **update_kwargs)
 
+                # Optional inter-chunk delay for inference protection
+                if INTER_CHUNK_DELAY_SECONDS > 0 and current_step in ("embedding_chunk", "writing_chunk"):
+                    await asyncio.sleep(INTER_CHUNK_DELAY_SECONDS)
+
             stats = await ingest_repository_with_progress(
                 config,
                 progress_callback=on_progress,
             )
             finished_at = _utc_now()
+            
+            # Build history entry
+            history_entry = {
+                "project_id": job.project_id,
+                "repo_path": job.repo_path,
+                "branch": job.branch,
+                "enqueued_at": job.enqueued_at,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "state": "success",
+                "last_error": None,
+                "skipped_files": stats.skipped_files,
+                "chunks_written": stats.ingested_chunks,
+                "files_scanned": stats.scanned_files,
+            }
+            
+            await self.store.add_history_entry(history_entry, "success")
+            
             await self.store.update_status(
                 job.project_id,
                 state="success",
@@ -449,7 +564,7 @@ class IngestionManager:
                 current_file=None,
             )
             self.logger.info(
-                "ingestion_success project_id=%s files_scanned=%s chunks_written=%s skipped_files=%s",
+                "job_completed project_id=%s files_scanned=%s chunks_written=%s skipped_files=%s",
                 job.project_id,
                 stats.scanned_files,
                 stats.ingested_chunks,
@@ -457,6 +572,23 @@ class IngestionManager:
             )
         except Exception as error:
             finished_at = _utc_now()
+            
+            # Build history entry for failed job
+            history_entry = {
+                "project_id": job.project_id,
+                "repo_path": job.repo_path,
+                "branch": job.branch,
+                "enqueued_at": job.enqueued_at,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "state": "failed",
+                "last_error": str(error),
+                "skipped_files": 0,
+                "chunks_written": 0,
+            }
+            
+            await self.store.add_history_entry(history_entry, "failed")
+            
             await self.store.update_status(
                 job.project_id,
                 state="failed",
@@ -468,7 +600,7 @@ class IngestionManager:
                 current_file=None,
             )
             self.logger.exception(
-                "ingestion_failed project_id=%s error=%s",
+                "job_failed project_id=%s error=%s",
                 job.project_id,
                 str(error),
             )
