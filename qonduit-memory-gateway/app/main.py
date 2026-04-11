@@ -2126,75 +2126,140 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             len(req.messages),
         )
 
-        # Track whether streaming succeeded or needs fallback
-        _stream_result = {"failed_early": False, "chunks_emitted": 0, "error": None}
+        # First, try to get a non-stream response as backup in case streaming fails
+        # We'll only use it if streaming fails early
+        non_stream_response_data = None
+        non_stream_fetched = False
+        
+        async def fetch_non_stream_backup():
+            """Fetch non-stream response in parallel as backup."""
+            nonlocal non_stream_response_data, non_stream_fetched
+            try:
+                non_stream_payload = dict(payload)
+                non_stream_payload["stream"] = False
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=non_stream_payload)
+                    if r.status_code < 400:
+                        non_stream_response_data = r.json()
+                        non_stream_fetched = True
+                        logger.info(
+                            "stream_backup_nonstream_fetched conversation_id=%s model=%s",
+                            conversation_id,
+                            req.model,
+                        )
+            except Exception as e:
+                logger.debug(
+                    "stream_backup_nonstream_fetch_failed conversation_id=%s model=%s error=%s",
+                    conversation_id,
+                    req.model,
+                    str(e),
+                )
+
+        # Start fetching backup in parallel (don't await - let it run in background)
+        backup_task = asyncio.create_task(fetch_non_stream_backup())
 
         async def wrapped_event_stream():
             """Wrap event_stream to detect early failures and trigger fallback."""
             chunks_emitted = 0
+            had_content = False
+            first_chunk_time = None
+            
             try:
                 async for chunk in event_stream():
                     chunks_emitted += 1
+                    if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                        had_content = True
+                        if first_chunk_time is None:
+                            first_chunk_time = time.perf_counter()
                     yield chunk
-            except _StreamFallbackNeeded:
-                # Internal signal to trigger fallback - don't log as error
-                _stream_result["failed_early"] = True
-                _stream_result["chunks_emitted"] = chunks_emitted
-                raise
+                    
+                # If we completed without any content, try to use backup
+                if not had_content and chunks_emitted > 0:
+                    # We sent chunks but no actual content - wait for backup if not ready
+                    if not non_stream_fetched:
+                        try:
+                            await asyncio.wait_for(backup_task, timeout=5.0)
+                        except asyncio.TimeoutError:
+                            pass
+                    
+                    if non_stream_fetched and non_stream_response_data:
+                        logger.info(
+                            "stream_no_content_using_backup conversation_id=%s model=%s",
+                            conversation_id,
+                            req.model,
+                        )
+                        # Send the backup response as a single chunk
+                        content = (
+                            non_stream_response_data.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                        )
+                        yield sse_chunk(req.model, content=content)
+                        yield sse_chunk(req.model, finish_reason="stop")
+                        yield "data: [DONE]\n\n"
+                        
             except asyncio.CancelledError:
-                _stream_result["failed_early"] = (chunks_emitted == 0)
-                _stream_result["chunks_emitted"] = chunks_emitted
-                raise
-            except Exception as e:
-                _stream_result["failed_early"] = (chunks_emitted == 0)
-                _stream_result["chunks_emitted"] = chunks_emitted
-                _stream_result["error"] = str(e)
-                if chunks_emitted == 0:
-                    logger.warning(
-                        "stream_early_failure_triggering_fallback conversation_id=%s model=%s error=%s",
-                        conversation_id,
-                        req.model,
-                        str(e),
-                    )
-                else:
-                    logger.warning(
-                        "stream_partial_failure_chunks_already_sent conversation_id=%s model=%s chunks=%s error=%s",
-                        conversation_id,
-                        req.model,
-                        chunks_emitted,
-                        str(e),
-                    )
-                raise
-
-        try:
-            stream_response = StreamingResponse(
-                wrapped_event_stream(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                },
-            )
-            return stream_response
-        except _StreamFallbackNeeded:
-            # Streaming completed but no content was received - fall back to non-stream
-            logger.info(
-                "stream_fallback_triggered_no_content conversation_id=%s model=%s",
-                conversation_id,
-                req.model,
-            )
-            return await call_non_stream_fallback()
-        except Exception:
-            # For other exceptions, check if we can fall back
-            if _stream_result.get("failed_early"):
                 logger.info(
-                    "stream_fallback_triggered_after_failure conversation_id=%s model=%s error=%s",
+                    "stream_canceled conversation_id=%s model=%s chunks_emitted=%s",
                     conversation_id,
                     req.model,
-                    _stream_result.get("error", "unknown"),
+                    chunks_emitted,
                 )
-                return await call_non_stream_fallback()
-            raise
+                # Cancel backup task if still running
+                backup_task.cancel()
+                raise
+            except Exception as e:
+                logger.exception(
+                    "stream_error conversation_id=%s model=%s chunks_emitted=%s error=%s",
+                    conversation_id,
+                    req.model,
+                    chunks_emitted,
+                    str(e),
+                )
+                # If no chunks emitted, try to use backup
+                if chunks_emitted == 0:
+                    if not non_stream_fetched:
+                        try:
+                            await asyncio.wait_for(backup_task, timeout=5.0)
+                        except asyncio.TimeoutError:
+                            pass
+                    
+                    if non_stream_fetched and non_stream_response_data:
+                        logger.info(
+                            "stream_early_failure_using_backup conversation_id=%s model=%s",
+                            conversation_id,
+                            req.model,
+                        )
+                        content = (
+                            non_stream_response_data.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                        )
+                        yield sse_chunk(req.model, content=content)
+                        yield sse_chunk(req.model, finish_reason="stop")
+                        yield "data: [DONE]\n\n"
+                        return
+                
+                # Re-raise if we can't recover
+                raise
+            finally:
+                # Clean up backup task if still running
+                if not backup_task.done():
+                    backup_task.cancel()
+                    try:
+                        await backup_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        stream_response = StreamingResponse(
+            wrapped_event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        return stream_response
 
     non_stream_start = time.perf_counter()
     try:
