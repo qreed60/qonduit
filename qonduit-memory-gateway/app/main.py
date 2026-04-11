@@ -1802,7 +1802,11 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                     upstream_lines = r.aiter_lines()
                     while True:
                         # Check if downstream client disconnected
-                        if request.is_disconnected():
+                        try:
+                            disconnected = await request.is_disconnected()
+                        except Exception:
+                            disconnected = False
+                        if disconnected:
                             logger.info(
                                 "stream_downstream_disconnect conversation_id=%s model=%s "
                                 "chunks_emitted=%s chars_emitted=%s",
@@ -1820,7 +1824,11 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                             )
                         except asyncio.TimeoutError:
                             # Check again for client disconnect before sending keepalive
-                            if request.is_disconnected():
+                            try:
+                                disconnected = await request.is_disconnected()
+                            except Exception:
+                                disconnected = False
+                            if disconnected:
                                 logger.info(
                                     "stream_downstream_disconnect_keepalive conversation_id=%s model=%s",
                                     conversation_id,
@@ -1924,7 +1932,12 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 emitted_chunks,
                 emitted_chars,
             )
-            raise
+            # Do not re-raise - let the caller handle cancellation gracefully
+            # This prevents the exception from bubbling up and causing generic failures
+            if not sent_done:
+                yield sse_chunk(req.model, finish_reason="stop")
+                yield "data: [DONE]\n\n"
+            return
         except Exception as e:
             logger.exception(
                 "stream_request_failed conversation_id=%s model=%s error=%s",
@@ -1938,7 +1951,8 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 yield sse_chunk(req.model, content=f"Gateway streaming error: {str(e)}")
                 yield sse_chunk(req.model, finish_reason="stop")
                 yield "data: [DONE]\n\n"
-            return
+            # Re-raise for early failure detection and fallback triggering
+            raise
         finally:
             # Clean up in-flight tracking
             _in_flight_streams.pop(stream_id, None)
@@ -2071,20 +2085,24 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             len(req.messages),
         )
 
-        # Wrap the event_stream generator to detect early failures and trigger fallback
+        # Track whether streaming succeeded or needs fallback
+        _stream_result = {"failed_early": False, "chunks_emitted": 0, "error": None}
+
         async def wrapped_event_stream():
-            """Wrap event_stream to detect early failures and signal fallback."""
-            nonlocal _stream_failed_early
+            """Wrap event_stream to detect early failures and trigger fallback."""
             chunks_emitted = 0
             try:
                 async for chunk in event_stream():
                     chunks_emitted += 1
                     yield chunk
             except asyncio.CancelledError:
-                _stream_failed_early = (chunks_emitted == 0)
+                _stream_result["failed_early"] = (chunks_emitted == 0)
+                _stream_result["chunks_emitted"] = chunks_emitted
                 raise
             except Exception as e:
-                _stream_failed_early = (chunks_emitted == 0)
+                _stream_result["failed_early"] = (chunks_emitted == 0)
+                _stream_result["chunks_emitted"] = chunks_emitted
+                _stream_result["error"] = str(e)
                 if chunks_emitted == 0:
                     logger.warning(
                         "stream_early_failure_triggering_fallback conversation_id=%s model=%s error=%s",
@@ -2102,19 +2120,27 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                     )
                 raise
 
-        _stream_failed_early = False
-        stream_response = StreamingResponse(
-            wrapped_event_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
-
-        # Return the streaming response; fallback will be handled at response level
-        # by checking if stream failed before any chunks were sent
-        return stream_response
+        try:
+            stream_response = StreamingResponse(
+                wrapped_event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+            return stream_response
+        except Exception:
+            # If streaming fails before response is sent, fall back to non-stream
+            if _stream_result["failed_early"]:
+                logger.info(
+                    "stream_fallback_triggered_after_failure conversation_id=%s model=%s error=%s",
+                    conversation_id,
+                    req.model,
+                    _stream_result.get("error", "unknown"),
+                )
+                return await call_non_stream_fallback()
+            raise
 
     non_stream_start = time.perf_counter()
     try:
