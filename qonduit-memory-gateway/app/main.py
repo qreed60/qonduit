@@ -63,7 +63,10 @@ def _log_stream_event(event_type: str, conversation_id: str, model: str, **kwarg
 
 @app.on_event("startup")
 async def startup() -> None:
-    ensure_collection()
+    try:
+        ensure_collection()
+    except Exception as e:
+        logger.warning("rag_startup_failed error=%s continuing_without_rag", str(e))
     await ingestion_manager.start()
     logger.info(
         "gateway_startup llama_base=%s default_context_size=%s default_mode=%s "
@@ -1766,6 +1769,11 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             "chunks_received": 0,
         }
 
+        # Keep-alive task to prevent client timeouts during long prompt processing
+        keep_alive_interval = 15.0  # seconds
+        last_activity = stream_start
+        keep_alive_sent = False
+
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream(
@@ -1809,6 +1817,9 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                     # Use aiter_bytes for more robust raw streaming, then parse lines manually
                     buffer = ""
                     async for chunk_bytes in r.aiter_bytes(chunk_size=1024):
+                        last_activity = time.perf_counter()
+                        keep_alive_sent = False
+                        
                         # Check if downstream client disconnected
                         try:
                             disconnected = await request.is_disconnected()
@@ -1904,6 +1915,11 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                         
                         if upstream_disconnect:
                             break
+                        
+                        # Send keep-alive comment if no activity for too long
+                        if time.perf_counter() - last_activity > keep_alive_interval and not keep_alive_sent:
+                            yield ": keep-alive\n\n"
+                            keep_alive_sent = True
                     
                     # Handle any remaining content in buffer (no trailing newline)
                     if buffer and not upstream_disconnect:
