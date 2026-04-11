@@ -46,6 +46,11 @@ logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
 
+class _StreamFallbackNeeded(Exception):
+    """Internal exception to signal that streaming failed and fallback to non-stream is needed."""
+    pass
+
+
 # Track in-flight stream requests for fallback retry
 _in_flight_streams: dict[str, dict[str, Any]] = {}
 
@@ -1743,6 +1748,8 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         assistant_parts: list[str] = []
         sent_done = False
         first_chunk_received = False
+        upstream_disconnect = False
+        had_any_content = False
         timeout = httpx.Timeout(
             connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
             read=None,
@@ -1799,8 +1806,9 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                         yield "data: [DONE]\n\n"
                         return
 
-                    upstream_lines = r.aiter_lines()
-                    while True:
+                    # Use aiter_bytes for more robust raw streaming, then parse lines manually
+                    buffer = ""
+                    async for chunk_bytes in r.aiter_bytes(chunk_size=1024):
                         # Check if downstream client disconnected
                         try:
                             disconnected = await request.is_disconnected()
@@ -1815,114 +1823,122 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                                 emitted_chunks,
                                 emitted_chars,
                             )
+                            upstream_disconnect = True
                             break
 
                         try:
-                            line = await asyncio.wait_for(
-                                anext(upstream_lines),
-                                timeout=STREAM_KEEPALIVE_INTERVAL_SECONDS,
+                            chunk_text = chunk_bytes.decode("utf-8", errors="replace")
+                        except Exception as e:
+                            logger.warning(
+                                "stream_chunk_decode_error conversation_id=%s model=%s error=%s",
+                                conversation_id,
+                                req.model,
+                                str(e),
                             )
-                        except asyncio.TimeoutError:
-                            # Check again for client disconnect before sending keepalive
-                            try:
-                                disconnected = await request.is_disconnected()
-                            except Exception:
-                                disconnected = False
-                            if disconnected:
+                            continue
+
+                        buffer += chunk_text
+                        
+                        # Process complete lines from buffer
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.rstrip("\r")
+                            
+                            if not line:
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+
+                            data_line = line[5:].strip()
+                            if not data_line:
+                                continue
+
+                            if data_line == "[DONE]":
+                                sent_done = True
+                                yield "data: [DONE]\n\n"
+                                upstream_disconnect = True
+                                break
+
+                            # Log first chunk received
+                            if not first_chunk_received:
+                                first_chunk_received = True
+                                time_to_first_chunk = int((time.perf_counter() - stream_start) * 1000)
                                 logger.info(
-                                    "stream_downstream_disconnect_keepalive conversation_id=%s model=%s",
+                                    "stream_first_chunk conversation_id=%s model=%s "
+                                    "time_to_first_chunk_ms=%s",
                                     conversation_id,
                                     req.model,
+                                    time_to_first_chunk,
                                 )
-                                break
-                            yield ": keep-alive\n\n"
-                            continue
-                        except StopAsyncIteration:
-                            logger.info(
-                                "stream_upstream_exhausted conversation_id=%s model=%s "
-                                "chunks_emitted=%s chars_emitted=%s",
-                                conversation_id,
-                                req.model,
-                                emitted_chunks,
-                                emitted_chars,
+                                _in_flight_streams[stream_id]["chunks_received"] = 1
+
+                            emitted_chunks += 1
+                            _in_flight_streams[stream_id]["chunks_received"] = emitted_chunks
+                            yield f"data: {data_line}\n\n"
+
+                            try:
+                                parsed = json.loads(data_line)
+                            except json.JSONDecodeError as e:
+                                logger.warning(
+                                    "stream_chunk_parse_failed conversation_id=%s model=%s "
+                                    "chunk_preview=%s error=%s",
+                                    conversation_id,
+                                    req.model,
+                                    data_line[:100],
+                                    str(e),
+                                )
+                                continue
+
+                            choices = parsed.get("choices", [])
+                            if not choices:
+                                continue
+
+                            delta = choices[0].get("delta", {})
+                            text_delta = coerce_model_content_to_text(
+                                delta.get("content", ""),
                             )
+                            if text_delta:
+                                emitted_chars += len(text_delta)
+                                assistant_parts.append(text_delta)
+                                had_any_content = True
+                        
+                        if upstream_disconnect:
                             break
-                        except httpx.ReadError as e:
-                            logger.error(
-                                "stream_upstream_read_error conversation_id=%s model=%s error=%s",
-                                conversation_id,
-                                req.model,
-                                str(e),
-                            )
-                            break
-                        except Exception as e:
-                            logger.exception(
-                                "stream_upstream_iter_error conversation_id=%s model=%s error=%s",
-                                conversation_id,
-                                req.model,
-                                str(e),
-                            )
-                            break
+                    
+                    # Handle any remaining content in buffer (no trailing newline)
+                    if buffer and not upstream_disconnect:
+                        line = buffer.strip().rstrip("\r")
+                        if line.startswith("data:"):
+                            data_line = line[5:].strip()
+                            if data_line and data_line != "[DONE]":
+                                if not first_chunk_received:
+                                    first_chunk_received = True
+                                    _in_flight_streams[stream_id]["chunks_received"] = 1
+                                emitted_chunks += 1
+                                yield f"data: {data_line}\n\n"
+                                
+                                try:
+                                    parsed = json.loads(data_line)
+                                    choices = parsed.get("choices", [])
+                                    if choices:
+                                        delta = choices[0].get("delta", {})
+                                        text_delta = coerce_model_content_to_text(delta.get("content", ""))
+                                        if text_delta:
+                                            emitted_chars += len(text_delta)
+                                            assistant_parts.append(text_delta)
+                                            had_any_content = True
+                                except json.JSONDecodeError:
+                                    pass
 
-                        if not line:
-                            continue
-                        if not line.startswith("data:"):
-                            continue
-
-                        data_line = line[5:].strip()
-                        if not data_line:
-                            continue
-
-                        if data_line == "[DONE]":
-                            sent_done = True
-                            yield "data: [DONE]\n\n"
-                            break
-
-                        # Log first chunk received
-                        if not first_chunk_received:
-                            first_chunk_received = True
-                            time_to_first_chunk = int((time.perf_counter() - stream_start) * 1000)
-                            logger.info(
-                                "stream_first_chunk conversation_id=%s model=%s "
-                                "time_to_first_chunk_ms=%s",
-                                conversation_id,
-                                req.model,
-                                time_to_first_chunk,
-                            )
-                            _in_flight_streams[stream_id]["chunks_received"] = 1
-
-                        emitted_chunks += 1
-                        _in_flight_streams[stream_id]["chunks_received"] = emitted_chunks
-                        yield f"data: {data_line}\n\n"
-
-                        try:
-                            parsed = json.loads(data_line)
-                        except json.JSONDecodeError as e:
-                            logger.warning(
-                                "stream_chunk_parse_failed conversation_id=%s model=%s "
-                                "chunk_preview=%s error=%s",
-                                conversation_id,
-                                req.model,
-                                data_line[:100],
-                                str(e),
-                            )
-                            continue
-
-                        choices = parsed.get("choices", [])
-                        if not choices:
-                            continue
-
-                        delta = choices[0].get("delta", {})
-                        text_delta = coerce_model_content_to_text(
-                            delta.get("content", ""),
+                    if not sent_done and not upstream_disconnect:
+                        logger.info(
+                            "stream_upstream_exhausted conversation_id=%s model=%s "
+                            "chunks_emitted=%s chars_emitted=%s",
+                            conversation_id,
+                            req.model,
+                            emitted_chunks,
+                            emitted_chars,
                         )
-                        if text_delta:
-                            emitted_chars += len(text_delta)
-                            assistant_parts.append(text_delta)
-
-                    if not sent_done:
-                        yield sse_chunk(req.model, finish_reason="stop")
-                        yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
             logger.info(
                 "stream_canceled conversation_id=%s model=%s "
@@ -1932,11 +1948,8 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 emitted_chunks,
                 emitted_chars,
             )
-            # Do not re-raise - let the caller handle cancellation gracefully
-            # This prevents the exception from bubbling up and causing generic failures
-            if not sent_done:
-                yield sse_chunk(req.model, finish_reason="stop")
-                yield "data: [DONE]\n\n"
+            # Upstream canceled (likely due to downstream disconnect). 
+            # Don't re-raise - just end the stream gracefully.
             return
         except Exception as e:
             logger.exception(
@@ -1945,19 +1958,31 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 req.model,
                 str(e),
             )
-            # Only yield error chunk if we haven't sent any data yet
-            # This allows partial success to be handled gracefully
+            # If no chunks were emitted, yield an error chunk for fallback detection
             if emitted_chunks == 0:
                 yield sse_chunk(req.model, content=f"Gateway streaming error: {str(e)}")
                 yield sse_chunk(req.model, finish_reason="stop")
                 yield "data: [DONE]\n\n"
-            # Re-raise for early failure detection and fallback triggering
-            raise
+            # Don't re-raise - let the stream end gracefully
+            # Fallback will be handled by checking if we got any content
+            return
         finally:
             # Clean up in-flight tracking
             _in_flight_streams.pop(stream_id, None)
 
+        # After successful streaming, check if we got any actual content
+        # If not, trigger fallback to non-streaming mode
         assistant_content = "".join(assistant_parts)
+        
+        if not had_any_content and not upstream_disconnect:
+            logger.warning(
+                "stream_no_content_triggering_fallback conversation_id=%s model=%s",
+                conversation_id,
+                req.model,
+            )
+            # Signal that fallback is needed by raising a specific exception
+            raise _StreamFallbackNeeded("No content received from stream")
+        
         logger.info(
             "stream_complete conversation_id=%s model=%s chunks=%s chars=%s",
             conversation_id,
@@ -2095,6 +2120,11 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 async for chunk in event_stream():
                     chunks_emitted += 1
                     yield chunk
+            except _StreamFallbackNeeded:
+                # Internal signal to trigger fallback - don't log as error
+                _stream_result["failed_early"] = True
+                _stream_result["chunks_emitted"] = chunks_emitted
+                raise
             except asyncio.CancelledError:
                 _stream_result["failed_early"] = (chunks_emitted == 0)
                 _stream_result["chunks_emitted"] = chunks_emitted
@@ -2130,9 +2160,17 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 },
             )
             return stream_response
+        except _StreamFallbackNeeded:
+            # Streaming completed but no content was received - fall back to non-stream
+            logger.info(
+                "stream_fallback_triggered_no_content conversation_id=%s model=%s",
+                conversation_id,
+                req.model,
+            )
+            return await call_non_stream_fallback()
         except Exception:
-            # If streaming fails before response is sent, fall back to non-stream
-            if _stream_result["failed_early"]:
+            # For other exceptions, check if we can fall back
+            if _stream_result.get("failed_early"):
                 logger.info(
                     "stream_fallback_triggered_after_failure conversation_id=%s model=%s error=%s",
                     conversation_id,
