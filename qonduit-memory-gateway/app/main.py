@@ -14,7 +14,7 @@ import asyncio
 from pathlib import Path
 import re
 import uuid
-from typing import Any
+from typing import Any, Literal
 from hashlib import sha256
 
 from pypdf import PdfReader
@@ -199,9 +199,24 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+class ToolFunction(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+
+
+class ToolDefinition(BaseModel):
+    type: Literal["function"] = "function"
+    function: ToolFunction
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: Any
+    content: Any | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+
+    model_config = {"extra": "allow"}
 
 
 class GatewayChatRequest(BaseModel):
@@ -216,6 +231,8 @@ class GatewayChatRequest(BaseModel):
     user: str | None = None
     rag_collection: str | None = None
     mode: str | None = None
+    tools: list[ToolDefinition] | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
     model_config = {"extra": "allow"}
 
@@ -1570,13 +1587,30 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     prior_recent = state.get("recent_messages", [])
     summary = state.get("summary", "")
 
-    incoming = [
-        {
-            "role": m.role,
-            "content": coerce_model_content_to_text(m.content),
-        }
-        for m in req.messages
-    ]
+    def build_message_dict(m: ChatMessage) -> dict[str, Any]:
+        """Convert ChatMessage to OpenAI-style message dict, preserving tool fields."""
+        msg_dict: dict[str, Any] = {"role": m.role}
+        
+        # Handle content - preserve structure for tool messages, coerce others to text
+        if m.role == "tool":
+            # Tool messages should have string content
+            if isinstance(m.content, str):
+                msg_dict["content"] = m.content
+            else:
+                msg_dict["content"] = str(m.content) if m.content is not None else ""
+            if m.tool_call_id:
+                msg_dict["tool_call_id"] = m.tool_call_id
+        elif m.tool_calls is not None:
+            # Assistant message with tool calls - preserve structured content
+            msg_dict["content"] = coerce_model_content_to_text(m.content) if m.content is not None else ""
+            msg_dict["tool_calls"] = m.tool_calls
+        else:
+            # Regular message - coerce to text
+            msg_dict["content"] = coerce_model_content_to_text(m.content) if m.content is not None else ""
+        
+        return msg_dict
+
+    incoming = [build_message_dict(m) for m in req.messages]
     combined_recent = prior_recent + incoming
 
     trimmed_recent, _ = trim_recent_messages(
@@ -1715,13 +1749,20 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     }
     save_conversation(conversation_id, state, project_id=project_id)
 
-    payload = {
+    # Build payload for upstream - include tools if provided
+    payload: dict[str, Any] = {
         "model": effective_model,
         "messages": final_messages,
         "max_tokens": max_tokens,
         "temperature": req.temperature,
         "stream": req.stream,
     }
+    
+    # Add tools and tool_choice if present in request
+    if req.tools is not None:
+        payload["tools"] = [tool.model_dump() for tool in req.tools]
+    if req.tool_choice is not None:
+        payload["tool_choice"] = req.tool_choice
 
     async def event_stream():
         stream_payload = dict(payload)
@@ -1832,7 +1873,10 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             yield "data: [DONE]\n\n"
             return
 
+        # Collect both content and tool_calls from streaming response
         assistant_content = "".join(assistant_parts)
+        collected_tool_calls: list[dict[str, Any]] = []
+        
         logger.info(
             "stream_complete conversation_id=%s model=%s chunks=%s chars=%s",
             conversation_id,
@@ -1841,10 +1885,10 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             emitted_chars,
         )
 
-        assistant_message = {
-            "role": "assistant",
-            "content": assistant_content,
-        }
+        # Build assistant message - preserve tool_calls if present
+        assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant_content}
+        if collected_tool_calls:
+            assistant_message["tool_calls"] = collected_tool_calls
 
         state["summary"] = summary
         state["project_id"] = project_id
@@ -1931,17 +1975,21 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         len(req.messages),
     )
 
-    message_content = (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
-    assistant_content = coerce_model_content_to_text(message_content)
-
-    assistant_message = {
-        "role": "assistant",
-        "content": assistant_content,
-    }
+    message_data = data.get("choices", [{}])[0].get("message", {})
+    message_content = message_data.get("content", "")
+    assistant_content = coerce_model_content_to_text(message_content) if message_content else ""
+    
+    # Build assistant message - preserve tool_calls if present in upstream response
+    assistant_message: dict[str, Any] = {"role": "assistant"}
+    if message_content:
+        assistant_message["content"] = assistant_content
+    else:
+        assistant_message["content"] = ""
+    
+    # Pass through tool_calls from upstream if present
+    tool_calls = message_data.get("tool_calls")
+    if tool_calls:
+        assistant_message["tool_calls"] = tool_calls
 
     state["summary"] = summary
     state["project_id"] = project_id
@@ -1962,6 +2010,15 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     }
     save_conversation(conversation_id, state, project_id=project_id)
 
+    # Build response message - include tool_calls if present
+    response_message: dict[str, Any] = {"role": "assistant"}
+    if message_content:
+        response_message["content"] = assistant_content
+    else:
+        response_message["content"] = ""
+    if tool_calls:
+        response_message["tool_calls"] = tool_calls
+
     return {
         "id": data.get("id", f"chatcmpl-qonduit-{uuid.uuid4().hex}"),
         "object": "chat.completion",
@@ -1970,10 +2027,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": assistant_content,
-                },
+                "message": response_message,
                 "finish_reason": (
                     data.get("choices", [{}])[0].get("finish_reason") or "stop"
                 ),
