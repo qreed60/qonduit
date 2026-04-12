@@ -3280,7 +3280,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             continue
 
         logger.info(
-            "tool_loop_exiting conversation_id=%s iteration=%s reason=%s",
+            "tool_loop_exiting conversation_id=%s iteration=%s reason=final_answer",
             conversation_id,
             tool_iteration,
             "model_returned_final_answer",
