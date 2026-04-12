@@ -41,6 +41,7 @@ from .projects import project_alias_cache
 from .ingestion import IngestionManager
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import glob
+import shutil
 
 app = FastAPI(title="Qonduit Memory Gateway")
 logger = logging.getLogger("qonduit.memory_gateway")
@@ -300,6 +301,345 @@ async def execute_get_project_entry_points(
     )
 
 
+MAX_EXECUTION_OUTPUT_BYTES = 120_000
+MAX_LOG_BYTES = 40_000
+MAX_LOG_LINES = 300
+
+
+def project_execution_log_dir(project_id: str) -> Path:
+    safe_project = sanitize_identifier(project_id, "default")
+    base = Path(GATEWAY_DATA_DIR) / "execution_logs" / safe_project
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def ensure_writable_file_path(project_id: str, path: str) -> tuple[Path | None, str | None]:
+    raw = (path or "").strip()
+    if not raw:
+        return None, "invalid_path"
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", raw):
+        return None, "absolute_path_blocked"
+
+    target = resolve_project_relative_file(project_id, raw)
+    if target is None:
+        return None, "path_escape_blocked"
+
+    project_root = resolve_project_root(project_id)
+    parent = target.parent
+    if not _is_within_dir(parent.resolve(), project_root):
+        return None, "path_escape_blocked"
+
+    for candidate in [parent, *parent.parents]:
+        if candidate == project_root.parent:
+            break
+        if candidate.exists() and candidate.is_symlink():
+            return None, "symlink_escape_blocked"
+        if candidate == project_root:
+            break
+
+    if target.exists() and target.is_symlink():
+        return None, "symlink_escape_blocked"
+
+    return target, None
+
+
+def parse_controlled_patch_operations(patch: str) -> list[dict[str, str]]:
+    try:
+        payload = json.loads(patch)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid_json: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_patch_payload: expected object")
+
+    if payload.get("format") != "qonduit.patch/v1":
+        raise ValueError("unsupported_patch_format")
+
+    operations = payload.get("operations")
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("invalid_operations: expected non-empty list")
+
+    parsed: list[dict[str, str]] = []
+    for op in operations:
+        if not isinstance(op, dict):
+            raise ValueError("invalid_operation: expected object")
+
+        action = op.get("action")
+        path = op.get("path")
+        content = op.get("content")
+        if action not in {"write", "create"}:
+            raise ValueError("invalid_action: only write/create allowed")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("invalid_path")
+        if not isinstance(content, str):
+            raise ValueError("invalid_content")
+
+        parsed.append({
+            "action": action,
+            "path": path,
+            "content": content,
+        })
+
+    return parsed
+
+
+async def execute_apply_patch(project_id: str, patch: str) -> str:
+    """Apply controlled patch operations inside the active project only."""
+    safe_project = sanitize_identifier(project_id, "default")
+
+    try:
+        operations = parse_controlled_patch_operations(patch)
+    except ValueError as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "project_id": safe_project,
+                "error": "invalid_patch",
+                "detail": str(exc),
+                "affected_files": [],
+            },
+            indent=2,
+        )
+
+    affected_files: list[str] = []
+    errors: list[dict[str, str]] = []
+
+    for op in operations:
+        path = op["path"]
+        target, error_code = ensure_writable_file_path(project_id, path)
+        if target is None:
+            errors.append({"path": path, "error": error_code or "invalid_path"})
+            continue
+
+        rel_path = str(target.relative_to(resolve_project_root(project_id)))
+        is_create = op["action"] == "create"
+        if is_create and target.exists():
+            errors.append({"path": rel_path, "error": "file_already_exists"})
+            continue
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(op["content"], encoding="utf-8")
+            affected_files.append(rel_path)
+        except Exception as exc:
+            errors.append({"path": rel_path, "error": f"write_failed: {exc}"})
+
+    ok = len(errors) == 0
+    return json.dumps(
+        {
+            "ok": ok,
+            "project_id": safe_project,
+            "error": None if ok else "patch_apply_failed",
+            "affected_files": affected_files,
+            "errors": errors,
+            "applied_count": len(affected_files),
+        },
+        indent=2,
+    )
+
+
+def build_allowed_command(project_id: str, operation: str) -> tuple[list[str] | None, str]:
+    project_root = resolve_project_root(project_id)
+    if not project_root.is_dir():
+        return None, "project_not_found"
+
+    evidence = collect_project_markers(project_root)
+
+    if (project_root / ".qonduit_safe_mock").is_file():
+        if operation == "build":
+            return ["python", "-c", "print('safe_mock_build_ok')"], "safe_mock"
+        return ["python", "-c", "print('safe_mock_tests_ok')"], "safe_mock"
+
+    ranking = rank_project_types(evidence)
+    primary = ranking[0]["type"] if ranking else "unknown"
+
+    if primary == "flutter":
+        if shutil.which("flutter") is None:
+            return None, "flutter_unavailable"
+        if operation == "build":
+            return ["flutter", "build", "apk", "--debug"], "flutter"
+        return ["flutter", "test", "--reporter", "expanded"], "flutter"
+
+    if primary == "android_kotlin":
+        gradlew = project_root / "android" / "gradlew"
+        gradlew_bat = project_root / "android" / "gradlew.bat"
+        if gradlew.is_file():
+            cmd = [str(gradlew)]
+        elif gradlew_bat.is_file():
+            cmd = [str(gradlew_bat)]
+        else:
+            return None, "gradlew_missing"
+        task = "assembleDebug" if operation == "build" else "test"
+        return cmd + [task, "--no-daemon"], "android_kotlin"
+
+    if primary == "web":
+        if shutil.which("npm") is None:
+            return None, "npm_unavailable"
+        npm_task = "build" if operation == "build" else "test"
+        return ["npm", "run", npm_task], "web"
+
+    return None, "unsupported_project_type"
+
+
+async def run_allowed_project_command(
+    project_id: str,
+    operation: str,
+    timeout_seconds: int,
+) -> str:
+    safe_project = sanitize_identifier(project_id, "default")
+    command, detected_type = build_allowed_command(project_id, operation)
+    if command is None:
+        return json.dumps(
+            {
+                "ok": False,
+                "project_id": safe_project,
+                "operation": operation,
+                "error": detected_type,
+                "affected_files": [],
+            },
+            indent=2,
+        )
+
+    timeout_seconds = max(10, min(timeout_seconds, 1200))
+    project_root = resolve_project_root(project_id)
+    log_dir = project_execution_log_dir(project_id)
+    log_path = log_dir / f"{operation}.log"
+
+    started = time.time()
+    output_text = ""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(project_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(),
+            timeout=timeout_seconds,
+        )
+        output_text = (stdout or b"").decode("utf-8", errors="ignore")
+        exit_code = int(process.returncode or 0)
+    except asyncio.TimeoutError:
+        return json.dumps(
+            {
+                "ok": False,
+                "project_id": safe_project,
+                "project_type": detected_type,
+                "operation": operation,
+                "command": command,
+                "error": "timeout",
+                "timeout_seconds": timeout_seconds,
+                "affected_files": [],
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "project_id": safe_project,
+                "project_type": detected_type,
+                "operation": operation,
+                "command": command,
+                "error": f"execution_failed: {exc}",
+                "affected_files": [],
+            },
+            indent=2,
+        )
+
+    output_text = output_text[:MAX_EXECUTION_OUTPUT_BYTES]
+    duration_ms = int((time.time() - started) * 1000)
+    log_path.write_text(output_text, encoding="utf-8")
+
+    return json.dumps(
+        {
+            "ok": exit_code == 0,
+            "project_id": safe_project,
+            "project_type": detected_type,
+            "operation": operation,
+            "command": command,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "log_source": str(log_path.relative_to(Path(GATEWAY_DATA_DIR))),
+            "output_preview": output_text[-4000:],
+            "affected_files": [str(log_path.relative_to(log_dir.parent))],
+        },
+        indent=2,
+    )
+
+
+async def execute_run_build(
+    project_id: str,
+    timeout_seconds: int = 600,
+) -> str:
+    """Run allowlisted build command for the detected project type."""
+    return await run_allowed_project_command(project_id, "build", timeout_seconds)
+
+
+async def execute_run_tests(
+    project_id: str,
+    timeout_seconds: int = 600,
+) -> str:
+    """Run allowlisted test command for the detected project type."""
+    return await run_allowed_project_command(project_id, "tests", timeout_seconds)
+
+
+async def execute_tail_logs(
+    project_id: str,
+    source: str = "build",
+    max_lines: int = 120,
+) -> str:
+    """Tail bounded project execution logs from known sources only."""
+    safe_project = sanitize_identifier(project_id, "default")
+    allowed_sources = {"build", "tests"}
+    if source not in allowed_sources:
+        return json.dumps(
+            {
+                "ok": False,
+                "project_id": safe_project,
+                "error": "invalid_source",
+                "allowed_sources": sorted(allowed_sources),
+                "affected_files": [],
+            },
+            indent=2,
+        )
+
+    log_path = project_execution_log_dir(project_id) / f"{source}.log"
+    if not log_path.is_file():
+        return json.dumps(
+            {
+                "ok": False,
+                "project_id": safe_project,
+                "error": "log_not_found",
+                "source": source,
+                "affected_files": [],
+            },
+            indent=2,
+        )
+
+    bounded_lines = max(1, min(max_lines, MAX_LOG_LINES))
+    raw = log_path.read_bytes()[-MAX_LOG_BYTES:]
+    text = raw.decode("utf-8", errors="ignore")
+    lines = text.splitlines()
+    tail = "\n".join(lines[-bounded_lines:])
+
+    return json.dumps(
+        {
+            "ok": True,
+            "project_id": safe_project,
+            "source": source,
+            "line_count": len(tail.splitlines()),
+            "truncated_bytes": len(raw),
+            "affected_files": [
+                str(log_path.relative_to(Path(GATEWAY_DATA_DIR)))
+            ],
+            "content": tail,
+        },
+        indent=2,
+    )
+
+
 TOOL_HANDLERS = {
     "retrieve_project_context": execute_retrieve_project_context,
     "search_project_files": execute_search_project_files,
@@ -308,6 +648,10 @@ TOOL_HANDLERS = {
     "get_project_file": execute_get_project_file,
     "detect_project_type": execute_detect_project_type,
     "get_project_entry_points": execute_get_project_entry_points,
+    "apply_patch": execute_apply_patch,
+    "run_build": execute_run_build,
+    "run_tests": execute_run_tests,
+    "tail_logs": execute_tail_logs,
 }
 
 
@@ -323,11 +667,18 @@ async def execute_tool(
         return ToolResult(
             tool_call_id=tool_args.get("_tool_call_id", "unknown"),
             name=tool_name,
-            content=(
-                f"Unknown tool: {tool_name}. Available tools: "
-                f"{list(TOOL_HANDLERS.keys())}. "
-                "For project grounding, call detect_project_type first, then "
-                "get_project_entry_points, then read_file/get_project_file."
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "error": "unknown_tool",
+                    "tool": tool_name,
+                    "available_tools": sorted(list(TOOL_HANDLERS.keys())),
+                    "hint": (
+                        "Call detect_project_type, then "
+                        "get_project_entry_points, then read_file."
+                    ),
+                },
+                indent=2,
             ),
             is_error=True,
         )
@@ -374,6 +725,27 @@ async def execute_tool(
                 project_id=project_id,
                 max_results=tool_args.get("max_results", 12),
             )
+        elif tool_name == "apply_patch":
+            result = await handler(
+                project_id=project_id,
+                patch=tool_args.get("patch", ""),
+            )
+        elif tool_name == "run_build":
+            result = await handler(
+                project_id=project_id,
+                timeout_seconds=tool_args.get("timeout_seconds", 600),
+            )
+        elif tool_name == "run_tests":
+            result = await handler(
+                project_id=project_id,
+                timeout_seconds=tool_args.get("timeout_seconds", 600),
+            )
+        elif tool_name == "tail_logs":
+            result = await handler(
+                project_id=project_id,
+                source=tool_args.get("source", "build"),
+                max_lines=tool_args.get("max_lines", 120),
+            )
         else:
             result = f"Unknown tool: {tool_name}"
         
@@ -388,7 +760,15 @@ async def execute_tool(
         return ToolResult(
             tool_call_id=tool_args.get("_tool_call_id", "unknown"),
             name=tool_name,
-            content=f"Tool execution error: {str(e)}",
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "error": "tool_execution_failed",
+                    "tool": tool_name,
+                    "detail": str(e),
+                },
+                indent=2,
+            ),
             is_error=True,
         )
 
@@ -688,6 +1068,104 @@ READ_ONLY_GROUNDING_TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+EXECUTION_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Apply controlled patch operations within the active project. "
+                "Patch must be JSON with format qonduit.patch/v1."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": (
+                            "JSON string: {\"format\":\"qonduit.patch/v1\","
+                            "\"operations\":[{\"action\":\"write|create\","
+                            "\"path\":\"relative/path\","
+                            "\"content\":\"...\"}]}"
+                        ),
+                    }
+                },
+                "required": ["patch"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_build",
+            "description": (
+                "Run an allowlisted build command based on detected project "
+                "type. Arbitrary command strings are not accepted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "default": 600,
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": (
+                "Run an allowlisted test command based on detected project "
+                "type. Arbitrary command strings are not accepted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "default": 600,
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tail_logs",
+            "description": (
+                "Read bounded recent build or test logs for the active "
+                "project only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["build", "tests"],
+                        "default": "build",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "default": 120,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+DEFAULT_CODING_TOOLS: list[dict[str, Any]] = (
+    READ_ONLY_GROUNDING_TOOLS + EXECUTION_TOOLS
+)
 
 
 class RagIngestRequest(BaseModel):
@@ -2446,7 +2924,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     if req.tools is not None:
         payload["tools"] = [tool.model_dump() for tool in req.tools]
     elif mode == "coding":
-        payload["tools"] = READ_ONLY_GROUNDING_TOOLS
+        payload["tools"] = DEFAULT_CODING_TOOLS
         payload["tool_choice"] = "auto"
     if req.tool_choice is not None:
         payload["tool_choice"] = req.tool_choice
@@ -2495,21 +2973,19 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     
     # Tool execution loop
     last_response_data: dict[str, Any] | None = None
-    
+
     while tool_iteration <= MAX_TOOL_ITERATIONS:
         logger.info(
             "tool_loop_iteration_start conversation_id=%s iteration=%s max=%s has_tools=%s",
             conversation_id,
             tool_iteration,
             MAX_TOOL_ITERATIONS,
-            bool(req.tools),
+            bool(req.tools or mode == "coding"),
         )
-        
-        # Call upstream model
+
         response_data = await call_upstream_model(working_messages)
         last_response_data = response_data
-        
-        # Extract message and finish_reason from response
+
         choices = response_data.get("choices", [])
         if not choices:
             logger.error(
@@ -2519,101 +2995,153 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 str(response_data)[:500],
             )
             break
-        
+
         message_data = choices[0].get("message", {})
         finish_reason = choices[0].get("finish_reason", "stop")
         tool_calls = message_data.get("tool_calls")
-        
+        has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+
         logger.info(
             "tool_loop_model_response conversation_id=%s iteration=%s finish_reason=%s has_tool_calls=%s",
             conversation_id,
             tool_iteration,
             finish_reason,
-            bool(tool_calls),
+            has_tool_calls,
         )
-        
-        # Check if we need to execute tools
-        if finish_reason == "tool_calls" and tool_calls and tool_iteration < MAX_TOOL_ITERATIONS:
+
+        if has_tool_calls:
+            if tool_iteration >= MAX_TOOL_ITERATIONS:
+                logger.error(
+                    "tool_loop_max_iterations_reached conversation_id=%s iteration=%s",
+                    conversation_id,
+                    tool_iteration,
+                )
+                last_response_data = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    "Tool execution stopped after reaching max "
+                                    "iterations. Please refine the request."
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+                break
+
             logger.info(
                 "tool_loop_tool_calls_detected conversation_id=%s iteration=%s tool_count=%s",
                 conversation_id,
                 tool_iteration,
                 len(tool_calls),
             )
-            
-            # Execute each tool call
+
+            assistant_tool_message = {
+                "role": "assistant",
+                "content": coerce_model_content_to_text(
+                    message_data.get("content")
+                ) if message_data.get("content") is not None else "",
+                "tool_calls": tool_calls,
+            }
+            working_messages.append(assistant_tool_message)
+
             tool_results: list[ChatMessage] = []
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "unknown")
                 tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                
+                raw_arguments = func.get("arguments", "{}")
+
                 try:
-                    tool_args = json.loads(func.get("arguments", "{}"))
+                    tool_args = json.loads(raw_arguments)
                 except (json.JSONDecodeError, TypeError):
-                    tool_args = {}
-                    logger.warning(
-                        "tool_loop_invalid_arguments conversation_id=%s tool=%s arguments=%s",
-                        conversation_id,
-                        tool_name,
-                        func.get("arguments", "")[:200],
+                    tool_args = {
+                        "_tool_call_id": tool_call_id,
+                    }
+                    result = ToolResult(
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error": "invalid_tool_arguments",
+                                "tool": tool_name,
+                                "raw_arguments": str(raw_arguments)[:500],
+                            },
+                            indent=2,
+                        ),
+                        is_error=True,
                     )
-                
-                # Add tool_call_id for tracking
-                tool_args["_tool_call_id"] = tool_call_id
-                
-                logger.info(
-                    "tool_loop_executing_tool conversation_id=%s tool=%s tool_call_id=%s args=%s",
-                    conversation_id,
-                    tool_name,
-                    tool_call_id,
-                    str(tool_args)[:500],
-                )
-                
-                # Execute the tool within project scope
-                result = await execute_tool(
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    project_id=project_id,
-                    user_id=user_id,
-                )
-                
-                # Create tool response message
+                    logger.warning(
+                        "tool_loop_invalid_arguments conversation_id=%s iteration=%s tool=%s arguments=%s",
+                        conversation_id,
+                        tool_iteration,
+                        tool_name,
+                        str(raw_arguments)[:200],
+                    )
+                else:
+                    if not isinstance(tool_args, dict):
+                        tool_args = {"value": tool_args}
+                    tool_args["_tool_call_id"] = tool_call_id
+                    logger.info(
+                        "tool_loop_executing_tool conversation_id=%s iteration=%s tool=%s tool_call_id=%s",
+                        conversation_id,
+                        tool_iteration,
+                        tool_name,
+                        tool_call_id,
+                    )
+                    result = await execute_tool(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        project_id=project_id,
+                        user_id=user_id,
+                    )
+
                 tool_msg = ChatMessage(
                     role="tool",
                     content=result.content,
                     tool_call_id=tool_call_id,
                 )
                 tool_results.append(tool_msg)
-                
+
                 logger.info(
-                    "tool_loop_tool_executed conversation_id=%s tool=%s tool_call_id=%s is_error=%s content_preview=%s",
+                    "tool_loop_tool_executed conversation_id=%s iteration=%s tool=%s tool_call_id=%s is_error=%s",
                     conversation_id,
+                    tool_iteration,
                     tool_name,
                     tool_call_id,
                     result.is_error,
-                    result.content[:200] if result.content else "(empty)",
                 )
-            
-            # Append tool results to working messages
-            working_messages.extend([
-                {"role": m.role, "content": m.content, "tool_call_id": m.tool_call_id}
-                for m in tool_results
-            ])
-            
-            # Increment iteration and continue loop to call model again
+
+            working_messages.extend(
+                [
+                    {
+                        "role": m.role,
+                        "content": m.content,
+                        "tool_call_id": m.tool_call_id,
+                    }
+                    for m in tool_results
+                ]
+            )
+
             tool_iteration += 1
+            logger.info(
+                "tool_loop_followup_model_call conversation_id=%s next_iteration=%s",
+                conversation_id,
+                tool_iteration,
+            )
             continue
-        
-        # No tool calls or max iterations reached - exit loop with final response
+
         logger.info(
-            "tool_loop_exiting conversation_id=%s iteration=%s reason=%s",
+            "tool_loop_exiting conversation_id=%s iteration=%s reason=final_answer",
             conversation_id,
             tool_iteration,
-            "final_answer" if finish_reason != "tool_calls" else "max_iterations_reached",
         )
         break
-    
+
     # Use last_response_data for final response, or make one final call if needed
     if last_response_data is None:
         # This shouldn't happen, but handle gracefully
