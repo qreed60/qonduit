@@ -251,10 +251,79 @@ To prevent infinite loops:
 
 ## Limitations
 
+## Limitations
+
 1. **Streaming not supported**: Tool execution loop only works for non-streaming requests
 2. **Read-only tools**: Only retrieval/search tools implemented (no write/build/shell tools)
 3. **Fixed tool set**: Tools must be pre-registered in `TOOL_HANDLERS`
-4. **No parallel execution**: Tools execute sequentially
+4. **Sequential execution**: Multiple tool calls in one response execute one at a time
+5. **Model-dependent**: The model must support OpenAI-style tool calling and return proper `finish_reason="tool_calls"`
+
+## Troubleshooting
+
+### Gateway returns tool_calls without executing them
+
+**Symptom:** Response has `finish_reason="tool_calls"` instead of a final answer.
+
+**Causes:**
+1. Model doesn't actually call any tools (check if `tool_calls` array is empty)
+2. Model returned an error or unexpected format  
+3. Log shows `tool_loop_no_choices` - upstream didn't return valid choices
+
+**Debug steps:**
+1. Check gateway logs for `tool_loop_*` entries
+2. Verify the model supports tool calling
+3. Ensure `tools` are properly defined in the request
+4. Confirm `tool_choice` is set appropriately
+
+### Tool execution fails
+
+**Symptom:** Tool returns error message or empty result.
+
+**Debug steps:**
+1. Check logs for `tool_loop_executing_tool` and `tool_loop_tool_executed` entries
+2. Verify `project_id` is correctly resolved
+3. For RAG tools: ensure collection exists and has documents
+4. For file tools: verify `PROJECTS_ROOT` path and project directory structure
+
+### Infinite loop or max iterations reached
+
+**Symptom:** Logs show multiple `tool_loop_iteration_start` entries, ends with `max_iterations_reached`.
+
+**Causes:**
+1. Model keeps requesting the same tool repeatedly
+2. Tool results don't provide enough context for model to answer
+3. Model isn't recognizing tool results as sufficient
+
+**Debug steps:**
+1. Review conversation flow in logs
+2. Check tool result content quality
+3. Consider adjusting system prompt or tool descriptions
+4. Max iterations (5) prevents infinite loops
+
+### Cross-project isolation issues
+
+**Symptom:** Tool accesses data from wrong project.
+
+**Debug steps:**
+1. Verify `project_id` resolution in logs (`chat_rag_state`, etc.)
+2. Check that project directories exist under `PROJECTS_ROOT/{project_id}`
+3. For RAG: confirm collection name matches `qonduit_rag__{project_id}`
+
+### Request timeouts
+
+**Symptom:** Client receives timeout error.
+
+**Causes:**
+1. Multiple tool iterations take longer than client timeout
+2. Upstream model is slow
+3. File operations on large directories
+
+**Debug steps:**
+1. Increase client timeout (default 60s in validation script)
+2. Check logs for iteration count
+3. Reduce `top_k` or `max_results` parameters
+4. Monitor upstream model latency
 
 ## Testing
 
@@ -266,6 +335,8 @@ python scripts/validate_phaseC.py
 
 Tests cover:
 - Plain chat still works
-- Tool call execution
-- Final assistant response after tool execution
-- Cross-project isolation
+- Tool schema acceptance
+- Tool message shapes
+- Assistant tool_calls shapes
+- Cross-project isolation (schema verification)
+- Tool execution loop (live test with actual tool execution)
