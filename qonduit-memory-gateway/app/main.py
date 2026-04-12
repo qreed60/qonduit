@@ -40,10 +40,188 @@ from .rag import (
 from .projects import project_alias_cache
 from .ingestion import IngestionManager
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+import glob
 
 app = FastAPI(title="Qonduit Memory Gateway")
 logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
+
+
+class ToolResult(BaseModel):
+    """Result from executing a tool."""
+    tool_call_id: str
+    name: str
+    content: str
+    is_error: bool = False
+
+
+async def execute_retrieve_project_context(
+    project_id: str,
+    query: str,
+    user_id: str | None = None,
+    top_k: int = 4,
+) -> str:
+    """Retrieve relevant context from project RAG."""
+    try:
+        results = await search_documents(
+            query=query,
+            limit=top_k,
+            collection=None,
+            user_id=user_id,
+            project_id=project_id,
+        )
+        if not results:
+            return "No relevant context found for this query."
+        
+        chunks = []
+        for i, r in enumerate(results, 1):
+            text = r.get("text", "")
+            score = r.get("score", 0)
+            chunks.append(f"[{i}] (score: {score:.3f})\\n{text}")
+        
+        return "\\n\\n".join(chunks)
+    except Exception as e:
+        logger.exception("execute_retrieve_project_context_failed")
+        return f"Error retrieving context: {str(e)}"
+
+
+async def execute_search_project_files(
+    project_id: str,
+    pattern: str,
+    max_results: int = 20,
+) -> str:
+    """Search for files matching a pattern in the project."""
+    try:
+        safe_project = sanitize_identifier(project_id, "default")
+        # Look for projects under PROJECTS_ROOT
+        matches = []
+        search_pattern = os.path.join(PROJECTS_ROOT, "*", "**", pattern)
+        for filepath in glob.glob(search_pattern, recursive=True)[:max_results]:
+            rel_path = os.path.relpath(filepath, PROJECTS_ROOT)
+            matches.append(rel_path)
+        
+        if not matches:
+            return f"No files matching '{pattern}' found in project '{safe_project}'."
+        
+        return "Found files:\\n" + "\\n".join(f"- {m}" for m in matches)
+    except Exception as e:
+        logger.exception("execute_search_project_files_failed")
+        return f"Error searching files: {str(e)}"
+
+
+async def execute_list_project_files(
+    project_id: str,
+    directory: str | None = None,
+    extensions: list[str] | None = None,
+    max_results: int = 50,
+) -> str:
+    """List files in a project directory."""
+    try:
+        safe_project = sanitize_identifier(project_id, "default")
+        base_dir = os.path.join(PROJECTS_ROOT, safe_project)
+        
+        if directory:
+            target_dir = os.path.join(base_dir, directory.lstrip("/"))
+        else:
+            target_dir = base_dir
+        
+        if not os.path.isdir(target_dir):
+            return f"Directory not found: {directory or safe_project}"
+        
+        files = []
+        for root, dirs, filenames in os.walk(target_dir):
+            # Skip hidden directories
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            for fname in filenames:
+                if fname.startswith('.'):
+                    continue
+                if extensions:
+                    _, ext = os.path.splitext(fname)
+                    if ext.lower() not in [e.lower() for e in extensions]:
+                        continue
+                
+                rel_path = os.path.relpath(os.path.join(root, fname), PROJECTS_ROOT)
+                files.append(rel_path)
+                
+                if len(files) >= max_results:
+                    break
+            
+            if len(files) >= max_results:
+                break
+        
+        if not files:
+            suffix = f" in {directory}" if directory else ""
+            return f"No files found{suffix}."
+        
+        return f"Files{f' in {directory}' if directory else ''}:\\n" + "\\n".join(f"- {f}" for f in files[:max_results])
+    except Exception as e:
+        logger.exception("execute_list_project_files_failed")
+        return f"Error listing files: {str(e)}"
+
+
+TOOL_HANDLERS = {
+    "retrieve_project_context": execute_retrieve_project_context,
+    "search_project_files": execute_search_project_files,
+    "list_project_files": execute_list_project_files,
+}
+
+
+async def execute_tool(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    project_id: str,
+    user_id: str | None,
+) -> ToolResult:
+    """Execute a tool and return the result."""
+    handler = TOOL_HANDLERS.get(tool_name)
+    if not handler:
+        return ToolResult(
+            tool_call_id=tool_args.get("_tool_call_id", "unknown"),
+            name=tool_name,
+            content=f"Unknown tool: {tool_name}. Available tools: {list(TOOL_HANDLERS.keys())}",
+            is_error=True,
+        )
+    
+    try:
+        # Map tool arguments to handler parameters
+        if tool_name == "retrieve_project_context":
+            result = await handler(
+                project_id=project_id,
+                query=tool_args.get("query", ""),
+                user_id=user_id,
+                top_k=tool_args.get("top_k", 4),
+            )
+        elif tool_name == "search_project_files":
+            result = await handler(
+                project_id=project_id,
+                pattern=tool_args.get("pattern", "*"),
+                max_results=tool_args.get("max_results", 20),
+            )
+        elif tool_name == "list_project_files":
+            result = await handler(
+                project_id=project_id,
+                directory=tool_args.get("directory"),
+                extensions=tool_args.get("extensions"),
+                max_results=tool_args.get("max_results", 50),
+            )
+        else:
+            result = f"Unknown tool: {tool_name}"
+        
+        return ToolResult(
+            tool_call_id=tool_args.get("_tool_call_id", "unknown"),
+            name=tool_name,
+            content=result,
+            is_error=False,
+        )
+    except Exception as e:
+        logger.exception("execute_tool_failed tool=%s", tool_name)
+        return ToolResult(
+            tool_call_id=tool_args.get("_tool_call_id", "unknown"),
+            name=tool_name,
+            content=f"Tool execution error: {str(e)}",
+            is_error=True,
+        )
 
 
 @app.on_event("startup")
@@ -1763,6 +1941,82 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         payload["tools"] = [tool.model_dump() for tool in req.tools]
     if req.tool_choice is not None:
         payload["tool_choice"] = req.tool_choice
+
+    # Tool execution loop constants
+    MAX_TOOL_ITERATIONS = 5
+    tool_iteration = 0
+    working_messages = list(final_messages)  # Copy for tool loop
+    
+    while True:
+        # Check if we have tool calls to execute (only for non-streaming)
+        has_tool_calls = False
+        tool_calls_to_execute: list[dict[str, Any]] = []
+        
+        if not req.stream and tool_iteration == 0:
+            # First iteration - send to model
+            pass
+        elif not req.stream and tool_iteration > 0:
+            # Subsequent iterations - check last message for tool_calls
+            last_msg = working_messages[-1] if working_messages else {}
+            if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+                has_tool_calls = True
+                tool_calls_to_execute = last_msg.get("tool_calls", [])
+        
+        # Execute tools if needed
+        if not req.stream and has_tool_calls and tool_iteration < MAX_TOOL_ITERATIONS:
+            tool_results: list[ChatMessage] = []
+            for tc in tool_calls_to_execute:
+                func = tc.get("function", {})
+                tool_name = func.get("name", "unknown")
+                try:
+                    tool_args = json.loads(func.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    tool_args = {}
+                
+                # Add tool_call_id for tracking
+                tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                tool_args["_tool_call_id"] = tool_call_id
+                
+                # Execute the tool within project scope
+                result = await execute_tool(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    project_id=project_id,
+                    user_id=user_id,
+                )
+                
+                # Create tool response message
+                tool_msg = ChatMessage(
+                    role="tool",
+                    content=result.content,
+                    tool_call_id=tool_call_id,
+                )
+                tool_results.append(tool_msg)
+                
+                logger.info(
+                    "tool_executed conversation_id=%s tool=%s tool_call_id=%s is_error=%s",
+                    conversation_id,
+                    tool_name,
+                    tool_call_id,
+                    result.is_error,
+                )
+            
+            # Append tool results to working messages
+            working_messages.extend([
+                {"role": m.role, "content": m.content, "tool_call_id": m.tool_call_id}
+                for m in tool_results
+            ])
+            
+            # Update payload with new messages and continue loop
+            payload["messages"] = working_messages
+            tool_iteration += 1
+            continue
+        
+        # No more tool calls or max iterations reached - break loop
+        break
+    
+    # Use working_messages for final upstream call
+    payload["messages"] = working_messages
 
     async def event_stream():
         stream_payload = dict(payload)
