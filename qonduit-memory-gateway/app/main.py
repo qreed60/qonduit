@@ -667,11 +667,18 @@ async def execute_tool(
         return ToolResult(
             tool_call_id=tool_args.get("_tool_call_id", "unknown"),
             name=tool_name,
-            content=(
-                f"Unknown tool: {tool_name}. Available tools: "
-                f"{list(TOOL_HANDLERS.keys())}. "
-                "For project grounding, call detect_project_type first, then "
-                "get_project_entry_points, then read_file/get_project_file."
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "error": "unknown_tool",
+                    "tool": tool_name,
+                    "available_tools": sorted(list(TOOL_HANDLERS.keys())),
+                    "hint": (
+                        "Call detect_project_type, then "
+                        "get_project_entry_points, then read_file."
+                    ),
+                },
+                indent=2,
             ),
             is_error=True,
         )
@@ -753,7 +760,15 @@ async def execute_tool(
         return ToolResult(
             tool_call_id=tool_args.get("_tool_call_id", "unknown"),
             name=tool_name,
-            content=f"Tool execution error: {str(e)}",
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "error": "tool_execution_failed",
+                    "tool": tool_name,
+                    "detail": str(e),
+                },
+                indent=2,
+            ),
             is_error=True,
         )
 
@@ -2958,21 +2973,19 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     
     # Tool execution loop
     last_response_data: dict[str, Any] | None = None
-    
+
     while tool_iteration <= MAX_TOOL_ITERATIONS:
         logger.info(
             "tool_loop_iteration_start conversation_id=%s iteration=%s max=%s has_tools=%s",
             conversation_id,
             tool_iteration,
             MAX_TOOL_ITERATIONS,
-            bool(req.tools),
+            bool(req.tools or mode == "coding"),
         )
-        
-        # Call upstream model
+
         response_data = await call_upstream_model(working_messages)
         last_response_data = response_data
-        
-        # Extract message and finish_reason from response
+
         choices = response_data.get("choices", [])
         if not choices:
             logger.error(
@@ -2982,101 +2995,153 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 str(response_data)[:500],
             )
             break
-        
+
         message_data = choices[0].get("message", {})
         finish_reason = choices[0].get("finish_reason", "stop")
         tool_calls = message_data.get("tool_calls")
-        
+        has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+
         logger.info(
             "tool_loop_model_response conversation_id=%s iteration=%s finish_reason=%s has_tool_calls=%s",
             conversation_id,
             tool_iteration,
             finish_reason,
-            bool(tool_calls),
+            has_tool_calls,
         )
-        
-        # Check if we need to execute tools
-        if finish_reason == "tool_calls" and tool_calls and tool_iteration < MAX_TOOL_ITERATIONS:
+
+        if has_tool_calls:
+            if tool_iteration >= MAX_TOOL_ITERATIONS:
+                logger.error(
+                    "tool_loop_max_iterations_reached conversation_id=%s iteration=%s",
+                    conversation_id,
+                    tool_iteration,
+                )
+                last_response_data = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    "Tool execution stopped after reaching max "
+                                    "iterations. Please refine the request."
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+                break
+
             logger.info(
                 "tool_loop_tool_calls_detected conversation_id=%s iteration=%s tool_count=%s",
                 conversation_id,
                 tool_iteration,
                 len(tool_calls),
             )
-            
-            # Execute each tool call
+
+            assistant_tool_message = {
+                "role": "assistant",
+                "content": coerce_model_content_to_text(
+                    message_data.get("content")
+                ) if message_data.get("content") is not None else "",
+                "tool_calls": tool_calls,
+            }
+            working_messages.append(assistant_tool_message)
+
             tool_results: list[ChatMessage] = []
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "unknown")
                 tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                
+                raw_arguments = func.get("arguments", "{}")
+
                 try:
-                    tool_args = json.loads(func.get("arguments", "{}"))
+                    tool_args = json.loads(raw_arguments)
                 except (json.JSONDecodeError, TypeError):
-                    tool_args = {}
-                    logger.warning(
-                        "tool_loop_invalid_arguments conversation_id=%s tool=%s arguments=%s",
-                        conversation_id,
-                        tool_name,
-                        func.get("arguments", "")[:200],
+                    tool_args = {
+                        "_tool_call_id": tool_call_id,
+                    }
+                    result = ToolResult(
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error": "invalid_tool_arguments",
+                                "tool": tool_name,
+                                "raw_arguments": str(raw_arguments)[:500],
+                            },
+                            indent=2,
+                        ),
+                        is_error=True,
                     )
-                
-                # Add tool_call_id for tracking
-                tool_args["_tool_call_id"] = tool_call_id
-                
-                logger.info(
-                    "tool_loop_executing_tool conversation_id=%s tool=%s tool_call_id=%s args=%s",
-                    conversation_id,
-                    tool_name,
-                    tool_call_id,
-                    str(tool_args)[:500],
-                )
-                
-                # Execute the tool within project scope
-                result = await execute_tool(
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    project_id=project_id,
-                    user_id=user_id,
-                )
-                
-                # Create tool response message
+                    logger.warning(
+                        "tool_loop_invalid_arguments conversation_id=%s iteration=%s tool=%s arguments=%s",
+                        conversation_id,
+                        tool_iteration,
+                        tool_name,
+                        str(raw_arguments)[:200],
+                    )
+                else:
+                    if not isinstance(tool_args, dict):
+                        tool_args = {"value": tool_args}
+                    tool_args["_tool_call_id"] = tool_call_id
+                    logger.info(
+                        "tool_loop_executing_tool conversation_id=%s iteration=%s tool=%s tool_call_id=%s",
+                        conversation_id,
+                        tool_iteration,
+                        tool_name,
+                        tool_call_id,
+                    )
+                    result = await execute_tool(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        project_id=project_id,
+                        user_id=user_id,
+                    )
+
                 tool_msg = ChatMessage(
                     role="tool",
                     content=result.content,
                     tool_call_id=tool_call_id,
                 )
                 tool_results.append(tool_msg)
-                
+
                 logger.info(
-                    "tool_loop_tool_executed conversation_id=%s tool=%s tool_call_id=%s is_error=%s content_preview=%s",
+                    "tool_loop_tool_executed conversation_id=%s iteration=%s tool=%s tool_call_id=%s is_error=%s",
                     conversation_id,
+                    tool_iteration,
                     tool_name,
                     tool_call_id,
                     result.is_error,
-                    result.content[:200] if result.content else "(empty)",
                 )
-            
-            # Append tool results to working messages
-            working_messages.extend([
-                {"role": m.role, "content": m.content, "tool_call_id": m.tool_call_id}
-                for m in tool_results
-            ])
-            
-            # Increment iteration and continue loop to call model again
+
+            working_messages.extend(
+                [
+                    {
+                        "role": m.role,
+                        "content": m.content,
+                        "tool_call_id": m.tool_call_id,
+                    }
+                    for m in tool_results
+                ]
+            )
+
             tool_iteration += 1
+            logger.info(
+                "tool_loop_followup_model_call conversation_id=%s next_iteration=%s",
+                conversation_id,
+                tool_iteration,
+            )
             continue
-        
-        # No tool calls or max iterations reached - exit loop with final response
+
         logger.info(
-            "tool_loop_exiting conversation_id=%s iteration=%s reason=%s",
+            "tool_loop_exiting conversation_id=%s iteration=%s reason=final_answer",
             conversation_id,
             tool_iteration,
-            "final_answer" if finish_reason != "tool_calls" else "max_iterations_reached",
         )
         break
-    
+
     # Use last_response_data for final response, or make one final call if needed
     if last_response_data is None:
         # This shouldn't happen, but handle gracefully

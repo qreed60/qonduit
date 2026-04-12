@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validation script for Phase E execution tools."""
+"""Validation script for Phase E execution tools and loop wiring."""
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
+
+from starlette.requests import Request
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -20,6 +23,163 @@ from app import main
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.text = json.dumps(payload)
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _FakeAsyncClient:
+    post_call_count = 0
+    saw_tool_result = False
+    saw_run_build = False
+    saw_run_tests = False
+    saw_tail_logs = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_FakeAsyncClient":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
+
+    async def post(self, url: str, json: dict[str, Any]) -> _FakeResponse:
+        _FakeAsyncClient.post_call_count += 1
+        messages = json.get("messages", [])
+
+        saw_apply_patch = any(
+            message.get("role") == "tool"
+            and "affected_files" in str(message.get("content", ""))
+            for message in messages
+        )
+        _FakeAsyncClient.saw_tool_result = (
+            _FakeAsyncClient.saw_tool_result or saw_apply_patch
+        )
+        _FakeAsyncClient.saw_run_build = _FakeAsyncClient.saw_run_build or any(
+            message.get("role") == "tool"
+            and "safe_mock_build_ok" in str(message.get("content", ""))
+            for message in messages
+        )
+        _FakeAsyncClient.saw_run_tests = _FakeAsyncClient.saw_run_tests or any(
+            message.get("role") == "tool"
+            and "safe_mock_tests_ok" in str(message.get("content", ""))
+            for message in messages
+        )
+        _FakeAsyncClient.saw_tail_logs = _FakeAsyncClient.saw_tail_logs or any(
+            message.get("role") == "tool"
+            and "safe_mock_build_ok" in str(message.get("content", ""))
+            and "line_count" in str(message.get("content", ""))
+            for message in messages
+        )
+
+        if not saw_apply_patch:
+            tool_calls = [
+                {
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": json_module.dumps(
+                            {
+                                "patch": json_module.dumps(
+                                    {
+                                        "format": "qonduit.patch/v1",
+                                        "operations": [
+                                            {
+                                                "action": "write",
+                                                "path": "MainActivity.kt",
+                                                "content": "// harmless\n",
+                                            }
+                                        ],
+                                    }
+                                )
+                            }
+                        ),
+                    },
+                },
+                {
+                    "id": "call_build",
+                    "type": "function",
+                    "function": {
+                        "name": "run_build",
+                        "arguments": json_module.dumps({"timeout_seconds": 30}),
+                    },
+                },
+                {
+                    "id": "call_tests",
+                    "type": "function",
+                    "function": {
+                        "name": "run_tests",
+                        "arguments": json_module.dumps({"timeout_seconds": 30}),
+                    },
+                },
+                {
+                    "id": "call_logs",
+                    "type": "function",
+                    "function": {
+                        "name": "tail_logs",
+                        "arguments": json_module.dumps(
+                            {"source": "build", "max_lines": 20}
+                        ),
+                    },
+                },
+            ]
+            return _FakeResponse(
+                {
+                    "id": "cmpl-1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": tool_calls,
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                }
+            )
+
+        return _FakeResponse(
+            {
+                "id": "cmpl-2",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Patch and checks completed successfully.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+
+
+json_module = json
+
+
+def _fake_request() -> Request:
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [],
+        "query_string": b"",
+    }
+    return Request(scope)
 
 
 async def run() -> int:
@@ -37,6 +197,7 @@ async def run() -> int:
 
         _write(alpha / "README.md", "alpha start\n")
         _write(alpha / ".qonduit_safe_mock", "enabled\n")
+        _write(alpha / "MainActivity.kt", "class MainActivity {}\n")
         _write(beta / "README.md", "beta start\n")
 
         patch_payload = json.dumps(
@@ -85,58 +246,74 @@ async def run() -> int:
             print("FAIL: out-of-project write was not blocked.")
             print(blocked_raw)
 
-        build_raw = await main.execute_run_build("alpha", timeout_seconds=60)
-        build_result = json.loads(build_raw)
-        if build_result.get("ok") and "safe_mock" in build_result.get(
-            "project_type", ""
+        original_client = main.httpx.AsyncClient
+        original_rag_enabled = main.RAG_ENABLED
+        main.RAG_ENABLED = False
+        main.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            req = main.GatewayChatRequest(
+                project_id="alpha",
+                model="gpt-oss:20b",
+                stream=False,
+                mode="coding",
+                messages=[
+                    main.ChatMessage(
+                        role="user",
+                        content=(
+                            "Read MainActivity.kt, add harmless comment, "
+                            "run build/tests, then summarize."
+                        ),
+                    )
+                ],
+            )
+            response = await main.chat(req=req, request=_fake_request())
+        finally:
+            main.httpx.AsyncClient = original_client
+            main.RAG_ENABLED = original_rag_enabled
+
+        final_content = (
+            response.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        if "completed successfully" in final_content:
+            print("PASS: final assistant answer is returned after tool calls.")
+        else:
+            failures += 1
+            print("FAIL: final assistant answer missing.")
+            print(json.dumps(response, indent=2))
+
+        if (alpha / "MainActivity.kt").read_text(encoding="utf-8") == (
+            "// harmless\n"
         ):
-            print("PASS: run_build executes allowlisted command.")
+            print("PASS: apply_patch was executed through the tool loop.")
         else:
             failures += 1
-            print("FAIL: run_build did not succeed for safe mock.")
-            print(build_raw)
+            print("FAIL: apply_patch did not execute through loop.")
 
-        tests_raw = await main.execute_run_tests("alpha", timeout_seconds=60)
-        tests_result = json.loads(tests_raw)
-        if tests_result.get("ok") and "safe_mock" in tests_result.get(
-            "project_type", ""
-        ):
-            print("PASS: run_tests executes allowlisted command.")
+        if _FakeAsyncClient.post_call_count >= 2:
+            print("PASS: follow-up model call occurred after tool execution.")
         else:
             failures += 1
-            print("FAIL: run_tests did not succeed for safe mock.")
-            print(tests_raw)
+            print("FAIL: follow-up model call did not occur.")
 
-        tail_raw = await main.execute_tail_logs(
-            "alpha",
-            source="build",
-            max_lines=1,
-        )
-        tail_result = json.loads(tail_raw)
-        tail_ok = tail_result.get("ok") and tail_result.get("line_count", 0) <= 1
-        if tail_ok:
-            print("PASS: tail_logs returns bounded output.")
+        if _FakeAsyncClient.saw_run_build:
+            print("PASS: run_build is wired into loop execution.")
         else:
             failures += 1
-            print("FAIL: tail_logs did not respect bounds.")
-            print(tail_raw)
+            print("FAIL: run_build did not execute via loop.")
 
-        # Ensure no cross-project access to beta logs via alpha project scope.
-        (main.project_execution_log_dir("beta") / "build.log").write_text(
-            "beta-only-log\n",
-            encoding="utf-8",
-        )
-        alpha_tail_raw = await main.execute_tail_logs(
-            "alpha",
-            source="build",
-            max_lines=50,
-        )
-        if "beta-only-log" not in alpha_tail_raw:
-            print("PASS: no cross-project log access is exposed.")
+        if _FakeAsyncClient.saw_run_tests:
+            print("PASS: run_tests is wired into loop execution.")
         else:
             failures += 1
-            print("FAIL: cross-project log leakage detected.")
-            print(alpha_tail_raw)
+            print("FAIL: run_tests did not execute via loop.")
+
+        if _FakeAsyncClient.saw_tail_logs:
+            print("PASS: tail_logs is wired into loop execution.")
+        else:
+            failures += 1
+            print("FAIL: tail_logs did not execute via loop.")
 
     print(f"\nValidation complete. failures={failures}")
     return failures

@@ -135,3 +135,23 @@ allowlisted test command.
 
 - Existing retrieval loop behavior and read-only grounding tools are preserved.
 - Plain chat behavior is unchanged when tools are not in use.
+
+## Troubleshooting tool execution loop
+
+If a model response contains `finish_reason: "tool_calls"` but the tool does
+not execute, check these points:
+
+1. The gateway tool loop must:
+   - append the assistant `tool_calls` message to conversation history,
+   - execute each tool,
+   - append each `role: "tool"` result with matching `tool_call_id`,
+   - and make a follow-up model call.
+2. Verify logs for:
+   - `tool_loop_tool_calls_detected`
+   - `tool_loop_executing_tool`
+   - `tool_loop_tool_executed`
+   - `tool_loop_followup_model_call`
+3. If tool arguments are malformed, the gateway should emit a structured tool
+   error payload instead of returning raw `tool_calls` to the client.
+4. If max tool iterations is reached, the gateway should return a clear final
+   assistant message rather than leaking unfinished raw `tool_calls`.
