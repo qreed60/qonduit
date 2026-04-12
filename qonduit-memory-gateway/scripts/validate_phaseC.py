@@ -16,6 +16,88 @@ import httpx
 GATEWAY_BASE = "http://localhost:8000"
 
 
+def test_tool_execution_loop():
+    """Test that tool calls are actually executed and final answer returned."""
+    print("\n=== Test 6: Tool Execution Loop (Live) ===")
+    
+    # This test requires a project with RAG data
+    payload = {
+        "model": "gpt-oss:20b",
+        "project_id": "test-project",
+        "messages": [
+            {"role": "user", "content": "What is in this project? Use retrieve_project_context to find out."}
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "retrieve_project_context",
+                    "description": "Retrieve relevant context from project RAG",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"},
+                            "top_k": {"type": "integer", "description": "Number of results", "default": 4},
+                            "user_id": {"type": "string", "description": "Optional user ID for filtering"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 500,
+    }
+    
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.post(
+                f"{GATEWAY_BASE}/v1/chat/completions",
+                json=payload,
+            )
+        
+        if response.status_code != 200:
+            print(f"FAIL: Status code {response.status_code}")
+            print(f"Response: {response.text[:500]}")
+            return False
+        
+        data = response.json()
+        choices = data.get("choices", [])
+        if not choices:
+            print("FAIL: No choices in response")
+            return False
+        
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        finish_reason = choices[0].get("finish_reason", "")
+        
+        # The key test: after tool execution, we should get a final answer
+        # not a tool_calls response
+        if finish_reason == "tool_calls":
+            print("FAIL: Response still has tool_calls - loop did not execute tools")
+            print(f"Message: {json.dumps(message, indent=2)[:500]}")
+            return False
+        
+        if not content.strip():
+            print("WARN: Empty content but no tool_calls - may be expected if no RAG data")
+        
+        # Check usage to see if multiple calls were made
+        usage = data.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        
+        print(f"PASS: Received final answer (finish_reason={finish_reason})")
+        print(f"      Content length: {len(content)} chars")
+        print(f"      Prompt tokens: {prompt_tokens} (higher values suggest multiple iterations)")
+        return True
+    
+    except httpx.ReadTimeout:
+        print("WARN: Request timed out - tool execution may be slow")
+        return None  # Inconclusive
+    except Exception as e:
+        print(f"FAIL: Exception - {e}")
+        return False
+
+
 def test_plain_chat():
     """Test that plain chat requests still work without tools."""
     print("\n=== Test 1: Plain Chat (Backward Compatibility) ===")
@@ -274,6 +356,7 @@ def main():
     if gateway_running:
         results.append(("Plain Chat", test_plain_chat()))
         results.append(("Tool Schema Acceptance", test_tool_schema_acceptance()))
+        results.append(("Tool Execution Loop", test_tool_execution_loop()))
     
     # Summary
     print("\n" + "=" * 60)

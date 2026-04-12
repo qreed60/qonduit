@@ -1947,35 +1947,119 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     tool_iteration = 0
     working_messages = list(final_messages)  # Copy for tool loop
     
-    while True:
-        # Check if we have tool calls to execute (only for non-streaming)
-        has_tool_calls = False
-        tool_calls_to_execute: list[dict[str, Any]] = []
+    # Helper function to call upstream model
+    async def call_upstream_model(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Call upstream model and return parsed response data."""
+        call_payload = dict(payload)
+        call_payload["messages"] = messages
+        call_payload["stream"] = False
         
-        if not req.stream and tool_iteration == 0:
-            # First iteration - send to model
-            pass
-        elif not req.stream and tool_iteration > 0:
-            # Subsequent iterations - check last message for tool_calls
-            last_msg = working_messages[-1] if working_messages else {}
-            if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
-                has_tool_calls = True
-                tool_calls_to_execute = last_msg.get("tool_calls", [])
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=call_payload)
         
-        # Execute tools if needed
-        if not req.stream and has_tool_calls and tool_iteration < MAX_TOOL_ITERATIONS:
+        if r.status_code >= 400:
+            logger.error(
+                "tool_loop_upstream_error conversation_id=%s model=%s status=%s iteration=%s",
+                conversation_id,
+                effective_model,
+                r.status_code,
+                tool_iteration,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream error ({r.status_code}): {r.text[:500]}",
+            )
+        
+        try:
+            return r.json()
+        except ValueError:
+            logger.error(
+                "tool_loop_upstream_invalid_json conversation_id=%s model=%s iteration=%s",
+                conversation_id,
+                effective_model,
+                tool_iteration,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Upstream returned invalid JSON",
+            )
+    
+    # Tool execution loop
+    last_response_data: dict[str, Any] | None = None
+    
+    while tool_iteration <= MAX_TOOL_ITERATIONS:
+        logger.info(
+            "tool_loop_iteration_start conversation_id=%s iteration=%s max=%s has_tools=%s",
+            conversation_id,
+            tool_iteration,
+            MAX_TOOL_ITERATIONS,
+            bool(req.tools),
+        )
+        
+        # Call upstream model
+        response_data = await call_upstream_model(working_messages)
+        last_response_data = response_data
+        
+        # Extract message and finish_reason from response
+        choices = response_data.get("choices", [])
+        if not choices:
+            logger.error(
+                "tool_loop_no_choices conversation_id=%s iteration=%s response=%s",
+                conversation_id,
+                tool_iteration,
+                str(response_data)[:500],
+            )
+            break
+        
+        message_data = choices[0].get("message", {})
+        finish_reason = choices[0].get("finish_reason", "stop")
+        tool_calls = message_data.get("tool_calls")
+        
+        logger.info(
+            "tool_loop_model_response conversation_id=%s iteration=%s finish_reason=%s has_tool_calls=%s",
+            conversation_id,
+            tool_iteration,
+            finish_reason,
+            bool(tool_calls),
+        )
+        
+        # Check if we need to execute tools
+        if finish_reason == "tool_calls" and tool_calls and tool_iteration < MAX_TOOL_ITERATIONS:
+            logger.info(
+                "tool_loop_tool_calls_detected conversation_id=%s iteration=%s tool_count=%s",
+                conversation_id,
+                tool_iteration,
+                len(tool_calls),
+            )
+            
+            # Execute each tool call
             tool_results: list[ChatMessage] = []
-            for tc in tool_calls_to_execute:
+            for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "unknown")
+                tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                
                 try:
                     tool_args = json.loads(func.get("arguments", "{}"))
                 except (json.JSONDecodeError, TypeError):
                     tool_args = {}
+                    logger.warning(
+                        "tool_loop_invalid_arguments conversation_id=%s tool=%s arguments=%s",
+                        conversation_id,
+                        tool_name,
+                        func.get("arguments", "")[:200],
+                    )
                 
                 # Add tool_call_id for tracking
-                tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
                 tool_args["_tool_call_id"] = tool_call_id
+                
+                logger.info(
+                    "tool_loop_executing_tool conversation_id=%s tool=%s tool_call_id=%s args=%s",
+                    conversation_id,
+                    tool_name,
+                    tool_call_id,
+                    str(tool_args)[:500],
+                )
                 
                 # Execute the tool within project scope
                 result = await execute_tool(
@@ -1994,11 +2078,12 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 tool_results.append(tool_msg)
                 
                 logger.info(
-                    "tool_executed conversation_id=%s tool=%s tool_call_id=%s is_error=%s",
+                    "tool_loop_tool_executed conversation_id=%s tool=%s tool_call_id=%s is_error=%s content_preview=%s",
                     conversation_id,
                     tool_name,
                     tool_call_id,
                     result.is_error,
+                    result.content[:200] if result.content else "(empty)",
                 )
             
             # Append tool results to working messages
@@ -2007,15 +2092,26 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 for m in tool_results
             ])
             
-            # Update payload with new messages and continue loop
-            payload["messages"] = working_messages
+            # Increment iteration and continue loop to call model again
             tool_iteration += 1
             continue
         
-        # No more tool calls or max iterations reached - break loop
+        # No tool calls or max iterations reached - exit loop with final response
+        logger.info(
+            "tool_loop_exiting conversation_id=%s iteration=%s reason=%s",
+            conversation_id,
+            tool_iteration,
+            "final_answer" if finish_reason != "tool_calls" else "max_iterations_reached",
+        )
         break
     
-    # Use working_messages for final upstream call
+    # Use last_response_data for final response, or make one final call if needed
+    if last_response_data is None:
+        # This shouldn't happen, but handle gracefully
+        logger.error("tool_loop_no_response conversation_id=%s", conversation_id)
+        raise HTTPException(status_code=502, detail="No response from upstream model")
+    
+    # Update working_messages in payload for state saving
     payload["messages"] = working_messages
 
     async def event_stream():
@@ -2179,54 +2275,19 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             },
         )
 
-    non_stream_start = time.perf_counter()
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=payload)
-    except httpx.RequestError as exc:
-        logger.exception(
-            "chat_upstream_connection_failed conversation_id=%s model=%s error=%s",
-            conversation_id,
-            effective_model,
-            str(exc),
-        )
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Failed to connect to upstream chat backend",
-                "upstream": LLAMA_BASE,
-            },
-        )
-
-    if r.status_code >= 400:
-        logger.error(
-            "chat_upstream_error conversation_id=%s model=%s status=%s",
-            conversation_id,
-            effective_model,
-            r.status_code,
-        )
-        raise upstream_error(r.status_code, r.text)
-
-    try:
-        data = r.json()
-    except ValueError:
-        logger.error(
-            "chat_upstream_invalid_json conversation_id=%s model=%s body=%s",
-            conversation_id,
-            effective_model,
-            r.text[:300],
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Upstream /v1/chat/completions returned invalid JSON",
-        )
+    # For non-streaming, we already have the final response from the tool loop
+    # Use last_response_data which contains the final model response
+    data = last_response_data
+    
+    non_stream_start = time.perf_counter()  # Track start time for logging (already elapsed during tool loop)
     non_stream_ms = int((time.perf_counter() - non_stream_start) * 1000)
     logger.info(
-        "chat_request stream=false conversation_id=%s model=%s latency_ms=%s messages=%s",
+        "chat_request stream=false conversation_id=%s model=%s latency_ms=%s messages=%s tool_iterations=%s",
         conversation_id,
         effective_model,
         non_stream_ms,
         len(req.messages),
+        tool_iteration,
     )
 
     message_data = data.get("choices", [{}])[0].get("message", {})
