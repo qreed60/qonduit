@@ -92,17 +92,25 @@ async def execute_search_project_files(
 ) -> str:
     """Search for files matching a pattern in the project."""
     try:
-        safe_project = sanitize_identifier(project_id, "default")
-        # Look for projects under PROJECTS_ROOT
+        project_root = resolve_project_root(project_id)
+        if not project_root.is_dir():
+            return (
+                f"Project directory not found for "
+                f"'{sanitize_identifier(project_id, 'default')}'."
+            )
+
         matches = []
-        search_pattern = os.path.join(PROJECTS_ROOT, "*", "**", pattern)
+        search_pattern = str(project_root / "**" / pattern)
         for filepath in glob.glob(search_pattern, recursive=True)[:max_results]:
-            rel_path = os.path.relpath(filepath, PROJECTS_ROOT)
+            rel_path = os.path.relpath(filepath, project_root)
             matches.append(rel_path)
-        
+
         if not matches:
-            return f"No files matching '{pattern}' found in project '{safe_project}'."
-        
+            return (
+                f"No files matching '{pattern}' found in project "
+                f"'{sanitize_identifier(project_id, 'default')}'."
+            )
+
         return "Found files:\\n" + "\\n".join(f"- {m}" for m in matches)
     except Exception as e:
         logger.exception("execute_search_project_files_failed")
@@ -117,22 +125,21 @@ async def execute_list_project_files(
 ) -> str:
     """List files in a project directory."""
     try:
-        safe_project = sanitize_identifier(project_id, "default")
-        base_dir = os.path.join(PROJECTS_ROOT, safe_project)
-        
-        if directory:
-            target_dir = os.path.join(base_dir, directory.lstrip("/"))
-        else:
-            target_dir = base_dir
-        
-        if not os.path.isdir(target_dir):
+        target_dir = resolve_project_relative_directory(project_id, directory)
+        if target_dir is None:
+            return (
+                "Blocked path escape attempt. Directory must stay inside "
+                "the project root."
+            )
+        if not target_dir.is_dir():
+            safe_project = sanitize_identifier(project_id, "default")
             return f"Directory not found: {directory or safe_project}"
-        
+
         files = []
         for root, dirs, filenames in os.walk(target_dir):
             # Skip hidden directories
             dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
+
             for fname in filenames:
                 if fname.startswith('.'):
                     continue
@@ -140,30 +147,167 @@ async def execute_list_project_files(
                     _, ext = os.path.splitext(fname)
                     if ext.lower() not in [e.lower() for e in extensions]:
                         continue
-                
-                rel_path = os.path.relpath(os.path.join(root, fname), PROJECTS_ROOT)
+
+                rel_path = os.path.relpath(
+                    os.path.join(root, fname), target_dir
+                )
                 files.append(rel_path)
-                
+
                 if len(files) >= max_results:
                     break
-            
+
             if len(files) >= max_results:
                 break
-        
+
         if not files:
             suffix = f" in {directory}" if directory else ""
             return f"No files found{suffix}."
-        
+
         return f"Files{f' in {directory}' if directory else ''}:\\n" + "\\n".join(f"- {f}" for f in files[:max_results])
     except Exception as e:
         logger.exception("execute_list_project_files_failed")
         return f"Error listing files: {str(e)}"
 
 
+async def execute_read_file(
+    project_id: str,
+    path: str,
+    start_line: int = 1,
+    end_line: int | None = None,
+) -> str:
+    """Read exact file content from a project with optional line range."""
+    file_path = resolve_project_relative_file(project_id, path)
+    if file_path is None:
+        return "Blocked path escape attempt. Path must stay inside project root."
+    if not file_path.is_file():
+        return f"File not found: {path}"
+
+    if start_line < 1:
+        start_line = 1
+    if end_line is not None and end_line < start_line:
+        return "Invalid line range: end_line must be >= start_line."
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        last_line = len(lines) if end_line is None else min(end_line, len(lines))
+        selected = lines[start_line - 1:last_line]
+        body = "".join(selected)
+        return (
+            f"File: {path}\n"
+            f"Line range: {start_line}-{last_line}\n\n"
+            f"{body}"
+        )
+    except Exception as e:
+        logger.exception("execute_read_file_failed")
+        return f"Error reading file: {str(e)}"
+
+
+async def execute_get_project_file(
+    project_id: str,
+    path: str,
+    max_bytes: int = 120_000,
+) -> str:
+    """Get file content and metadata for a project file."""
+    file_path = resolve_project_relative_file(project_id, path)
+    if file_path is None:
+        return "Blocked path escape attempt. Path must stay inside project root."
+    if not file_path.is_file():
+        return f"File not found: {path}"
+
+    max_bytes = max(2048, min(max_bytes, 500_000))
+    try:
+        with open(file_path, "rb") as f:
+            raw = f.read(max_bytes + 1)
+        truncated = len(raw) > max_bytes
+        text = raw[:max_bytes].decode("utf-8", errors="ignore")
+        size_bytes = file_path.stat().st_size
+        return (
+            f"File: {path}\n"
+            f"Size bytes: {size_bytes}\n"
+            f"Truncated: {'yes' if truncated else 'no'}\n\n"
+            f"{text}"
+        )
+    except Exception as e:
+        logger.exception("execute_get_project_file_failed")
+        return f"Error reading file: {str(e)}"
+
+
+async def execute_detect_project_type(project_id: str) -> str:
+    """Detect project type using confidence-ranked repo markers."""
+    project_root = resolve_project_root(project_id)
+    if not project_root.is_dir():
+        return json.dumps(
+            {
+                "project_id": sanitize_identifier(project_id, "default"),
+                "error": "project_not_found",
+            },
+            indent=2,
+        )
+
+    evidence = collect_project_markers(project_root)
+    ranking = rank_project_types(evidence)
+    best = ranking[0] if ranking else {"type": "unknown", "score": 0.0}
+
+    return json.dumps(
+        {
+            "project_id": sanitize_identifier(project_id, "default"),
+            "project_root": str(project_root),
+            "primary_type": best["type"],
+            "confidence": round(float(best["score"]), 3),
+            "ranked_types": ranking,
+            "recommendation": (
+                "Call get_project_entry_points next, then read_file on top "
+                "entry-point files before making framework assumptions."
+            ),
+        },
+        indent=2,
+    )
+
+
+async def execute_get_project_entry_points(
+    project_id: str,
+    max_results: int = 12,
+) -> str:
+    """Discover likely startup files for the current project."""
+    project_root = resolve_project_root(project_id)
+    if not project_root.is_dir():
+        return json.dumps(
+            {
+                "project_id": sanitize_identifier(project_id, "default"),
+                "error": "project_not_found",
+            },
+            indent=2,
+        )
+
+    evidence = collect_project_markers(project_root)
+    ranking = rank_project_types(evidence)
+    primary = ranking[0]["type"] if ranking else "unknown"
+    entry_points = discover_entry_points(project_root, primary)
+    top_entries = entry_points[:max(1, min(max_results, 50))]
+
+    return json.dumps(
+        {
+            "project_id": sanitize_identifier(project_id, "default"),
+            "detected_type": primary,
+            "entry_points": top_entries,
+            "next_step": (
+                "Use read_file with exact paths above before proposing edits "
+                "or assuming a framework layout."
+            ),
+        },
+        indent=2,
+    )
+
+
 TOOL_HANDLERS = {
     "retrieve_project_context": execute_retrieve_project_context,
     "search_project_files": execute_search_project_files,
     "list_project_files": execute_list_project_files,
+    "read_file": execute_read_file,
+    "get_project_file": execute_get_project_file,
+    "detect_project_type": execute_detect_project_type,
+    "get_project_entry_points": execute_get_project_entry_points,
 }
 
 
@@ -179,7 +323,12 @@ async def execute_tool(
         return ToolResult(
             tool_call_id=tool_args.get("_tool_call_id", "unknown"),
             name=tool_name,
-            content=f"Unknown tool: {tool_name}. Available tools: {list(TOOL_HANDLERS.keys())}",
+            content=(
+                f"Unknown tool: {tool_name}. Available tools: "
+                f"{list(TOOL_HANDLERS.keys())}. "
+                "For project grounding, call detect_project_type first, then "
+                "get_project_entry_points, then read_file/get_project_file."
+            ),
             is_error=True,
         )
     
@@ -204,6 +353,26 @@ async def execute_tool(
                 directory=tool_args.get("directory"),
                 extensions=tool_args.get("extensions"),
                 max_results=tool_args.get("max_results", 50),
+            )
+        elif tool_name == "read_file":
+            result = await handler(
+                project_id=project_id,
+                path=tool_args.get("path", ""),
+                start_line=tool_args.get("start_line", 1),
+                end_line=tool_args.get("end_line"),
+            )
+        elif tool_name == "get_project_file":
+            result = await handler(
+                project_id=project_id,
+                path=tool_args.get("path", ""),
+                max_bytes=tool_args.get("max_bytes", 120_000),
+            )
+        elif tool_name == "detect_project_type":
+            result = await handler(project_id=project_id)
+        elif tool_name == "get_project_entry_points":
+            result = await handler(
+                project_id=project_id,
+                max_results=tool_args.get("max_results", 12),
             )
         else:
             result = f"Unknown tool: {tool_name}"
@@ -415,6 +584,112 @@ class GatewayChatRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+READ_ONLY_GROUNDING_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "detect_project_type",
+            "description": (
+                "Detect the project type with confidence-ranked evidence. "
+                "Call this first before assuming framework defaults."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_project_entry_points",
+            "description": (
+                "List real startup files for the current project. "
+                "For Android, prioritize AndroidManifest.xml, MainActivity, "
+                "and Application classes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of entry points to return.",
+                        "default": 12,
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read exact file lines by path. Use this to verify assumptions "
+                "after detecting project type and entry points."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the project root.",
+                    },
+                    "start_line": {"type": "integer", "default": 1},
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional inclusive end line.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_project_file",
+            "description": (
+                "Read full project file content (size-capped). Use for exact "
+                "inspection when line ranges are not needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the project root.",
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes to read.",
+                        "default": 120000,
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_project_files",
+            "description": (
+                "List files inside the project root only. Useful for finding "
+                "candidate files before exact reads."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string"},
+                    "extensions": {"type": "array", "items": {"type": "string"}},
+                    "max_results": {"type": "integer", "default": 50},
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
 class RagIngestRequest(BaseModel):
     text: str
     source: str = "manual_test"
@@ -612,6 +887,232 @@ def sanitize_identifier(value: str | None, fallback: str) -> str:
     return cleaned
 
 
+def resolve_project_root(project_id: str) -> Path:
+    safe_project = sanitize_identifier(project_id, "default")
+    return (Path(PROJECTS_ROOT) / safe_project).resolve()
+
+
+def _is_within_dir(candidate: Path, base_dir: Path) -> bool:
+    candidate_s = str(candidate.resolve())
+    base_s = str(base_dir.resolve())
+    return candidate_s == base_s or candidate_s.startswith(base_s + os.sep)
+
+
+def resolve_project_relative_directory(
+    project_id: str,
+    directory: str | None,
+) -> Path | None:
+    base_dir = resolve_project_root(project_id)
+    raw = (directory or "").strip().lstrip("/")
+    candidate = (base_dir / raw).resolve() if raw else base_dir
+    if not _is_within_dir(candidate, base_dir):
+        return None
+    return candidate
+
+
+def resolve_project_relative_file(project_id: str, path: str) -> Path | None:
+    base_dir = resolve_project_root(project_id)
+    raw = (path or "").strip().lstrip("/")
+    if not raw:
+        return None
+    candidate = (base_dir / raw).resolve()
+    if not _is_within_dir(candidate, base_dir):
+        return None
+    return candidate
+
+
+def collect_project_markers(project_root: Path) -> dict[str, bool]:
+    def exists(rel: str) -> bool:
+        return (project_root / rel).exists()
+
+    has_android_manifest = exists("android/app/src/main/AndroidManifest.xml")
+    has_android_gradle = (
+        exists("android/settings.gradle")
+        or exists("android/settings.gradle.kts")
+        or exists("android/app/build.gradle")
+        or exists("android/app/build.gradle.kts")
+    )
+    has_android_kotlin = bool(
+        list((project_root / "android/app/src/main/kotlin").glob("**/*.kt"))
+    )
+    has_android_java = bool(
+        list((project_root / "android/app/src/main/java").glob("**/*.java"))
+    )
+    has_main_activity = bool(
+        list(project_root.glob("**/MainActivity.kt"))
+        or list(project_root.glob("**/MainActivity.java"))
+    )
+    has_application_class = bool(
+        list(project_root.glob("**/*Application.kt"))
+        or list(project_root.glob("**/*Application.java"))
+    )
+
+    return {
+        "android_manifest": has_android_manifest,
+        "android_gradle": has_android_gradle,
+        "android_kotlin": has_android_kotlin,
+        "android_java": has_android_java,
+        "android_main_activity": has_main_activity,
+        "android_application_class": has_application_class,
+        "flutter_pubspec": exists("pubspec.yaml"),
+        "flutter_lib_main": exists("lib/main.dart"),
+        "react_package_json": exists("package.json"),
+        "react_src_main": (
+            exists("src/main.tsx")
+            or exists("src/main.jsx")
+            or exists("src/index.tsx")
+            or exists("src/index.jsx")
+        ),
+    }
+
+
+def rank_project_types(evidence: dict[str, bool]) -> list[dict[str, Any]]:
+    android_score = 0.0
+    android_evidence: list[str] = []
+    if evidence.get("android_manifest"):
+        android_score += 0.35
+        android_evidence.append("android/app/src/main/AndroidManifest.xml")
+    if evidence.get("android_gradle"):
+        android_score += 0.2
+        android_evidence.append("android gradle files")
+    if evidence.get("android_kotlin"):
+        android_score += 0.2
+        android_evidence.append("android/app/src/main/kotlin/**/*.kt")
+    if evidence.get("android_java"):
+        android_score += 0.1
+        android_evidence.append("android/app/src/main/java/**/*.java")
+    if evidence.get("android_main_activity"):
+        android_score += 0.1
+        android_evidence.append("MainActivity.kt/.java")
+    if evidence.get("android_application_class"):
+        android_score += 0.05
+        android_evidence.append("*Application.kt/.java")
+    android_score = min(android_score, 1.0)
+
+    flutter_score = 0.0
+    flutter_evidence: list[str] = []
+    if evidence.get("flutter_pubspec"):
+        flutter_score += 0.35
+        flutter_evidence.append("pubspec.yaml")
+    if evidence.get("flutter_lib_main"):
+        flutter_score += 0.45
+        flutter_evidence.append("lib/main.dart")
+    if evidence.get("android_manifest"):
+        flutter_score += 0.2
+        flutter_evidence.append("android/app/src/main/AndroidManifest.xml")
+    flutter_score = min(flutter_score, 1.0)
+
+    web_score = 0.0
+    web_evidence: list[str] = []
+    if evidence.get("react_package_json"):
+        web_score += 0.4
+        web_evidence.append("package.json")
+    if evidence.get("react_src_main"):
+        web_score += 0.6
+        web_evidence.append("src/main.tsx|jsx or src/index.tsx|jsx")
+    web_score = min(web_score, 1.0)
+
+    ranked = [
+        {
+            "type": "android_kotlin",
+            "score": round(android_score, 3),
+            "evidence": android_evidence,
+        },
+        {
+            "type": "flutter",
+            "score": round(flutter_score, 3),
+            "evidence": flutter_evidence,
+        },
+        {
+            "type": "web",
+            "score": round(web_score, 3),
+            "evidence": web_evidence,
+        },
+    ]
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return ranked
+
+
+def discover_entry_points(project_root: Path, project_type: str) -> list[dict[str, Any]]:
+    def rel(path: Path) -> str:
+        return str(path.relative_to(project_root))
+
+    entries: list[dict[str, Any]] = []
+
+    def add_if_exists(relative_path: str, priority: int, reason: str) -> None:
+        candidate = project_root / relative_path
+        if candidate.is_file():
+            entries.append(
+                {
+                    "path": relative_path,
+                    "priority": priority,
+                    "reason": reason,
+                }
+            )
+
+    if project_type in {"android_kotlin", "flutter"}:
+        add_if_exists(
+            "android/app/src/main/AndroidManifest.xml",
+            100,
+            "Android startup manifest",
+        )
+        for main_activity in sorted(project_root.glob("**/MainActivity.kt")):
+            entries.append(
+                {
+                    "path": rel(main_activity),
+                    "priority": 95,
+                    "reason": "Android Activity entry point",
+                }
+            )
+        for main_activity in sorted(project_root.glob("**/MainActivity.java")):
+            entries.append(
+                {
+                    "path": rel(main_activity),
+                    "priority": 94,
+                    "reason": "Android Activity entry point",
+                }
+            )
+        for app_file in sorted(project_root.glob("**/*Application.kt")):
+            entries.append(
+                {
+                    "path": rel(app_file),
+                    "priority": 90,
+                    "reason": "Android Application initialization",
+                }
+            )
+        for app_file in sorted(project_root.glob("**/*Application.java")):
+            entries.append(
+                {
+                    "path": rel(app_file),
+                    "priority": 89,
+                    "reason": "Android Application initialization",
+                }
+            )
+
+    if project_type == "flutter":
+        add_if_exists("lib/main.dart", 85, "Flutter app root entry point")
+
+    if project_type == "web":
+        add_if_exists("src/main.tsx", 80, "React/TypeScript entry point")
+        add_if_exists("src/main.jsx", 79, "React entry point")
+        add_if_exists("src/index.tsx", 78, "React/TypeScript entry point")
+        add_if_exists("src/index.jsx", 77, "React entry point")
+
+    if not entries:
+        add_if_exists("README.md", 20, "Fallback project overview")
+
+    entries.sort(key=lambda item: item["priority"], reverse=True)
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in entries:
+        path = item["path"]
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(item)
+    return deduped
+
+
 def model_alias_entry(model: str) -> dict[str, Any] | None:
     entry = merged_alias_config().get(model)
     if isinstance(entry, dict):
@@ -790,6 +1291,9 @@ def system_prompt_for_mode(mode: str) -> str:
             "You are Qonduit in CODING mode. "
             "Prioritize correctness, exact technical details, and reproducible steps. "
             "Preserve exact file paths, function/class names, commands, errors, and constraints. "
+            "For repository questions, detect project type first and inspect real "
+            "entry points before assuming framework defaults. "
+            "Prefer exact file reads over guessed structures. "
             "When uncertain, state assumptions briefly and propose the next verification command."
         )
     return DEFAULT_SYSTEM_PROMPT
@@ -1936,9 +2440,14 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "stream": req.stream,
     }
     
-    # Add tools and tool_choice if present in request
+    # Add tools and tool_choice if present in request.
+    # In coding mode, provide a safe default read-only tool set when none is
+    # provided to improve project grounding in agentic workflows.
     if req.tools is not None:
         payload["tools"] = [tool.model_dump() for tool in req.tools]
+    elif mode == "coding":
+        payload["tools"] = READ_ONLY_GROUNDING_TOOLS
+        payload["tool_choice"] = "auto"
     if req.tool_choice is not None:
         payload["tool_choice"] = req.tool_choice
 
