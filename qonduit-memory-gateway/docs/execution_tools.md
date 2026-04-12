@@ -50,11 +50,15 @@ reviewable.
 ```json
 {
   "ok": true,
+  "status": "success",
+  "applied": true,
   "project_id": "demo",
   "error": null,
+  "files_changed": ["README.md"],
   "affected_files": ["README.md"],
   "errors": [],
-  "applied_count": 1
+  "applied_count": 1,
+  "summary": "Applied 1 patch operation(s)."
 }
 ```
 
@@ -77,6 +81,8 @@ No free-form command input is accepted from the model.
 ```json
 {
   "ok": true,
+  "status": "success",
+  "applied": true,
   "project_id": "demo",
   "project_type": "safe_mock",
   "operation": "build",
@@ -85,7 +91,9 @@ No free-form command input is accepted from the model.
   "duration_ms": 18,
   "log_source": "execution_logs/demo/build.log",
   "output_preview": "safe_mock_build_ok\n",
-  "affected_files": ["demo/build.log"]
+  "files_changed": ["demo/build.log"],
+  "affected_files": ["demo/build.log"],
+  "summary": "build completed successfully."
 }
 ```
 
@@ -122,11 +130,15 @@ allowlisted test command.
 ```json
 {
   "ok": true,
+  "status": "success",
+  "applied": true,
   "project_id": "demo",
   "source": "build",
   "line_count": 1,
   "truncated_bytes": 19,
+  "files_changed": ["execution_logs/demo/build.log"],
   "affected_files": ["execution_logs/demo/build.log"],
+  "summary": "Returned up to 120 log line(s).",
   "content": "safe_mock_build_ok"
 }
 ```
@@ -155,3 +167,20 @@ not execute, check these points:
    error payload instead of returning raw `tool_calls` to the client.
 4. If max tool iterations is reached, the gateway should return a clear final
    assistant message rather than leaking unfinished raw `tool_calls`.
+
+## Tool loop convergence troubleshooting
+
+If tool calls execute but the model keeps calling the same tool repeatedly:
+
+- Check tool result payloads for explicit completion signals:
+  - `status: "success"`
+  - `applied: true`
+  - `files_changed`
+  - `summary`
+- Verify logs include argument signatures/hashes and repeat detection entries.
+- Confirm repeated calls with identical args are blocked to prevent pointless
+  loops.
+- Confirm the follow-up system guidance message is present, instructing the
+  model to summarize and stop after successful tool output.
+- If all tool calls in an iteration are repeats, the gateway should exit the
+  loop with a final assistant message instead of spinning until max iterations.

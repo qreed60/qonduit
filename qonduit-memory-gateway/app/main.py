@@ -393,10 +393,14 @@ async def execute_apply_patch(project_id: str, patch: str) -> str:
         return json.dumps(
             {
                 "ok": False,
+                "status": "error",
+                "applied": False,
                 "project_id": safe_project,
                 "error": "invalid_patch",
                 "detail": str(exc),
+                "files_changed": [],
                 "affected_files": [],
+                "summary": "Patch payload was invalid and was not applied.",
             },
             indent=2,
         )
@@ -428,11 +432,19 @@ async def execute_apply_patch(project_id: str, patch: str) -> str:
     return json.dumps(
         {
             "ok": ok,
+            "status": "success" if ok else "error",
+            "applied": ok,
             "project_id": safe_project,
             "error": None if ok else "patch_apply_failed",
+            "files_changed": affected_files,
             "affected_files": affected_files,
             "errors": errors,
             "applied_count": len(affected_files),
+            "summary": (
+                f"Applied {len(affected_files)} patch operation(s)."
+                if ok
+                else "Patch application failed for one or more files."
+            ),
         },
         indent=2,
     )
@@ -492,10 +504,14 @@ async def run_allowed_project_command(
         return json.dumps(
             {
                 "ok": False,
+                "status": "error",
+                "applied": False,
                 "project_id": safe_project,
                 "operation": operation,
                 "error": detected_type,
+                "files_changed": [],
                 "affected_files": [],
+                "summary": "No allowlisted command available for this project type.",
             },
             indent=2,
         )
@@ -524,13 +540,17 @@ async def run_allowed_project_command(
         return json.dumps(
             {
                 "ok": False,
+                "status": "error",
+                "applied": False,
                 "project_id": safe_project,
                 "project_type": detected_type,
                 "operation": operation,
                 "command": command,
                 "error": "timeout",
                 "timeout_seconds": timeout_seconds,
+                "files_changed": [],
                 "affected_files": [],
+                "summary": f"{operation} timed out before completion.",
             },
             indent=2,
         )
@@ -538,12 +558,16 @@ async def run_allowed_project_command(
         return json.dumps(
             {
                 "ok": False,
+                "status": "error",
+                "applied": False,
                 "project_id": safe_project,
                 "project_type": detected_type,
                 "operation": operation,
                 "command": command,
                 "error": f"execution_failed: {exc}",
+                "files_changed": [],
                 "affected_files": [],
+                "summary": f"{operation} command execution failed.",
             },
             indent=2,
         )
@@ -552,9 +576,12 @@ async def run_allowed_project_command(
     duration_ms = int((time.time() - started) * 1000)
     log_path.write_text(output_text, encoding="utf-8")
 
+    ok = exit_code == 0
     return json.dumps(
         {
-            "ok": exit_code == 0,
+            "ok": ok,
+            "status": "success" if ok else "error",
+            "applied": ok,
             "project_id": safe_project,
             "project_type": detected_type,
             "operation": operation,
@@ -563,7 +590,13 @@ async def run_allowed_project_command(
             "duration_ms": duration_ms,
             "log_source": str(log_path.relative_to(Path(GATEWAY_DATA_DIR))),
             "output_preview": output_text[-4000:],
+            "files_changed": [str(log_path.relative_to(log_dir.parent))],
             "affected_files": [str(log_path.relative_to(log_dir.parent))],
+            "summary": (
+                f"{operation} completed successfully."
+                if ok
+                else f"{operation} failed with exit code {exit_code}."
+            ),
         },
         indent=2,
     )
@@ -597,10 +630,14 @@ async def execute_tail_logs(
         return json.dumps(
             {
                 "ok": False,
+                "status": "error",
+                "applied": False,
                 "project_id": safe_project,
                 "error": "invalid_source",
                 "allowed_sources": sorted(allowed_sources),
+                "files_changed": [],
                 "affected_files": [],
+                "summary": "Requested log source is not allowlisted.",
             },
             indent=2,
         )
@@ -610,10 +647,14 @@ async def execute_tail_logs(
         return json.dumps(
             {
                 "ok": False,
+                "status": "error",
+                "applied": False,
                 "project_id": safe_project,
                 "error": "log_not_found",
                 "source": source,
+                "files_changed": [],
                 "affected_files": [],
+                "summary": "Requested log file does not exist yet.",
             },
             indent=2,
         )
@@ -627,13 +668,19 @@ async def execute_tail_logs(
     return json.dumps(
         {
             "ok": True,
+            "status": "success",
+            "applied": True,
             "project_id": safe_project,
             "source": source,
             "line_count": len(tail.splitlines()),
             "truncated_bytes": len(raw),
+            "files_changed": [
+                str(log_path.relative_to(Path(GATEWAY_DATA_DIR)))
+            ],
             "affected_files": [
                 str(log_path.relative_to(Path(GATEWAY_DATA_DIR)))
             ],
+            "summary": f"Returned up to {bounded_lines} log line(s).",
             "content": tail,
         },
         indent=2,
@@ -2973,6 +3020,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     
     # Tool execution loop
     last_response_data: dict[str, Any] | None = None
+    seen_tool_signatures: dict[str, int] = {}
 
     while tool_iteration <= MAX_TOOL_ITERATIONS:
         logger.info(
@@ -3049,11 +3097,14 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             working_messages.append(assistant_tool_message)
 
             tool_results: list[ChatMessage] = []
+            had_repeat_call = False
+            repeated_calls_count = 0
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "unknown")
                 tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
                 raw_arguments = func.get("arguments", "{}")
+                args_hash = sha256(str(raw_arguments).encode("utf-8")).hexdigest()[:12]
 
                 try:
                     tool_args = json.loads(raw_arguments)
@@ -3061,44 +3112,98 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                     tool_args = {
                         "_tool_call_id": tool_call_id,
                     }
+                    signature = f"{tool_name}:{args_hash}"
                     result = ToolResult(
                         tool_call_id=tool_call_id,
                         name=tool_name,
                         content=json.dumps(
                             {
                                 "ok": False,
+                                "status": "error",
+                                "applied": False,
                                 "error": "invalid_tool_arguments",
                                 "tool": tool_name,
+                                "args_hash": args_hash,
                                 "raw_arguments": str(raw_arguments)[:500],
+                                "files_changed": [],
+                                "summary": (
+                                    "Tool arguments were invalid JSON. "
+                                    "Fix arguments before retrying."
+                                ),
                             },
                             indent=2,
                         ),
                         is_error=True,
                     )
                     logger.warning(
-                        "tool_loop_invalid_arguments conversation_id=%s iteration=%s tool=%s arguments=%s",
+                        "tool_loop_invalid_arguments conversation_id=%s iteration=%s tool=%s args_hash=%s",
                         conversation_id,
                         tool_iteration,
                         tool_name,
-                        str(raw_arguments)[:200],
+                        args_hash,
                     )
                 else:
                     if not isinstance(tool_args, dict):
                         tool_args = {"value": tool_args}
-                    tool_args["_tool_call_id"] = tool_call_id
-                    logger.info(
-                        "tool_loop_executing_tool conversation_id=%s iteration=%s tool=%s tool_call_id=%s",
-                        conversation_id,
-                        tool_iteration,
-                        tool_name,
-                        tool_call_id,
+                    signature = (
+                        f"{tool_name}:" + sha256(
+                            json.dumps(tool_args, sort_keys=True).encode("utf-8")
+                        ).hexdigest()[:12]
                     )
-                    result = await execute_tool(
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        project_id=project_id,
-                        user_id=user_id,
-                    )
+                    repeat_count = seen_tool_signatures.get(signature, 0)
+                    is_repeat = repeat_count > 0
+                    if is_repeat:
+                        had_repeat_call = True
+                        repeated_calls_count += 1
+                        result = ToolResult(
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                            content=json.dumps(
+                                {
+                                    "ok": False,
+                                    "status": "blocked_repeat",
+                                    "applied": False,
+                                    "error": "repeated_tool_call",
+                                    "tool": tool_name,
+                                    "args_hash": signature.split(":", 1)[1],
+                                    "repeat_count": repeat_count,
+                                    "files_changed": [],
+                                    "summary": (
+                                        "Skipped repeated invocation with "
+                                        "identical arguments to prevent "
+                                        "pointless loops."
+                                    ),
+                                },
+                                indent=2,
+                            ),
+                            is_error=True,
+                        )
+                        logger.warning(
+                            "tool_loop_repeated_call conversation_id=%s iteration=%s tool=%s signature=%s repeat_count=%s",
+                            conversation_id,
+                            tool_iteration,
+                            tool_name,
+                            signature,
+                            repeat_count,
+                        )
+                    else:
+                        seen_tool_signatures[signature] = repeat_count + 1
+                        tool_args["_tool_call_id"] = tool_call_id
+                        logger.info(
+                            "tool_loop_executing_tool conversation_id=%s iteration=%s tool=%s tool_call_id=%s signature=%s is_repeat=%s",
+                            conversation_id,
+                            tool_iteration,
+                            tool_name,
+                            tool_call_id,
+                            signature,
+                            is_repeat,
+                        )
+                        result = await execute_tool(
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            project_id=project_id,
+                            user_id=user_id,
+                        )
 
                 tool_msg = ChatMessage(
                     role="tool",
@@ -3108,11 +3213,12 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 tool_results.append(tool_msg)
 
                 logger.info(
-                    "tool_loop_tool_executed conversation_id=%s iteration=%s tool=%s tool_call_id=%s is_error=%s",
+                    "tool_loop_tool_executed conversation_id=%s iteration=%s tool=%s tool_call_id=%s signature=%s is_error=%s",
                     conversation_id,
                     tool_iteration,
                     tool_name,
                     tool_call_id,
+                    signature,
                     result.is_error,
                 )
 
@@ -3127,11 +3233,49 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 ]
             )
 
+            if repeated_calls_count == len(tool_calls):
+                logger.warning(
+                    "tool_loop_exiting conversation_id=%s iteration=%s reason=%s",
+                    conversation_id,
+                    tool_iteration,
+                    "all_tool_calls_repeated",
+                )
+                last_response_data = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    "Tools were already run with these exact "
+                                    "arguments. I will stop tool calls now and "
+                                    "summarize the latest successful results."
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+                break
+
+            working_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Tool results are now available. If the task is "
+                        "satisfied, provide a final assistant answer and stop "
+                        "calling tools. Only call another tool if a prior tool "
+                        "failed or additional data is required."
+                    ),
+                }
+            )
+
             tool_iteration += 1
             logger.info(
-                "tool_loop_followup_model_call conversation_id=%s next_iteration=%s",
+                "tool_loop_followup_model_call conversation_id=%s next_iteration=%s repeated_call_detected=%s continue_reason=%s",
                 conversation_id,
                 tool_iteration,
+                had_repeat_call,
+                "tool_calls_detected",
             )
             continue
 
@@ -3139,6 +3283,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             "tool_loop_exiting conversation_id=%s iteration=%s reason=final_answer",
             conversation_id,
             tool_iteration,
+            "model_returned_final_answer",
         )
         break
 

@@ -195,6 +195,12 @@ async def run() -> int:
         alpha = root / "alpha"
         beta = root / "beta"
 
+        _FakeAsyncClient.post_call_count = 0
+        _FakeAsyncClient.saw_tool_result = False
+        _FakeAsyncClient.saw_run_build = False
+        _FakeAsyncClient.saw_run_tests = False
+        _FakeAsyncClient.saw_tail_logs = False
+
         _write(alpha / "README.md", "alpha start\n")
         _write(alpha / ".qonduit_safe_mock", "enabled\n")
         _write(alpha / "MainActivity.kt", "class MainActivity {}\n")
@@ -214,13 +220,21 @@ async def run() -> int:
         )
         patch_raw = await main.execute_apply_patch("alpha", patch_payload)
         patch_result = json.loads(patch_raw)
-        if patch_result.get("ok") and (alpha / "README.md").read_text() == (
-            "alpha patched\n"
+        patch_schema_ok = (
+            patch_result.get("status") == "success"
+            and patch_result.get("applied") is True
+            and isinstance(patch_result.get("files_changed"), list)
+            and isinstance(patch_result.get("summary"), str)
+        )
+        if (
+            patch_result.get("ok")
+            and patch_schema_ok
+            and (alpha / "README.md").read_text() == "alpha patched\n"
         ):
-            print("PASS: apply_patch writes within project root.")
+            print("PASS: apply_patch writes within project root with clear schema.")
         else:
             failures += 1
-            print("FAIL: apply_patch did not write expected project file.")
+            print("FAIL: apply_patch did not write expected project file/schema.")
             print(patch_raw)
 
         blocked_payload = json.dumps(
@@ -291,11 +305,17 @@ async def run() -> int:
             failures += 1
             print("FAIL: apply_patch did not execute through loop.")
 
-        if _FakeAsyncClient.post_call_count >= 2:
-            print("PASS: follow-up model call occurred after tool execution.")
+        if _FakeAsyncClient.post_call_count == 2:
+            print("PASS: convergence achieved before max iterations (2 model calls).")
         else:
             failures += 1
-            print("FAIL: follow-up model call did not occur.")
+            print("FAIL: expected exactly 2 model calls for convergence.")
+
+        if "max iterations" not in final_content.lower():
+            print("PASS: final response did not hit max-iteration fallback.")
+        else:
+            failures += 1
+            print("FAIL: response hit max-iteration fallback unexpectedly.")
 
         if _FakeAsyncClient.saw_run_build:
             print("PASS: run_build is wired into loop execution.")
