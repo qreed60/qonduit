@@ -71,6 +71,47 @@ Lists files in a project directory with optional filtering.
 }
 ```
 
+### 4. `detect_project_type`
+
+Detects project type using confidence-ranked repository markers.
+
+**Parameters:**
+- none
+
+**Output highlights:**
+- `primary_type` (for example `android_kotlin`, `flutter`, `web`)
+- `confidence` score in `[0, 1]`
+- `ranked_types` with evidence markers
+
+### 5. `get_project_entry_points`
+
+Discovers startup files for grounded inspection.
+
+**Parameters:**
+- `max_results` (integer, optional, default=12)
+
+**Android/Kotlin prioritization:**
+1. `android/app/src/main/AndroidManifest.xml`
+2. `MainActivity.kt` / `MainActivity.java`
+3. `*Application.kt` / `*Application.java`
+
+### 6. `read_file`
+
+Reads exact project file content with optional line range.
+
+**Parameters:**
+- `path` (string, required): Path relative to project root
+- `start_line` (integer, optional, default=1)
+- `end_line` (integer, optional)
+
+### 7. `get_project_file`
+
+Reads full project file content with size cap.
+
+**Parameters:**
+- `path` (string, required): Path relative to project root
+- `max_bytes` (integer, optional, default=120000)
+
 ## Complete Request/Response Example
 
 ### Initial Request
@@ -228,6 +269,8 @@ All tools execute strictly within the resolved `project_id`:
 - `retrieve_project_context` queries only the project's RAG collection
 - `search_project_files` searches under `PROJECTS_ROOT/{project_id}`
 - `list_project_files` lists files within the project directory
+- `read_file` and `get_project_file` block path escapes outside the project root
+- `detect_project_type` and `get_project_entry_points` only inspect project-scoped files
 
 ### Iteration Limits
 
@@ -237,11 +280,13 @@ To prevent infinite loops:
 
 ### Backward Compatibility
 
-- Plain chat requests (without tools) work unchanged
-- Tool execution only triggers when:
-  - `tools` are provided in request
-  - Model returns `tool_calls` in response
-  - Non-streaming mode (streaming tool support TBD)
+- Plain chat requests (without tools) work unchanged.
+- In coding mode, if the client does not provide tools, the gateway can inject
+  a safe read-only grounding tool set.
+- Tool execution triggers when:
+  - tools are present in the effective upstream payload
+  - the model returns `tool_calls` in response
+  - non-streaming mode is used (streaming tool support TBD)
 
 ### Error Handling
 
