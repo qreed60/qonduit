@@ -26,6 +26,10 @@ import 'conversation_parsing.dart';
 import 'worker_manager.dart';
 
 const bool _traceApiLogs = true;
+const bool _memoryGatewayNonStreamingDebug = bool.fromEnvironment(
+  'QONDUIT_MEMORY_GATEWAY_NON_STREAM',
+  defaultValue: false,
+);
 
 void _traceApi(String message) {
   if (!_traceApiLogs) {
@@ -4145,6 +4149,7 @@ class ApiService {
       'conversation_id': conversationId,
       'model': model,
       'context_size': contextSize,
+      'stream': !_memoryGatewayNonStreamingDebug,
       if (ragCollection != null && ragCollection.trim().isNotEmpty)
         'rag_collection': ragCollection.trim(),
       'max_tokens': maxTokens,
@@ -4292,6 +4297,12 @@ class ApiService {
         'sendMessageSession: posting to memory gateway '
             '(model=$model, conversationId=$gatewayConversationId, contextSize=$contextSize)',
       );
+
+      if (_memoryGatewayNonStreamingDebug) {
+        _traceApi(
+          'sendMessageSession: memory gateway non-stream debug fallback enabled',
+        );
+      }
 
       final gatewayUserValue = await _getMemoryGatewayUserHeaderValue();
       final resp = await _memoryGatewayDio.post<ResponseBody>(
@@ -4700,6 +4711,28 @@ class ApiService {
   @visibleForTesting
   bool hasCancelActionForTest(String messageId) {
     return _streamCancelActions.containsKey(messageId);
+  }
+
+  /// Exposes [_buildMemoryGatewayPayload] for unit tests.
+  @visibleForTesting
+  Map<String, dynamic> buildMemoryGatewayPayloadForTest({
+    required List<Map<String, dynamic>> messages,
+    required String model,
+    required String conversationId,
+    required int contextSize,
+    String? ragCollection,
+    required int maxTokens,
+    required double temperature,
+  }) {
+    return _buildMemoryGatewayPayload(
+      messages: messages,
+      model: model,
+      conversationId: conversationId,
+      contextSize: contextSize,
+      ragCollection: ragCollection,
+      maxTokens: maxTokens,
+      temperature: temperature,
+    );
   }
 
   // === Tasks control (parity with Web client) ===

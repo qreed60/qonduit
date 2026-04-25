@@ -203,5 +203,19 @@ void main() {
           .has((u) => u.content, 'content')
           .equals('say');
     });
+
+    test('ignores null delta.content and still handles [DONE]', () async {
+      final updates = await parseOpenWebUIStream(
+        Stream<List<int>>.fromIterable([
+          utf8.encode(
+            'data: {"choices":[{"delta":{"content":null}}]}\n\n',
+          ),
+          utf8.encode('data: [DONE]\n\n'),
+        ]),
+      ).toList();
+
+      check(updates).has((it) => it.length, 'length').equals(1);
+      check(updates[0]).isA<OpenWebUIStreamDone>();
+    });
   });
 }

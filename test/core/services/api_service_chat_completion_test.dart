@@ -104,6 +104,32 @@ const _minimalMessages = <Map<String, dynamic>>[
 const _model = 'gpt-test';
 
 void main() {
+  test('memory gateway payload defaults to stream true', () {
+    final api = _buildApiServiceForTest(
+      _FakeAdapter.json(const <String, dynamic>{}),
+    );
+    final payload = api.buildMemoryGatewayPayloadForTest(
+      messages: const <Map<String, dynamic>>[
+        {'role': 'user', 'content': 'hello'},
+      ],
+      model: 'gpt-test',
+      conversationId: 'conv-1',
+      contextSize: 4096,
+      maxTokens: 512,
+      temperature: 0.2,
+      ragCollection: 'my_rag',
+    );
+
+    check(payload['stream']).equals(true);
+    check(payload['model']).equals('gpt-test');
+    check(payload['conversation_id']).equals('conv-1');
+    check(payload['context_size']).equals(4096);
+    check(payload['max_tokens']).equals(512);
+    check(payload['temperature']).equals(0.2);
+    check(payload['rag_collection']).equals('my_rag');
+    check(payload['messages']).isA<List<dynamic>>();
+  });
+
   // -----------------------------------------------------------------------
   // 1. taskSocket classification from JSON with task_id
   // -----------------------------------------------------------------------
