@@ -24,6 +24,10 @@ import 'worker_manager.dart';
 
 // Keep local verbosity toggle for socket logs
 const bool kSocketVerboseLogging = false;
+const bool _debugFirstContentLatency = bool.fromEnvironment(
+  'QONDUIT_DEBUG_FIRST_CONTENT_MS',
+  defaultValue: false,
+);
 
 // Pre-compiled regex patterns for image extraction (performance optimization)
 final _base64ImagePattern = RegExp(
@@ -1717,6 +1721,8 @@ ActiveChatStream attachUnifiedChunkedStreaming({
     case ChatCompletionTransport.httpStream:
       // Parse the SSE byte stream directly via the typed parser.
       bool receivedDone = false;
+      final firstContentStopwatch = Stopwatch()..start();
+      var firstContentLogged = false;
       // Track whether we're inside a reasoning block so we can wrap
       // raw `reasoning_content` deltas in `<think>` tags for the
       // ReasoningParser. The taskSocket transport doesn't need this
@@ -1732,6 +1738,18 @@ ActiveChatStream attachUnifiedChunkedStreaming({
                 if (inReasoningBlock) {
                   inReasoningBlock = false;
                   appendToLastMessage('\n</think>\n');
+                }
+                if (_debugFirstContentLatency && !firstContentLogged) {
+                  firstContentLogged = true;
+                  DebugLogger.stream(
+                    'first_content_ms='
+                    '${firstContentStopwatch.elapsedMilliseconds}',
+                    scope: 'streaming/helper',
+                    data: {
+                      'transport': session.transport.name,
+                      'assistantMessageId': assistantMessageId,
+                    },
+                  );
                 }
                 appendToLastMessage(content);
                 updateImagesFromCurrentContent();
