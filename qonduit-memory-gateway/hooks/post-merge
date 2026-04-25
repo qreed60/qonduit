@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+/opt/qonduit-memory-gateway/scripts/enqueue_repo.sh "$repo_root" >> /opt/qonduit-memory-gateway/state/ingest.log 2>&1
