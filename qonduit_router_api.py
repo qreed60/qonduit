@@ -73,7 +73,7 @@ def _qonduit_model_list() -> list[str]:
 def _qonduit_suggested_ctx() -> int:
     # Keep it simple for now. Match your current launcher default behavior closely.
     # You can replace this later with smarter heuristics by file size or VRAM.
-    return 32768
+    return 65536
 
 
 @app.get("/api/v1/qonduit-router/health")
