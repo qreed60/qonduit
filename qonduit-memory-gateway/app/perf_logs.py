@@ -63,7 +63,7 @@ class PerfTracker:
             "t_ms": round(self.total_ms, 3),
         }
         payload.update({k: v for k, v in fields.items() if v is not None})
-        self.logger.info("PERF_EVENT %s", json.dumps(payload, default=str))
+        self.logger.warning("PERF_EVENT %s", json.dumps(payload, default=str))
 
     def summary(self, **fields: Any) -> None:
         if not self.enabled:
@@ -74,4 +74,4 @@ class PerfTracker:
             "steps_ms": self.steps_ms,
         }
         payload.update({k: v for k, v in fields.items() if v is not None})
-        self.logger.info("PERF_SUMMARY %s", json.dumps(payload, default=str))
+        self.logger.warning("PERF_SUMMARY %s", json.dumps(payload, default=str))

@@ -3010,6 +3010,281 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     if req.tool_choice is not None:
         payload["tool_choice"] = req.tool_choice
 
+    if req.stream:
+        async def stream_event_source() -> Any:
+            nonlocal upstream_status_code, upstream_usage, upstream_timings
+            nonlocal llama_first_chunk_ms, first_llama_request_ns, total_llama_ms
+            nonlocal summary_error
+            stream_payload = dict(payload)
+            stream_payload["stream"] = True
+
+            gateway_prepare_ms = (time.perf_counter_ns() - perf.start_ns) / 1_000_000
+            stream_open_start_ns = time.perf_counter_ns()
+            first_llama_request_ns = stream_open_start_ns
+            stream_open_end_ns: int | None = None
+            upstream_stream_open_ms: float | None = None
+            first_byte_ms: float | None = None
+            upstream_first_byte_ms: float | None = None
+            client_visible_ttft_ms: float | None = None
+            upstream_first_content_ms: float | None = None
+            stream_chunks = 0
+            stream_bytes = 0
+            emitted_chars = 0
+            assistant_parts: list[str] = []
+            sent_done = False
+
+            timeout = httpx.Timeout(
+                connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+                read=None,
+                write=UPSTREAM_WRITE_TIMEOUT_SECONDS,
+                pool=UPSTREAM_POOL_TIMEOUT_SECONDS,
+            )
+
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    with perf.step("llama_upstream_request"):
+                        async with client.stream(
+                            "POST",
+                            f"{LLAMA_BASE}/v1/chat/completions",
+                            json=stream_payload,
+                        ) as upstream_response:
+                            stream_open_end_ns = time.perf_counter_ns()
+                            upstream_stream_open_ms = (
+                                stream_open_end_ns - stream_open_start_ns
+                            ) / 1_000_000
+                            upstream_status_code = upstream_response.status_code
+
+                            if upstream_response.status_code >= 400:
+                                summary_error = (
+                                    f"upstream_status_{upstream_response.status_code}"
+                                )
+                                yield sse_chunk(
+                                    req.model,
+                                    content=(
+                                        "Upstream error "
+                                        f"({upstream_response.status_code})"
+                                    ),
+                                )
+                                yield sse_chunk(req.model, finish_reason="stop")
+                                yield "data: [DONE]\n\n"
+                                sent_done = True
+                                return
+
+                            upstream_lines = upstream_response.aiter_lines()
+                            while True:
+                                try:
+                                    line = await asyncio.wait_for(
+                                        anext(upstream_lines),
+                                        timeout=STREAM_KEEPALIVE_INTERVAL_SECONDS,
+                                    )
+                                except asyncio.TimeoutError:
+                                    yield ": keep-alive\n\n"
+                                    continue
+                                except StopAsyncIteration:
+                                    break
+
+                                if not line or not line.startswith("data:"):
+                                    continue
+
+                                data_line = line[5:].strip()
+                                if not data_line:
+                                    continue
+
+                                now_ns = time.perf_counter_ns()
+                                if first_byte_ms is None:
+                                    first_byte_ms = (
+                                        now_ns - perf.start_ns
+                                    ) / 1_000_000
+                                    if stream_open_end_ns is not None:
+                                        upstream_first_byte_ms = (
+                                            now_ns - stream_open_end_ns
+                                        ) / 1_000_000
+
+                                if data_line == "[DONE]":
+                                    yield "data: [DONE]\n\n"
+                                    sent_done = True
+                                    break
+
+                                stream_chunks += 1
+                                formatted = f"data: {data_line}\n\n"
+                                stream_bytes += len(
+                                    formatted.encode("utf-8", errors="ignore")
+                                )
+                                yield formatted
+
+                                try:
+                                    parsed = json.loads(data_line)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                if isinstance(parsed.get("usage"), dict):
+                                    upstream_usage = parsed["usage"]
+                                if isinstance(parsed.get("timings"), dict):
+                                    upstream_timings = parsed["timings"]
+
+                                choices = parsed.get("choices", [])
+                                if not choices:
+                                    continue
+
+                                delta = choices[0].get("delta", {})
+                                text_delta = coerce_model_content_to_text(
+                                    delta.get("content", ""),
+                                )
+                                if not text_delta:
+                                    continue
+
+                                emitted_chars += len(text_delta)
+                                assistant_parts.append(text_delta)
+
+                                if client_visible_ttft_ms is None:
+                                    content_ns = time.perf_counter_ns()
+                                    client_visible_ttft_ms = (
+                                        content_ns - perf.start_ns
+                                    ) / 1_000_000
+                                    if stream_open_end_ns is not None:
+                                        upstream_first_content_ms = (
+                                            content_ns - stream_open_end_ns
+                                        ) / 1_000_000
+                                    llama_first_chunk_ms = (
+                                        upstream_first_content_ms
+                                        if upstream_first_content_ms is not None
+                                        else None
+                                    )
+                                    perf.mark(
+                                        "llama_first_chunk",
+                                        chunk_index=stream_chunks,
+                                    )
+                                    if llama_first_chunk_ms is not None:
+                                        perf.add_step_ms(
+                                            "llama_first_chunk",
+                                            llama_first_chunk_ms,
+                                        )
+            except Exception as e:
+                summary_error = str(e)
+                logger.exception(
+                    "stream_request_failed conversation_id=%s model=%s error=%s",
+                    conversation_id,
+                    req.model,
+                    str(e),
+                )
+                yield sse_chunk(req.model, content=f"Gateway streaming error: {str(e)}")
+                yield sse_chunk(req.model, finish_reason="stop")
+                yield "data: [DONE]\n\n"
+                sent_done = True
+            finally:
+                stream_end_ns = time.perf_counter_ns()
+                llama_total_ms = (
+                    stream_end_ns - stream_open_start_ns
+                ) / 1_000_000
+                total_llama_ms += llama_total_ms
+                perf.add_step_ms("llama_response_complete", llama_total_ms)
+                if not sent_done:
+                    yield sse_chunk(req.model, finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "".join(assistant_parts),
+                }
+                state["summary"] = summary
+                state["project_id"] = project_id
+                state["conversation_id"] = conversation_id
+                state["recent_messages"] = (
+                    trimmed_recent + [assistant_message]
+                )[-recent_window:]
+                state["last_model"] = effective_model
+                state["last_context_size"] = context_size
+                state["last_mode"] = mode
+                state["last_prompt_tokens"] = prompt_tokens
+                state["last_reserved_output"] = budget.reserved_output
+                state["metadata"] = {
+                    "mode": mode,
+                    "project_id": project_id,
+                    "rag_collection": (req.rag_collection or "").strip()
+                    or project_id,
+                    "rag_enabled": rag_active,
+                    "request_model": req.model,
+                    "effective_model": effective_model,
+                }
+                save_conversation(conversation_id, state, project_id=project_id)
+
+                perf.mark(
+                    "llama_response_complete",
+                    chunks=stream_chunks,
+                    bytes=stream_bytes,
+                )
+                perf.summary(
+                    model=effective_model,
+                    stream=True,
+                    input_message_count=input_message_count,
+                    approx_input_tokens=approx_input_tokens,
+                    approx_final_prompt_tokens=approx_final_prompt_tokens,
+                    rag_chunk_count=len(rag_chunks),
+                    qdrant_result_count=len(rag_results),
+                    gateway_prepare_ms=round(gateway_prepare_ms, 3),
+                    gateway_pre_llama_ms=round(gateway_prepare_ms, 3),
+                    upstream_stream_open_ms=(
+                        round(upstream_stream_open_ms, 3)
+                        if upstream_stream_open_ms is not None
+                        else None
+                    ),
+                    upstream_response_open_ms=(
+                        round(upstream_stream_open_ms, 3)
+                        if upstream_stream_open_ms is not None
+                        else None
+                    ),
+                    first_byte_ms=(
+                        round(first_byte_ms, 3) if first_byte_ms is not None else None
+                    ),
+                    upstream_first_byte_ms=(
+                        round(upstream_first_byte_ms, 3)
+                        if upstream_first_byte_ms is not None
+                        else None
+                    ),
+                    client_visible_ttft_ms=(
+                        round(client_visible_ttft_ms, 3)
+                        if client_visible_ttft_ms is not None
+                        else None
+                    ),
+                    upstream_first_content_ms=(
+                        round(upstream_first_content_ms, 3)
+                        if upstream_first_content_ms is not None
+                        else None
+                    ),
+                    upstream_first_chunk_after_open_ms=(
+                        round(upstream_first_content_ms, 3)
+                        if upstream_first_content_ms is not None
+                        else None
+                    ),
+                    llama_first_chunk_ms=(
+                        round(llama_first_chunk_ms, 3)
+                        if llama_first_chunk_ms is not None
+                        else None
+                    ),
+                    llama_total_ms=round(llama_total_ms, 3),
+                    upstream_status_code=upstream_status_code,
+                    upstream_usage=upstream_usage,
+                    upstream_timings=upstream_timings,
+                    stream_chunks=stream_chunks,
+                    stream_bytes=stream_bytes,
+                    error=summary_error,
+                )
+
+        logger.info(
+            "chat_request stream=true conversation_id=%s model=%s messages=%s",
+            conversation_id,
+            effective_model,
+            len(req.messages),
+        )
+        return StreamingResponse(
+            stream_event_source(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
     # Tool execution loop constants
     MAX_TOOL_ITERATIONS = 5
     tool_iteration = 0
