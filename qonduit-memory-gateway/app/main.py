@@ -3404,6 +3404,12 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         if first_llama_request_ns is None:
             first_llama_request_ns = time.perf_counter_ns()
         stream_start_ns = time.perf_counter_ns()
+        stream_upstream_open_started_ns = stream_start_ns
+        stream_upstream_open_completed_ns: int | None = None
+        client_visible_ttft_ms: float | None = None
+        upstream_response_open_ms: float | None = None
+        upstream_first_chunk_after_open_ms: float | None = None
+        stream_llama_total_ms = 0.0
         emitted_chunks = 0
         emitted_chars = 0
         emitted_bytes = 0
@@ -3425,6 +3431,11 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                         json=stream_payload,
                     )
                     r = await stream_ctx.__aenter__()
+                    stream_upstream_open_completed_ns = time.perf_counter_ns()
+                    upstream_response_open_ms = (
+                        stream_upstream_open_completed_ns
+                        - stream_upstream_open_started_ns
+                    ) / 1_000_000
                 try:
                     upstream_status_code = r.status_code
                     upstream_ms = int(
@@ -3484,9 +3495,18 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                         emitted_chunks += 1
                         emitted_bytes += len(data_line.encode("utf-8", errors="ignore"))
                         if llama_first_chunk_ms is None:
+                            first_chunk_seen_ns = time.perf_counter_ns()
                             llama_first_chunk_ms = (
-                                time.perf_counter_ns() - stream_start_ns
+                                first_chunk_seen_ns - stream_start_ns
                             ) / 1_000_000
+                            client_visible_ttft_ms = (
+                                first_chunk_seen_ns - perf.start_ns
+                            ) / 1_000_000
+                            if stream_upstream_open_completed_ns is not None:
+                                upstream_first_chunk_after_open_ms = (
+                                    first_chunk_seen_ns
+                                    - stream_upstream_open_completed_ns
+                                ) / 1_000_000
                             perf.mark(
                                 "llama_first_chunk",
                                 chunk_index=emitted_chunks,
@@ -3535,12 +3555,13 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             yield sse_chunk(req.model, content=f"Gateway streaming error: {str(e)}")
             yield sse_chunk(req.model, finish_reason="stop")
             yield "data: [DONE]\n\n"
-            total_llama_ms += (
+            stream_llama_total_ms = (
                 time.perf_counter_ns() - stream_start_ns
             ) / 1_000_000
+            total_llama_ms += stream_llama_total_ms
             perf.add_step_ms(
                 "llama_response_complete",
-                (time.perf_counter_ns() - stream_start_ns) / 1_000_000,
+                stream_llama_total_ms,
             )
             perf.summary(
                 model=effective_model,
@@ -3551,16 +3572,31 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 rag_chunk_count=len(rag_chunks),
                 qdrant_result_count=len(rag_results),
                 gateway_pre_llama_ms=round(
-                    ((first_llama_request_ns or perf.start_ns) - perf.start_ns)
+                    (stream_upstream_open_started_ns - perf.start_ns)
                     / 1_000_000,
                     3,
+                ),
+                client_visible_ttft_ms=(
+                    round(client_visible_ttft_ms, 3)
+                    if client_visible_ttft_ms is not None
+                    else None
+                ),
+                upstream_response_open_ms=(
+                    round(upstream_response_open_ms, 3)
+                    if upstream_response_open_ms is not None
+                    else None
+                ),
+                upstream_first_chunk_after_open_ms=(
+                    round(upstream_first_chunk_after_open_ms, 3)
+                    if upstream_first_chunk_after_open_ms is not None
+                    else None
                 ),
                 llama_first_chunk_ms=(
                     round(llama_first_chunk_ms, 3)
                     if llama_first_chunk_ms is not None
                     else None
                 ),
-                llama_total_ms=round(total_llama_ms, 3),
+                llama_total_ms=round(stream_llama_total_ms, 3),
                 upstream_status_code=upstream_status_code,
                 upstream_usage=upstream_usage,
                 upstream_timings=upstream_timings,
@@ -3579,10 +3615,11 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             emitted_chunks,
             emitted_chars,
         )
-        total_llama_ms += (time.perf_counter_ns() - stream_start_ns) / 1_000_000
+        stream_llama_total_ms = (time.perf_counter_ns() - stream_start_ns) / 1_000_000
+        total_llama_ms += stream_llama_total_ms
         perf.add_step_ms(
             "llama_response_complete",
-            (time.perf_counter_ns() - stream_start_ns) / 1_000_000,
+            stream_llama_total_ms,
         )
         perf.mark(
             "llama_response_complete",
@@ -3622,16 +3659,31 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             rag_chunk_count=len(rag_chunks),
             qdrant_result_count=len(rag_results),
             gateway_pre_llama_ms=round(
-                ((first_llama_request_ns or perf.start_ns) - perf.start_ns)
+                (stream_upstream_open_started_ns - perf.start_ns)
                 / 1_000_000,
                 3,
+            ),
+            client_visible_ttft_ms=(
+                round(client_visible_ttft_ms, 3)
+                if client_visible_ttft_ms is not None
+                else None
+            ),
+            upstream_response_open_ms=(
+                round(upstream_response_open_ms, 3)
+                if upstream_response_open_ms is not None
+                else None
+            ),
+            upstream_first_chunk_after_open_ms=(
+                round(upstream_first_chunk_after_open_ms, 3)
+                if upstream_first_chunk_after_open_ms is not None
+                else None
             ),
             llama_first_chunk_ms=(
                 round(llama_first_chunk_ms, 3)
                 if llama_first_chunk_ms is not None
                 else None
             ),
-            llama_total_ms=round(total_llama_ms, 3),
+            llama_total_ms=round(stream_llama_total_ms, 3),
             upstream_status_code=upstream_status_code,
             upstream_usage=upstream_usage,
             upstream_timings=upstream_timings,
