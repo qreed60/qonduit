@@ -22,6 +22,7 @@ from docx import Document
 from openpyxl import load_workbook
 
 from .budget import build_budget, estimate_tokens, trim_recent_messages
+from .perf_logs import PerfTracker
 from .store import DEFAULT_PROJECT_ID, load_conversation, save_conversation
 from .summarizer import summarize_messages
 from .rag import (
@@ -2056,6 +2057,12 @@ def latest_user_text(messages: list[ChatMessage]) -> str:
     return ""
 
 
+def approx_tokens_from_chars(total_chars: int) -> int:
+    if total_chars <= 0:
+        return 0
+    return max(1, int(round(total_chars / 3.7)))
+
+
 def _debug_preview(text: str, limit: int = 280) -> str:
     preview = text.replace("\n", "\\n")
     if len(preview) > limit:
@@ -2779,20 +2786,31 @@ async def chat_completions_help() -> dict:
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat(req: GatewayChatRequest, request: Request) -> Any:
+    perf = PerfTracker(logger=logger)
+    perf.mark("request_received", model=req.model, stream=req.stream)
+    upstream_status_code: int | None = None
+    upstream_usage: dict[str, Any] | None = None
+    upstream_timings: dict[str, Any] | None = None
+    llama_first_chunk_ms: float | None = None
+    first_llama_request_ns: int | None = None
+    total_llama_ms = 0.0
+    summary_error: str | None = None
+
     user_id = get_request_user_id(request)
     alias = model_alias_entry(req.model)
     endpoint_binding = endpoint_binding_entry(request)
-    effective_model = resolve_effective_model(req, request)
-    project_id = resolve_project_id(req, request)
-    conversation_id = resolve_conversation_id(req, request)
-    state = load_conversation(conversation_id, project_id=project_id)
-    context_size = resolve_context_size(req, state)
-    mode = resolve_mode(req, request, project_id)
-    system_prompt = system_prompt_for_mode(mode)
-    recent_window = 16 if mode == "coding" else 8
+    with perf.step("memory_parse"):
+        effective_model = resolve_effective_model(req, request)
+        project_id = resolve_project_id(req, request)
+        conversation_id = resolve_conversation_id(req, request)
+        state = load_conversation(conversation_id, project_id=project_id)
+        context_size = resolve_context_size(req, state)
+        mode = resolve_mode(req, request, project_id)
+        system_prompt = system_prompt_for_mode(mode)
+        recent_window = 16 if mode == "coding" else 8
 
-    prior_recent = state.get("recent_messages", [])
-    summary = state.get("summary", "")
+        prior_recent = state.get("recent_messages", [])
+        summary = state.get("summary", "")
 
     def build_message_dict(m: ChatMessage) -> dict[str, Any]:
         """Convert ChatMessage to OpenAI-style message dict, preserving tool fields."""
@@ -2872,6 +2890,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 collection=rag_namespace,
                 user_id=user_id,
                 project_id=project_id,
+                perf=perf,
             )
             if not rag_results:
                 used_user_fallback = True
@@ -2881,12 +2900,14 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                     collection=rag_namespace,
                     user_id=None,
                     project_id=project_id,
+                    perf=perf,
                 )
-            rag_chunks = [
-                item["text"].strip()
-                for item in rag_results
-                if item.get("text", "").strip()
-            ]
+            with perf.step("rag_assembly"):
+                rag_chunks = [
+                    item["text"].strip()
+                    for item in rag_results
+                    if item.get("text", "").strip()
+                ]
             logger.info(
                 "chat_rag_retrieval conversation_id=%s project_id=%s "
                 "hit_count=%s fallback_without_user=%s",
@@ -2910,23 +2931,24 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             project_id,
         )
 
-    rag_context = "\n\n".join(rag_chunks)
+    with perf.step("prompt_assembly"):
+        rag_context = "\n\n".join(rag_chunks)
 
-    final_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"Rolling summary:\n{summary or '(none)'}"},
-    ]
+        final_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": f"Rolling summary:\n{summary or '(none)'}"},
+        ]
 
-    if rag_context:
-        final_messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Relevant retrieved knowledge:\n"
-                    f"{rag_context}"
-                ),
-            }
-        )
+        if rag_context:
+            final_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Relevant retrieved knowledge:\n"
+                        f"{rag_context}"
+                    ),
+                }
+            )
     logger.info(
         "chat_rag_injection conversation_id=%s project_id=%s injected=%s snippets=%s",
         conversation_id,
@@ -2936,6 +2958,18 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     )
 
     final_messages.extend(trimmed_recent)
+
+    input_message_count = len(req.messages)
+    input_chars = sum(
+        len(coerce_model_content_to_text(message.content))
+        for message in req.messages
+    )
+    approx_input_tokens = approx_tokens_from_chars(input_chars)
+    prompt_chars = sum(
+        len(coerce_model_content_to_text(message.get("content", "")))
+        for message in final_messages
+    )
+    approx_final_prompt_tokens = approx_tokens_from_chars(prompt_chars)
 
     state["summary"] = summary
     state["project_id"] = project_id
@@ -2984,12 +3018,23 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     # Helper function to call upstream model
     async def call_upstream_model(messages: list[dict[str, Any]]) -> dict[str, Any]:
         """Call upstream model and return parsed response data."""
+        nonlocal upstream_status_code, upstream_usage, upstream_timings
+        nonlocal first_llama_request_ns, total_llama_ms
         call_payload = dict(payload)
         call_payload["messages"] = messages
         call_payload["stream"] = False
-        
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=call_payload)
+
+        if first_llama_request_ns is None:
+            first_llama_request_ns = time.perf_counter_ns()
+        llama_call_started_ns = time.perf_counter_ns()
+        with perf.step("llama_upstream_request"):
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(
+                    f"{LLAMA_BASE}/v1/chat/completions",
+                    json=call_payload,
+                )
+        total_llama_ms += (time.perf_counter_ns() - llama_call_started_ns) / 1_000_000
+        upstream_status_code = r.status_code
         
         if r.status_code >= 400:
             logger.error(
@@ -3005,7 +3050,38 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             )
         
         try:
-            return r.json()
+            parsed = r.json()
+            if isinstance(parsed, dict):
+                maybe_usage = parsed.get("usage")
+                if isinstance(maybe_usage, dict):
+                    upstream_usage = maybe_usage
+
+                timings: dict[str, Any] = {}
+                for key in (
+                    "timings",
+                    "prompt_eval",
+                    "prompt_ms",
+                    "prompt_n",
+                    "predicted_ms",
+                    "predicted_n",
+                    "eval_ms",
+                    "eval_count",
+                ):
+                    if key in parsed:
+                        timings[key] = parsed.get(key)
+                if isinstance(parsed.get("usage"), dict):
+                    usage = parsed["usage"]
+                    for key in (
+                        "prompt_eval_count",
+                        "prompt_eval_duration",
+                        "eval_count",
+                        "eval_duration",
+                    ):
+                        if key in usage:
+                            timings[f"usage_{key}"] = usage.get(key)
+                if timings:
+                    upstream_timings = timings
+            return parsed
         except ValueError:
             logger.error(
                 "tool_loop_upstream_invalid_json conversation_id=%s model=%s iteration=%s",
@@ -3022,156 +3098,114 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     last_response_data: dict[str, Any] | None = None
     seen_tool_signatures: dict[str, int] = {}
 
-    while tool_iteration <= MAX_TOOL_ITERATIONS:
-        logger.info(
-            "tool_loop_iteration_start conversation_id=%s iteration=%s max=%s has_tools=%s",
-            conversation_id,
-            tool_iteration,
-            MAX_TOOL_ITERATIONS,
-            bool(req.tools or mode == "coding"),
-        )
-
-        response_data = await call_upstream_model(working_messages)
-        last_response_data = response_data
-
-        choices = response_data.get("choices", [])
-        if not choices:
-            logger.error(
-                "tool_loop_no_choices conversation_id=%s iteration=%s response=%s",
+    try:
+        while tool_iteration <= MAX_TOOL_ITERATIONS:
+            logger.info(
+                "tool_loop_iteration_start conversation_id=%s iteration=%s max=%s has_tools=%s",
                 conversation_id,
                 tool_iteration,
-                str(response_data)[:500],
+                MAX_TOOL_ITERATIONS,
+                bool(req.tools or mode == "coding"),
             )
-            break
 
-        message_data = choices[0].get("message", {})
-        finish_reason = choices[0].get("finish_reason", "stop")
-        tool_calls = message_data.get("tool_calls")
-        has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+            response_data = await call_upstream_model(working_messages)
+            last_response_data = response_data
 
-        logger.info(
-            "tool_loop_model_response conversation_id=%s iteration=%s finish_reason=%s has_tool_calls=%s",
-            conversation_id,
-            tool_iteration,
-            finish_reason,
-            has_tool_calls,
-        )
-
-        if has_tool_calls:
-            if tool_iteration >= MAX_TOOL_ITERATIONS:
+            choices = response_data.get("choices", [])
+            if not choices:
                 logger.error(
-                    "tool_loop_max_iterations_reached conversation_id=%s iteration=%s",
+                    "tool_loop_no_choices conversation_id=%s iteration=%s response=%s",
                     conversation_id,
                     tool_iteration,
+                    str(response_data)[:500],
                 )
-                last_response_data = {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": (
-                                    "Tool execution stopped after reaching max "
-                                    "iterations. Please refine the request."
-                                ),
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ]
-                }
                 break
 
+            message_data = choices[0].get("message", {})
+            finish_reason = choices[0].get("finish_reason", "stop")
+            tool_calls = message_data.get("tool_calls")
+            has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+
             logger.info(
-                "tool_loop_tool_calls_detected conversation_id=%s iteration=%s tool_count=%s",
+                "tool_loop_model_response conversation_id=%s iteration=%s finish_reason=%s has_tool_calls=%s",
                 conversation_id,
                 tool_iteration,
-                len(tool_calls),
+                finish_reason,
+                has_tool_calls,
             )
 
-            assistant_tool_message = {
-                "role": "assistant",
-                "content": coerce_model_content_to_text(
-                    message_data.get("content")
-                ) if message_data.get("content") is not None else "",
-                "tool_calls": tool_calls,
-            }
-            working_messages.append(assistant_tool_message)
-
-            tool_results: list[ChatMessage] = []
-            had_repeat_call = False
-            repeated_calls_count = 0
-            for tc in tool_calls:
-                func = tc.get("function", {})
-                tool_name = func.get("name", "unknown")
-                tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                raw_arguments = func.get("arguments", "{}")
-                args_hash = sha256(str(raw_arguments).encode("utf-8")).hexdigest()[:12]
-
-                try:
-                    tool_args = json.loads(raw_arguments)
-                except (json.JSONDecodeError, TypeError):
-                    tool_args = {
-                        "_tool_call_id": tool_call_id,
-                    }
-                    signature = f"{tool_name}:{args_hash}"
-                    result = ToolResult(
-                        tool_call_id=tool_call_id,
-                        name=tool_name,
-                        content=json.dumps(
-                            {
-                                "ok": False,
-                                "status": "error",
-                                "applied": False,
-                                "error": "invalid_tool_arguments",
-                                "tool": tool_name,
-                                "args_hash": args_hash,
-                                "raw_arguments": str(raw_arguments)[:500],
-                                "files_changed": [],
-                                "summary": (
-                                    "Tool arguments were invalid JSON. "
-                                    "Fix arguments before retrying."
-                                ),
-                            },
-                            indent=2,
-                        ),
-                        is_error=True,
-                    )
-                    logger.warning(
-                        "tool_loop_invalid_arguments conversation_id=%s iteration=%s tool=%s args_hash=%s",
+            if has_tool_calls:
+                if tool_iteration >= MAX_TOOL_ITERATIONS:
+                    logger.error(
+                        "tool_loop_max_iterations_reached conversation_id=%s iteration=%s",
                         conversation_id,
                         tool_iteration,
-                        tool_name,
-                        args_hash,
                     )
-                else:
-                    if not isinstance(tool_args, dict):
-                        tool_args = {"value": tool_args}
-                    signature = (
-                        f"{tool_name}:" + sha256(
-                            json.dumps(tool_args, sort_keys=True).encode("utf-8")
-                        ).hexdigest()[:12]
-                    )
-                    repeat_count = seen_tool_signatures.get(signature, 0)
-                    is_repeat = repeat_count > 0
-                    if is_repeat:
-                        had_repeat_call = True
-                        repeated_calls_count += 1
+                    last_response_data = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": (
+                                        "Tool execution stopped after reaching max "
+                                        "iterations. Please refine the request."
+                                    ),
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                    break
+
+                logger.info(
+                    "tool_loop_tool_calls_detected conversation_id=%s iteration=%s tool_count=%s",
+                    conversation_id,
+                    tool_iteration,
+                    len(tool_calls),
+                )
+
+                assistant_tool_message = {
+                    "role": "assistant",
+                    "content": coerce_model_content_to_text(
+                        message_data.get("content")
+                    ) if message_data.get("content") is not None else "",
+                    "tool_calls": tool_calls,
+                }
+                working_messages.append(assistant_tool_message)
+
+                tool_results: list[ChatMessage] = []
+                had_repeat_call = False
+                repeated_calls_count = 0
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    tool_name = func.get("name", "unknown")
+                    tool_call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                    raw_arguments = func.get("arguments", "{}")
+                    args_hash = sha256(str(raw_arguments).encode("utf-8")).hexdigest()[:12]
+
+                    try:
+                        tool_args = json.loads(raw_arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        tool_args = {
+                            "_tool_call_id": tool_call_id,
+                        }
+                        signature = f"{tool_name}:{args_hash}"
                         result = ToolResult(
                             tool_call_id=tool_call_id,
                             name=tool_name,
                             content=json.dumps(
                                 {
                                     "ok": False,
-                                    "status": "blocked_repeat",
+                                    "status": "error",
                                     "applied": False,
-                                    "error": "repeated_tool_call",
+                                    "error": "invalid_tool_arguments",
                                     "tool": tool_name,
-                                    "args_hash": signature.split(":", 1)[1],
-                                    "repeat_count": repeat_count,
+                                    "args_hash": args_hash,
+                                    "raw_arguments": str(raw_arguments)[:500],
                                     "files_changed": [],
                                     "summary": (
-                                        "Skipped repeated invocation with "
-                                        "identical arguments to prevent "
-                                        "pointless loops."
+                                        "Tool arguments were invalid JSON. "
+                                        "Fix arguments before retrying."
                                     ),
                                 },
                                 indent=2,
@@ -3179,113 +3213,178 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                             is_error=True,
                         )
                         logger.warning(
-                            "tool_loop_repeated_call conversation_id=%s iteration=%s tool=%s signature=%s repeat_count=%s",
+                            "tool_loop_invalid_arguments conversation_id=%s iteration=%s tool=%s args_hash=%s",
                             conversation_id,
                             tool_iteration,
                             tool_name,
-                            signature,
-                            repeat_count,
+                            args_hash,
                         )
                     else:
-                        seen_tool_signatures[signature] = repeat_count + 1
-                        tool_args["_tool_call_id"] = tool_call_id
-                        logger.info(
-                            "tool_loop_executing_tool conversation_id=%s iteration=%s tool=%s tool_call_id=%s signature=%s is_repeat=%s",
-                            conversation_id,
-                            tool_iteration,
-                            tool_name,
-                            tool_call_id,
-                            signature,
-                            is_repeat,
+                        if not isinstance(tool_args, dict):
+                            tool_args = {"value": tool_args}
+                        signature = (
+                            f"{tool_name}:" + sha256(
+                                json.dumps(tool_args, sort_keys=True).encode("utf-8")
+                            ).hexdigest()[:12]
                         )
-                        result = await execute_tool(
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                            project_id=project_id,
-                            user_id=user_id,
-                        )
-
-                tool_msg = ChatMessage(
-                    role="tool",
-                    content=result.content,
-                    tool_call_id=tool_call_id,
-                )
-                tool_results.append(tool_msg)
-
-                logger.info(
-                    "tool_loop_tool_executed conversation_id=%s iteration=%s tool=%s tool_call_id=%s signature=%s is_error=%s",
-                    conversation_id,
-                    tool_iteration,
-                    tool_name,
-                    tool_call_id,
-                    signature,
-                    result.is_error,
-                )
-
-            working_messages.extend(
-                [
-                    {
-                        "role": m.role,
-                        "content": m.content,
-                        "tool_call_id": m.tool_call_id,
-                    }
-                    for m in tool_results
-                ]
-            )
-
-            if repeated_calls_count == len(tool_calls):
-                logger.warning(
-                    "tool_loop_exiting conversation_id=%s iteration=%s reason=%s",
-                    conversation_id,
-                    tool_iteration,
-                    "all_tool_calls_repeated",
-                )
-                last_response_data = {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": (
-                                    "Tools were already run with these exact "
-                                    "arguments. I will stop tool calls now and "
-                                    "summarize the latest successful results."
+                        repeat_count = seen_tool_signatures.get(signature, 0)
+                        is_repeat = repeat_count > 0
+                        if is_repeat:
+                            had_repeat_call = True
+                            repeated_calls_count += 1
+                            result = ToolResult(
+                                tool_call_id=tool_call_id,
+                                name=tool_name,
+                                content=json.dumps(
+                                    {
+                                        "ok": False,
+                                        "status": "blocked_repeat",
+                                        "applied": False,
+                                        "error": "repeated_tool_call",
+                                        "tool": tool_name,
+                                        "args_hash": signature.split(":", 1)[1],
+                                        "repeat_count": repeat_count,
+                                        "files_changed": [],
+                                        "summary": (
+                                            "Skipped repeated invocation with "
+                                            "identical arguments to prevent "
+                                            "pointless loops."
+                                        ),
+                                    },
+                                    indent=2,
                                 ),
-                            },
-                            "finish_reason": "stop",
+                                is_error=True,
+                            )
+                            logger.warning(
+                                "tool_loop_repeated_call conversation_id=%s iteration=%s tool=%s signature=%s repeat_count=%s",
+                                conversation_id,
+                                tool_iteration,
+                                tool_name,
+                                signature,
+                                repeat_count,
+                            )
+                        else:
+                            seen_tool_signatures[signature] = repeat_count + 1
+                            tool_args["_tool_call_id"] = tool_call_id
+                            logger.info(
+                                "tool_loop_executing_tool conversation_id=%s iteration=%s tool=%s tool_call_id=%s signature=%s is_repeat=%s",
+                                conversation_id,
+                                tool_iteration,
+                                tool_name,
+                                tool_call_id,
+                                signature,
+                                is_repeat,
+                            )
+                            result = await execute_tool(
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                project_id=project_id,
+                                user_id=user_id,
+                            )
+
+                    tool_msg = ChatMessage(
+                        role="tool",
+                        content=result.content,
+                        tool_call_id=tool_call_id,
+                    )
+                    tool_results.append(tool_msg)
+
+                    logger.info(
+                        "tool_loop_tool_executed conversation_id=%s iteration=%s tool=%s tool_call_id=%s signature=%s is_error=%s",
+                        conversation_id,
+                        tool_iteration,
+                        tool_name,
+                        tool_call_id,
+                        signature,
+                        result.is_error,
+                    )
+
+                working_messages.extend(
+                    [
+                        {
+                            "role": m.role,
+                            "content": m.content,
+                            "tool_call_id": m.tool_call_id,
                         }
+                        for m in tool_results
                     ]
-                }
-                break
+                )
 
-            working_messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Tool results are now available. If the task is "
-                        "satisfied, provide a final assistant answer and stop "
-                        "calling tools. Only call another tool if a prior tool "
-                        "failed or additional data is required."
-                    ),
-                }
-            )
+                if repeated_calls_count == len(tool_calls):
+                    logger.warning(
+                        "tool_loop_exiting conversation_id=%s iteration=%s reason=%s",
+                        conversation_id,
+                        tool_iteration,
+                        "all_tool_calls_repeated",
+                    )
+                    last_response_data = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": (
+                                        "Tools were already run with these exact "
+                                        "arguments. I will stop tool calls now and "
+                                        "summarize the latest successful results."
+                                    ),
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                    break
 
-            tool_iteration += 1
+                working_messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Tool results are now available. If the task is "
+                            "satisfied, provide a final assistant answer and stop "
+                            "calling tools. Only call another tool if a prior tool "
+                            "failed or additional data is required."
+                        ),
+                    }
+                )
+
+                tool_iteration += 1
+                logger.info(
+                    "tool_loop_followup_model_call conversation_id=%s next_iteration=%s repeated_call_detected=%s continue_reason=%s",
+                    conversation_id,
+                    tool_iteration,
+                    had_repeat_call,
+                    "tool_calls_detected",
+                )
+                continue
+
             logger.info(
-                "tool_loop_followup_model_call conversation_id=%s next_iteration=%s repeated_call_detected=%s continue_reason=%s",
+                "tool_loop_exiting conversation_id=%s iteration=%s reason=final_answer",
                 conversation_id,
                 tool_iteration,
-                had_repeat_call,
-                "tool_calls_detected",
+                "model_returned_final_answer",
             )
-            continue
-
-        logger.info(
-            "tool_loop_exiting conversation_id=%s iteration=%s reason=final_answer",
-            conversation_id,
-            tool_iteration,
-            "model_returned_final_answer",
+            break
+    except Exception as error:
+        summary_error = str(error)
+        perf.summary(
+            model=effective_model,
+            stream=req.stream,
+            input_message_count=input_message_count,
+            approx_input_tokens=approx_input_tokens,
+            approx_final_prompt_tokens=approx_final_prompt_tokens,
+            rag_chunk_count=len(rag_chunks),
+            qdrant_result_count=len(rag_results),
+            gateway_pre_llama_ms=round(
+                ((first_llama_request_ns or perf.start_ns) - perf.start_ns)
+                / 1_000_000,
+                3,
+            ),
+            llama_total_ms=round(total_llama_ms, 3),
+            upstream_status_code=upstream_status_code,
+            upstream_usage=upstream_usage,
+            upstream_timings=upstream_timings,
+            error=summary_error,
         )
-        break
+        raise
 
     # Use last_response_data for final response, or make one final call if needed
     if last_response_data is None:
@@ -3297,11 +3396,23 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     payload["messages"] = working_messages
 
     async def event_stream():
+        nonlocal upstream_status_code, upstream_usage, upstream_timings
+        nonlocal llama_first_chunk_ms, first_llama_request_ns, total_llama_ms
+        nonlocal summary_error
         stream_payload = dict(payload)
         stream_payload["stream"] = True
-        stream_start = time.perf_counter()
+        if first_llama_request_ns is None:
+            first_llama_request_ns = time.perf_counter_ns()
+        stream_start_ns = time.perf_counter_ns()
+        stream_upstream_open_started_ns = stream_start_ns
+        stream_upstream_open_completed_ns: int | None = None
+        client_visible_ttft_ms: float | None = None
+        upstream_response_open_ms: float | None = None
+        upstream_first_chunk_after_open_ms: float | None = None
+        stream_llama_total_ms = 0.0
         emitted_chunks = 0
         emitted_chars = 0
+        emitted_bytes = 0
         assistant_parts: list[str] = []
         sent_done = False
         timeout = httpx.Timeout(
@@ -3313,12 +3424,23 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST",
-                    f"{LLAMA_BASE}/v1/chat/completions",
-                    json=stream_payload,
-                ) as r:
-                    upstream_ms = int((time.perf_counter() - stream_start) * 1000)
+                with perf.step("llama_upstream_request"):
+                    stream_ctx = client.stream(
+                        "POST",
+                        f"{LLAMA_BASE}/v1/chat/completions",
+                        json=stream_payload,
+                    )
+                    r = await stream_ctx.__aenter__()
+                    stream_upstream_open_completed_ns = time.perf_counter_ns()
+                    upstream_response_open_ms = (
+                        stream_upstream_open_completed_ns
+                        - stream_upstream_open_started_ns
+                    ) / 1_000_000
+                try:
+                    upstream_status_code = r.status_code
+                    upstream_ms = int(
+                        (time.perf_counter_ns() - stream_start_ns) / 1_000_000
+                    )
                     logger.info(
                         "stream_upstream_response conversation_id=%s model=%s "
                         "status=%s latency_ms=%s",
@@ -3371,6 +3493,25 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                             break
 
                         emitted_chunks += 1
+                        emitted_bytes += len(data_line.encode("utf-8", errors="ignore"))
+                        if llama_first_chunk_ms is None:
+                            first_chunk_seen_ns = time.perf_counter_ns()
+                            llama_first_chunk_ms = (
+                                first_chunk_seen_ns - stream_start_ns
+                            ) / 1_000_000
+                            client_visible_ttft_ms = (
+                                first_chunk_seen_ns - perf.start_ns
+                            ) / 1_000_000
+                            if stream_upstream_open_completed_ns is not None:
+                                upstream_first_chunk_after_open_ms = (
+                                    first_chunk_seen_ns
+                                    - stream_upstream_open_completed_ns
+                                ) / 1_000_000
+                            perf.mark(
+                                "llama_first_chunk",
+                                chunk_index=emitted_chunks,
+                            )
+                            perf.add_step_ms("llama_first_chunk", llama_first_chunk_ms)
                         yield f"data: {data_line}\n\n"
 
                         try:
@@ -3380,6 +3521,10 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
                         choices = parsed.get("choices", [])
                         if not choices:
+                            if isinstance(parsed.get("usage"), dict):
+                                upstream_usage = parsed["usage"]
+                            if isinstance(parsed.get("timings"), dict):
+                                upstream_timings = parsed["timings"]
                             continue
 
                         delta = choices[0].get("delta", {})
@@ -3389,11 +3534,18 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                         if text_delta:
                             emitted_chars += len(text_delta)
                             assistant_parts.append(text_delta)
+                        if isinstance(parsed.get("usage"), dict):
+                            upstream_usage = parsed["usage"]
+                        if isinstance(parsed.get("timings"), dict):
+                            upstream_timings = parsed["timings"]
 
                     if not sent_done:
                         yield sse_chunk(req.model, finish_reason="stop")
                         yield "data: [DONE]\n\n"
+                finally:
+                    await stream_ctx.__aexit__(None, None, None)
         except Exception as e:
+            summary_error = str(e)
             logger.exception(
                 "stream_request_failed conversation_id=%s model=%s error=%s",
                 conversation_id,
@@ -3403,6 +3555,53 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             yield sse_chunk(req.model, content=f"Gateway streaming error: {str(e)}")
             yield sse_chunk(req.model, finish_reason="stop")
             yield "data: [DONE]\n\n"
+            stream_llama_total_ms = (
+                time.perf_counter_ns() - stream_start_ns
+            ) / 1_000_000
+            total_llama_ms += stream_llama_total_ms
+            perf.add_step_ms(
+                "llama_response_complete",
+                stream_llama_total_ms,
+            )
+            perf.summary(
+                model=effective_model,
+                stream=True,
+                input_message_count=input_message_count,
+                approx_input_tokens=approx_input_tokens,
+                approx_final_prompt_tokens=approx_final_prompt_tokens,
+                rag_chunk_count=len(rag_chunks),
+                qdrant_result_count=len(rag_results),
+                gateway_pre_llama_ms=round(
+                    (stream_upstream_open_started_ns - perf.start_ns)
+                    / 1_000_000,
+                    3,
+                ),
+                client_visible_ttft_ms=(
+                    round(client_visible_ttft_ms, 3)
+                    if client_visible_ttft_ms is not None
+                    else None
+                ),
+                upstream_response_open_ms=(
+                    round(upstream_response_open_ms, 3)
+                    if upstream_response_open_ms is not None
+                    else None
+                ),
+                upstream_first_chunk_after_open_ms=(
+                    round(upstream_first_chunk_after_open_ms, 3)
+                    if upstream_first_chunk_after_open_ms is not None
+                    else None
+                ),
+                llama_first_chunk_ms=(
+                    round(llama_first_chunk_ms, 3)
+                    if llama_first_chunk_ms is not None
+                    else None
+                ),
+                llama_total_ms=round(stream_llama_total_ms, 3),
+                upstream_status_code=upstream_status_code,
+                upstream_usage=upstream_usage,
+                upstream_timings=upstream_timings,
+                error=summary_error,
+            )
             return
 
         # Collect both content and tool_calls from streaming response
@@ -3415,6 +3614,17 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             req.model,
             emitted_chunks,
             emitted_chars,
+        )
+        stream_llama_total_ms = (time.perf_counter_ns() - stream_start_ns) / 1_000_000
+        total_llama_ms += stream_llama_total_ms
+        perf.add_step_ms(
+            "llama_response_complete",
+            stream_llama_total_ms,
+        )
+        perf.mark(
+            "llama_response_complete",
+            chunks=emitted_chunks,
+            bytes=emitted_bytes,
         )
 
         # Build assistant message - preserve tool_calls if present
@@ -3440,6 +3650,47 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             "effective_model": effective_model,
         }
         save_conversation(conversation_id, state, project_id=project_id)
+        perf.summary(
+            model=effective_model,
+            stream=True,
+            input_message_count=input_message_count,
+            approx_input_tokens=approx_input_tokens,
+            approx_final_prompt_tokens=approx_final_prompt_tokens,
+            rag_chunk_count=len(rag_chunks),
+            qdrant_result_count=len(rag_results),
+            gateway_pre_llama_ms=round(
+                (stream_upstream_open_started_ns - perf.start_ns)
+                / 1_000_000,
+                3,
+            ),
+            client_visible_ttft_ms=(
+                round(client_visible_ttft_ms, 3)
+                if client_visible_ttft_ms is not None
+                else None
+            ),
+            upstream_response_open_ms=(
+                round(upstream_response_open_ms, 3)
+                if upstream_response_open_ms is not None
+                else None
+            ),
+            upstream_first_chunk_after_open_ms=(
+                round(upstream_first_chunk_after_open_ms, 3)
+                if upstream_first_chunk_after_open_ms is not None
+                else None
+            ),
+            llama_first_chunk_ms=(
+                round(llama_first_chunk_ms, 3)
+                if llama_first_chunk_ms is not None
+                else None
+            ),
+            llama_total_ms=round(stream_llama_total_ms, 3),
+            upstream_status_code=upstream_status_code,
+            upstream_usage=upstream_usage,
+            upstream_timings=upstream_timings,
+            stream_chunks=emitted_chunks,
+            stream_bytes=emitted_bytes,
+            error=summary_error,
+        )
 
     if req.stream:
         logger.info(
@@ -3471,6 +3722,8 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         len(req.messages),
         tool_iteration,
     )
+    perf.mark("llama_response_complete")
+    perf.add_step_ms("llama_response_complete", round(total_llama_ms, 3))
 
     message_data = data.get("choices", [{}])[0].get("message", {})
     message_content = message_data.get("content", "")
@@ -3506,6 +3759,28 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "effective_model": effective_model,
     }
     save_conversation(conversation_id, state, project_id=project_id)
+    perf.summary(
+        model=effective_model,
+        stream=False,
+        input_message_count=input_message_count,
+        approx_input_tokens=approx_input_tokens,
+        approx_final_prompt_tokens=approx_final_prompt_tokens,
+        rag_chunk_count=len(rag_chunks),
+        qdrant_result_count=len(rag_results),
+        gateway_pre_llama_ms=round(
+            ((first_llama_request_ns or perf.start_ns) - perf.start_ns)
+            / 1_000_000,
+            3,
+        ),
+        llama_first_chunk_ms=(
+            round(llama_first_chunk_ms, 3) if llama_first_chunk_ms is not None else None
+        ),
+        llama_total_ms=round(total_llama_ms, 3),
+        upstream_status_code=upstream_status_code,
+        upstream_usage=upstream_usage,
+        upstream_timings=upstream_timings,
+        error=summary_error,
+    )
 
     # Build response message - include tool_calls if present
     response_message: dict[str, Any] = {"role": "assistant"}

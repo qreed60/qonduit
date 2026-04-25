@@ -152,11 +152,16 @@ class ProjectScopedRagService:
         top_k: int,
         user_id: str | None,
         namespace: str | None,
+        perf: Any | None = None,
     ) -> list[dict[str, Any]]:
         if not RAG_ENABLED:
             return []
 
-        vector = await self.embedding.embed_query(query)
+        if perf is None:
+            vector = await self.embedding.embed_query(query)
+        else:
+            with perf.step("query_embedding"):
+                vector = await self.embedding.embed_query(query)
         collection_name = self.ensure_collection(project_id)
 
         must_conditions = [
@@ -182,12 +187,21 @@ class ProjectScopedRagService:
                 )
             )
 
-        hits = self.client.search(
-            collection_name=collection_name,
-            query_vector=vector,
-            query_filter=Filter(must=must_conditions),
-            limit=max(1, top_k),
-        )
+        if perf is None:
+            hits = self.client.search(
+                collection_name=collection_name,
+                query_vector=vector,
+                query_filter=Filter(must=must_conditions),
+                limit=max(1, top_k),
+            )
+        else:
+            with perf.step("qdrant_search"):
+                hits = self.client.search(
+                    collection_name=collection_name,
+                    query_vector=vector,
+                    query_filter=Filter(must=must_conditions),
+                    limit=max(1, top_k),
+                )
 
         results: list[dict[str, Any]] = []
         for hit in hits:
@@ -245,6 +259,7 @@ async def search_documents(
     collection: str | None = None,
     user_id: str | None = None,
     project_id: str | None = None,
+    perf: Any | None = None,
 ) -> list[dict]:
     return await rag_service.search(
         project_id=project_id or "default",
@@ -252,6 +267,7 @@ async def search_documents(
         top_k=limit,
         user_id=user_id,
         namespace=collection,
+        perf=perf,
     )
 
 
