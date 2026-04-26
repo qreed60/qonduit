@@ -2897,7 +2897,6 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
         prior_recent = state.get("recent_messages", [])
         summary = state.get("summary", "")
-        stable_project_summary = str(state.get("project_summary", "")).strip()
 
     def build_message_dict(m: ChatMessage) -> dict[str, Any]:
         """Convert ChatMessage to OpenAI-style message dict, preserving tool fields."""
@@ -3027,34 +3026,56 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     rag_context = "\n\n".join(rag_chunks)
 
     with perf.step("prompt_assembly"):
-        stable_prefix_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
+        selected_collections = sorted(
             {
-                "role": "system",
-                "content": (
-                    "Mode and control instructions:\n"
-                    "Keep answers concise, deterministic, and actionable.\n"
-                    "Use available tools only when necessary."
-                ),
-            },
-        ]
-        if stable_project_summary:
-            stable_prefix_messages.append(
-                {
-                    "role": "system",
-                    "content": f"Project summary:\n{stable_project_summary}",
-                }
-            )
-        if rag_context:
-            stable_prefix_messages.append(
-                {
-                    "role": "system",
-                    "content": f"Relevant retrieved knowledge:\n{rag_context}",
-                }
-            )
+                c.strip()
+                for c in ((req.rag_collection or "").split(","))
+                if c.strip()
+            }
+        )
+        if not selected_collections:
+            selected_collections = [project_id]
+        collection_identity_lines = "\n".join(
+            f"- {collection}" for collection in selected_collections
+        )
+        collection_identity_block = (
+            "Selected collection identities:\n"
+            f"{collection_identity_lines}"
+        )
 
-        history_messages, current_user_message = split_recent_history_and_current_user(
-            trimmed_recent,
+        section_messages: list[tuple[str, list[dict[str, Any]]]] = [
+            (
+                "system_prompt",
+                [{"role": "system", "content": system_prompt}],
+            ),
+            (
+                "gateway_control_instructions",
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Mode and control instructions:\n"
+                            "Keep answers concise, deterministic, and "
+                            "actionable.\n"
+                            "Use available tools only when necessary."
+                        ),
+                    }
+                ],
+            ),
+            (
+                "selected_collection_identities",
+                [{"role": "system", "content": collection_identity_block}],
+            ),
+        ]
+
+        stable_prefix_messages = [
+            message
+            for _, messages in section_messages
+            for message in messages
+        ]
+
+        history_messages, current_user_message = (
+            split_recent_history_and_current_user(trimmed_recent)
         )
         if summary.strip():
             history_messages = [
@@ -3064,19 +3085,58 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 },
                 *history_messages,
             ]
+        history_messages = history_messages[-recent_window:]
 
-        dynamic_messages = history_messages[-recent_window:]
-        if current_user_message is not None:
-            dynamic_messages.append(current_user_message)
-
-        final_messages = stable_prefix_messages + dynamic_messages
-
-        stable_prefix_est_tokens = estimate_tokens(
-            "".join(
-                coerce_model_content_to_text(m.get("content", ""))
-                for m in stable_prefix_messages
+        if history_messages:
+            section_messages.append(
+                ("recent_conversation_history", history_messages)
             )
+        if rag_context:
+            section_messages.append(
+                (
+                    "deterministic_rag_context",
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Relevant retrieved knowledge:\n"
+                                f"{rag_context}"
+                            ),
+                        }
+                    ],
+                )
+            )
+        if current_user_message is not None:
+            section_messages.append(
+                ("current_user_message", [current_user_message])
+            )
+
+        first_dynamic_section_name = next(
+            (
+                name
+                for name, messages in section_messages[3:]
+                if messages
+            ),
+            None,
         )
+        prompt_section_order = [
+            name for name, messages in section_messages if messages
+        ]
+        final_messages = [
+            message
+            for _, messages in section_messages
+            for message in messages
+        ]
+        dynamic_messages = final_messages[len(stable_prefix_messages):]
+
+        stable_prefix_text = "".join(
+            coerce_model_content_to_text(m.get("content", ""))
+            for m in stable_prefix_messages
+        )
+        stable_prefix_hash = sha256(
+            stable_prefix_text.encode("utf-8")
+        ).hexdigest()
+        stable_prefix_est_tokens = estimate_tokens(stable_prefix_text)
         rag_context_est_tokens = estimate_tokens(rag_context)
         recent_history_est_tokens = estimate_tokens(
             "".join(
@@ -3149,6 +3209,9 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "rag_context_est_tokens": rag_context_est_tokens,
         "recent_history_est_tokens": recent_history_est_tokens,
         "final_prompt_est_tokens": final_prompt_est_tokens,
+        "stable_prefix_hash": stable_prefix_hash,
+        "first_dynamic_section_name": first_dynamic_section_name,
+        "prompt_section_order": prompt_section_order,
         "rag_chunk_ids_or_stable_keys": rag_chunk_keys,
     }
 
