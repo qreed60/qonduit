@@ -900,6 +900,17 @@ PROJECTS_ROOT = env_str("PROJECTS_ROOT", "/opt/projects")
 PROJECT_ALIAS_TARGET_MODEL = env_str("PROJECT_ALIAS_TARGET_MODEL", "gpt-oss:20b")
 PROJECT_ALIAS_CACHE_TTL_SECONDS = max(env_int("PROJECT_ALIAS_CACHE_TTL_SECONDS", 60), 1)
 INGESTION_POLL_SECONDS = max(env_int("INGESTION_POLL_SECONDS", 2), 1)
+QONDUIT_MAX_RAG_CHUNKS = max(1, env_int("QONDUIT_MAX_RAG_CHUNKS", 4))
+QONDUIT_MAX_RAG_CHARS = max(1000, env_int("QONDUIT_MAX_RAG_CHARS", 6000))
+QONDUIT_MAX_RECENT_MESSAGES = max(1, env_int("QONDUIT_MAX_RECENT_MESSAGES", 8))
+QONDUIT_MAX_RECENT_MESSAGES_CODING = max(
+    QONDUIT_MAX_RECENT_MESSAGES,
+    env_int("QONDUIT_MAX_RECENT_MESSAGES_CODING", 16),
+)
+QONDUIT_TARGET_PROMPT_TOKENS = max(
+    1024,
+    env_int("QONDUIT_TARGET_PROMPT_TOKENS", 8192),
+)
 
 UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
@@ -2057,6 +2068,77 @@ def latest_user_text(messages: list[ChatMessage]) -> str:
     return ""
 
 
+def split_recent_history_and_current_user(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    last_user_index: int | None = None
+    for idx in range(len(messages) - 1, -1, -1):
+        if str(messages[idx].get("role", "")).lower() == "user":
+            last_user_index = idx
+            break
+    if last_user_index is None:
+        return list(messages), None
+    current_user = dict(messages[last_user_index])
+    history = [
+        dict(message)
+        for index, message in enumerate(messages)
+        if index != last_user_index
+    ]
+    return history, current_user
+
+
+def rag_stable_key(result: dict[str, Any]) -> str:
+    payload = result.get("payload")
+    if isinstance(payload, dict):
+        source = str(payload.get("source") or "").strip()
+        path = str(payload.get("path") or payload.get("file_path") or "").strip()
+        chunk_index = payload.get("chunk_index")
+        chunk_render = "" if chunk_index is None else str(chunk_index)
+    else:
+        source = ""
+        path = ""
+        chunk_render = ""
+    doc_id = str(result.get("id") or "").strip()
+    return "|".join([source, path, doc_id, chunk_render])
+
+
+def sort_rag_results_deterministically(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    def sort_key(item: dict[str, Any]) -> tuple[float, str]:
+        score = item.get("score")
+        numeric_score = float(score) if isinstance(score, (int, float)) else 0.0
+        return (-numeric_score, rag_stable_key(item))
+
+    return sorted(results, key=sort_key)
+
+
+def build_bounded_rag_chunks(
+    rag_results: list[dict[str, Any]],
+    max_chunks: int,
+    max_chars: int,
+) -> tuple[list[str], list[str]]:
+    selected_chunks: list[str] = []
+    selected_keys: list[str] = []
+    consumed_chars = 0
+    for result in rag_results:
+        text = str(result.get("text", "")).strip()
+        if not text:
+            continue
+        if len(selected_chunks) >= max_chunks:
+            break
+        remaining = max_chars - consumed_chars
+        if remaining <= 0:
+            break
+        bounded_text = text[:remaining].strip()
+        if not bounded_text:
+            continue
+        selected_chunks.append(bounded_text)
+        selected_keys.append(rag_stable_key(result))
+        consumed_chars += len(bounded_text)
+    return selected_chunks, selected_keys
+
+
 def approx_tokens_from_chars(total_chars: int) -> int:
     if total_chars <= 0:
         return 0
@@ -2807,10 +2889,15 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         context_size = resolve_context_size(req, state)
         mode = resolve_mode(req, request, project_id)
         system_prompt = system_prompt_for_mode(mode)
-        recent_window = 16 if mode == "coding" else 8
+        recent_window = (
+            QONDUIT_MAX_RECENT_MESSAGES_CODING
+            if mode == "coding"
+            else QONDUIT_MAX_RECENT_MESSAGES
+        )
 
         prior_recent = state.get("recent_messages", [])
         summary = state.get("summary", "")
+        stable_project_summary = str(state.get("project_summary", "")).strip()
 
     def build_message_dict(m: ChatMessage) -> dict[str, Any]:
         """Convert ChatMessage to OpenAI-style message dict, preserving tool fields."""
@@ -2931,23 +3018,111 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             project_id,
         )
 
+    rag_results = sort_rag_results_deterministically(rag_results)
+    rag_chunks, rag_chunk_keys = build_bounded_rag_chunks(
+        rag_results=rag_results,
+        max_chunks=QONDUIT_MAX_RAG_CHUNKS,
+        max_chars=QONDUIT_MAX_RAG_CHARS,
+    )
+    rag_context = "\n\n".join(rag_chunks)
+
     with perf.step("prompt_assembly"):
-        rag_context = "\n\n".join(rag_chunks)
-
-        final_messages = [
+        stable_prefix_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "system", "content": f"Rolling summary:\n{summary or '(none)'}"},
+            {
+                "role": "system",
+                "content": (
+                    "Mode and control instructions:\n"
+                    "Keep answers concise, deterministic, and actionable.\n"
+                    "Use available tools only when necessary."
+                ),
+            },
         ]
-
-        if rag_context:
-            final_messages.append(
+        if stable_project_summary:
+            stable_prefix_messages.append(
                 {
                     "role": "system",
-                    "content": (
-                        "Relevant retrieved knowledge:\n"
-                        f"{rag_context}"
-                    ),
+                    "content": f"Project summary:\n{stable_project_summary}",
                 }
+            )
+        if rag_context:
+            stable_prefix_messages.append(
+                {
+                    "role": "system",
+                    "content": f"Relevant retrieved knowledge:\n{rag_context}",
+                }
+            )
+
+        history_messages, current_user_message = split_recent_history_and_current_user(
+            trimmed_recent,
+        )
+        if summary.strip():
+            history_messages = [
+                {
+                    "role": "system",
+                    "content": f"Conversation summary:\n{summary.strip()}",
+                },
+                *history_messages,
+            ]
+
+        dynamic_messages = history_messages[-recent_window:]
+        if current_user_message is not None:
+            dynamic_messages.append(current_user_message)
+
+        final_messages = stable_prefix_messages + dynamic_messages
+
+        stable_prefix_est_tokens = estimate_tokens(
+            "".join(
+                coerce_model_content_to_text(m.get("content", ""))
+                for m in stable_prefix_messages
+            )
+        )
+        rag_context_est_tokens = estimate_tokens(rag_context)
+        recent_history_est_tokens = estimate_tokens(
+            "".join(
+                coerce_model_content_to_text(m.get("content", ""))
+                for m in history_messages
+            )
+        )
+        dynamic_prompt_est_tokens = estimate_tokens(
+            "".join(
+                coerce_model_content_to_text(m.get("content", ""))
+                for m in dynamic_messages
+            )
+        )
+
+        final_prompt_est_tokens = estimate_tokens(
+            "".join(
+                coerce_model_content_to_text(m.get("content", ""))
+                for m in final_messages
+            )
+        )
+
+        if final_prompt_est_tokens > QONDUIT_TARGET_PROMPT_TOKENS:
+            while (
+                current_user_message is not None
+                and len(dynamic_messages) > 1
+                and final_prompt_est_tokens > QONDUIT_TARGET_PROMPT_TOKENS
+            ):
+                dynamic_messages.pop(0)
+                final_messages = stable_prefix_messages + dynamic_messages
+                final_prompt_est_tokens = estimate_tokens(
+                    "".join(
+                        coerce_model_content_to_text(m.get("content", ""))
+                        for m in final_messages
+                    )
+                )
+            dynamic_prompt_est_tokens = estimate_tokens(
+                "".join(
+                    coerce_model_content_to_text(m.get("content", ""))
+                    for m in dynamic_messages
+                )
+            )
+            recent_history_est_tokens = estimate_tokens(
+                "".join(
+                    coerce_model_content_to_text(m.get("content", ""))
+                    for m in dynamic_messages[:-1]
+                )
             )
     logger.info(
         "chat_rag_injection conversation_id=%s project_id=%s injected=%s snippets=%s",
@@ -2956,8 +3131,6 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         bool(rag_context.strip()),
         len(rag_chunks),
     )
-
-    final_messages.extend(trimmed_recent)
 
     input_message_count = len(req.messages)
     input_chars = sum(
@@ -2970,6 +3143,14 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         for message in final_messages
     )
     approx_final_prompt_tokens = approx_tokens_from_chars(prompt_chars)
+    prompt_perf_fields = {
+        "stable_prefix_est_tokens": stable_prefix_est_tokens,
+        "dynamic_prompt_est_tokens": dynamic_prompt_est_tokens,
+        "rag_context_est_tokens": rag_context_est_tokens,
+        "recent_history_est_tokens": recent_history_est_tokens,
+        "final_prompt_est_tokens": final_prompt_est_tokens,
+        "rag_chunk_ids_or_stable_keys": rag_chunk_keys,
+    }
 
     state["summary"] = summary
     state["project_id"] = project_id
@@ -3219,6 +3400,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                     input_message_count=input_message_count,
                     approx_input_tokens=approx_input_tokens,
                     approx_final_prompt_tokens=approx_final_prompt_tokens,
+                    **prompt_perf_fields,
                     rag_chunk_count=len(rag_chunks),
                     qdrant_result_count=len(rag_results),
                     gateway_prepare_ms=round(gateway_prepare_ms, 3),
@@ -3646,6 +3828,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             input_message_count=input_message_count,
             approx_input_tokens=approx_input_tokens,
             approx_final_prompt_tokens=approx_final_prompt_tokens,
+            **prompt_perf_fields,
             rag_chunk_count=len(rag_chunks),
             qdrant_result_count=len(rag_results),
             gateway_pre_llama_ms=round(
@@ -3844,6 +4027,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 input_message_count=input_message_count,
                 approx_input_tokens=approx_input_tokens,
                 approx_final_prompt_tokens=approx_final_prompt_tokens,
+                **prompt_perf_fields,
                 rag_chunk_count=len(rag_chunks),
                 qdrant_result_count=len(rag_results),
                 gateway_pre_llama_ms=round(
@@ -3931,6 +4115,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             input_message_count=input_message_count,
             approx_input_tokens=approx_input_tokens,
             approx_final_prompt_tokens=approx_final_prompt_tokens,
+            **prompt_perf_fields,
             rag_chunk_count=len(rag_chunks),
             qdrant_result_count=len(rag_results),
             gateway_pre_llama_ms=round(
@@ -4040,6 +4225,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         input_message_count=input_message_count,
         approx_input_tokens=approx_input_tokens,
         approx_final_prompt_tokens=approx_final_prompt_tokens,
+        **prompt_perf_fields,
         rag_chunk_count=len(rag_chunks),
         qdrant_result_count=len(rag_results),
         gateway_pre_llama_ms=round(
