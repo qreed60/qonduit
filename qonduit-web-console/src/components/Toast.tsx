@@ -12,22 +12,39 @@ const Toast: React.FC<ToastProps> = ({ message, type = 'info', onClose }) => {
     return () => clearTimeout(timer);
   }, [onClose]);
 
-  const bgColor = {
-    error: 'bg-red-500',
-    success: 'bg-green-500',
-    info: 'bg-blue-500',
-  }[type];
+  const styles = {
+    error: {
+      bg: 'bg-[var(--status-error)]',
+      border: 'border-[var(--status-error)]/30',
+      icon: '❌',
+    },
+    success: {
+      bg: 'bg-[var(--status-success)]',
+      border: 'border-[var(--status-success)]/30',
+      icon: '✅',
+    },
+    info: {
+      bg: 'bg-[var(--status-info)]',
+      border: 'border-[var(--status-info)]/30',
+      icon: 'ℹ️',
+    },
+  };
+
+  const style = styles[type];
 
   return (
     <div
-      className={`fixed bottom-4 right-4 ${bgColor} text-white px-6 py-3 rounded-lg shadow-lg z-50 animate-fade-in-up`}
+      className={`fixed bottom-4 right-4 ${style.bg} text-white px-6 py-4 rounded-xl shadow-xl z-50 border ${style.border} animate-fade-in-up min-w-[300px]`}
       role="alert"
     >
       <div className="flex items-center justify-between w-full">
-        <span>{message}</span>
+        <div className="flex items-center space-x-3">
+          <span className="text-xl">{style.icon}</span>
+          <span className="font-medium">{message}</span>
+        </div>
         <button
           onClick={onClose}
-          className="ml-4 text-white hover:text-gray-200 focus:outline-none"
+          className="ml-4 hover:text-[var(--text-primary)]/70 focus:outline-none transition-colors"
         >
           <svg
             className="w-5 h-5"

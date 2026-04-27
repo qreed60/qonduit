@@ -11,16 +11,16 @@ import { Page, Settings } from './types';
 import { getSettings } from './services/api';
 
 function App() {
-  const [currentPage, setCurrentPage] = useState<Page>('models');
+  const [currentPage, setCurrentPage] = useState<Page>('chat');
   const [settings] = useState<Settings>(getSettings());
 
   return (
     <Router>
-      <div className="flex h-screen bg-gray-900 text-gray-200">
+      <div className="flex h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] transition-colors duration-300">
         <Sidebar currentPage={currentPage} onChangePage={setCurrentPage} />
-        <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
           <StatusBar settings={settings} />
-          <main className="flex-1 overflow-y-auto">
+          <main className="flex-1 overflow-y-auto bg-[var(--bg-primary)]">
             <Routes>
               <Route path="/" element={<ChatPage />} />
               <Route path="/chat" element={<ChatPage />} />
