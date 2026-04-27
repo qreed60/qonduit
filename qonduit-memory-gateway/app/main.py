@@ -3350,21 +3350,42 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                                     break
 
                                 stream_chunks += 1
-                                formatted = f"data: {data_line}\n\n"
+                                
+                                # Parse the chunk for internal processing and cleaning
+                                try:
+                                    parsed = json.loads(data_line)
+                                except json.JSONDecodeError:
+                                    # If parsing fails, yield as-is
+                                    formatted = f"data: {data_line}\n\n"
+                                    stream_bytes += len(
+                                        formatted.encode("utf-8", errors="ignore")
+                                    )
+                                    yield formatted
+                                    continue
+
+                                # Clean the chunk for OpenAI compatibility
+                                choices = parsed.get("choices", [])
+                                if choices and isinstance(choices, list):
+                                    delta = choices[0].get("delta", {})
+                                    if delta and isinstance(delta, dict):
+                                        # Remove null content fields
+                                        if delta.get("content") is None:
+                                            delta.pop("content", None)
+                                
+                                # Remove timings field from the top level
+                                parsed.pop("timings", None)
+                                
+                                # Convert back to JSON for the client
+                                cleaned_json = json.dumps(parsed, ensure_ascii=False)
+                                formatted = f"data: {cleaned_json}\n\n"
                                 stream_bytes += len(
                                     formatted.encode("utf-8", errors="ignore")
                                 )
                                 yield formatted
 
-                                try:
-                                    parsed = json.loads(data_line)
-                                except json.JSONDecodeError:
-                                    continue
-
+                                # Use the parsed data for internal processing
                                 if isinstance(parsed.get("usage"), dict):
                                     upstream_usage = parsed["usage"]
-                                if isinstance(parsed.get("timings"), dict):
-                                    upstream_timings = parsed["timings"]
 
                                 choices = parsed.get("choices", [])
                                 if not choices:
@@ -4015,6 +4036,48 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
                         emitted_chunks += 1
                         emitted_bytes += len(data_line.encode("utf-8", errors="ignore"))
+                        
+                        # Parse the chunk for internal processing and cleaning
+                        try:
+                            parsed = json.loads(data_line)
+                        except json.JSONDecodeError:
+                            # If parsing fails, yield as-is
+                            if llama_first_chunk_ms is None:
+                                first_chunk_seen_ns = time.perf_counter_ns()
+                                llama_first_chunk_ms = (
+                                    first_chunk_seen_ns - stream_start_ns
+                                ) / 1_000_000
+                                client_visible_ttft_ms = (
+                                    first_chunk_seen_ns - perf.start_ns
+                                ) / 1_000_000
+                                if stream_upstream_open_completed_ns is not None:
+                                    upstream_first_chunk_after_open_ms = (
+                                        first_chunk_seen_ns
+                                        - stream_upstream_open_completed_ns
+                                    ) / 1_000_000
+                                perf.mark(
+                                    "llama_first_chunk",
+                                    chunk_index=emitted_chunks,
+                                )
+                                perf.add_step_ms("llama_first_chunk", llama_first_chunk_ms)
+                            yield f"data: {data_line}\n\n"
+                            continue
+                        
+                        # Clean the chunk for OpenAI compatibility
+                        choices = parsed.get("choices", [])
+                        if choices and isinstance(choices, list):
+                            delta = choices[0].get("delta", {})
+                            if delta and isinstance(delta, dict):
+                                # Remove null content fields
+                                if delta.get("content") is None:
+                                    delta.pop("content", None)
+                        
+                        # Remove timings field from the top level
+                        parsed.pop("timings", None)
+                        
+                        # Convert back to JSON for the client
+                        cleaned_json = json.dumps(parsed, ensure_ascii=False)
+                        
                         if llama_first_chunk_ms is None:
                             first_chunk_seen_ns = time.perf_counter_ns()
                             llama_first_chunk_ms = (
@@ -4033,19 +4096,13 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                                 chunk_index=emitted_chunks,
                             )
                             perf.add_step_ms("llama_first_chunk", llama_first_chunk_ms)
-                        yield f"data: {data_line}\n\n"
+                        yield f"data: {cleaned_json}\n\n"
 
-                        try:
-                            parsed = json.loads(data_line)
-                        except json.JSONDecodeError:
-                            continue
-
+                        # Use the parsed data for internal processing
                         choices = parsed.get("choices", [])
                         if not choices:
                             if isinstance(parsed.get("usage"), dict):
                                 upstream_usage = parsed["usage"]
-                            if isinstance(parsed.get("timings"), dict):
-                                upstream_timings = parsed["timings"]
                             continue
 
                         delta = choices[0].get("delta", {})
@@ -4057,8 +4114,6 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                             assistant_parts.append(text_delta)
                         if isinstance(parsed.get("usage"), dict):
                             upstream_usage = parsed["usage"]
-                        if isinstance(parsed.get("timings"), dict):
-                            upstream_timings = parsed["timings"]
 
                     if not sent_done:
                         yield sse_chunk(req.model, finish_reason="stop")
