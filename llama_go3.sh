@@ -6,6 +6,8 @@ IMAGE_NAME="llama_cpp_cuda"
 MODEL_DIR="/mnt/models/llm"
 HOST_PORT="8080"
 DOCKER_NETWORK="qonduit-ai-net"
+BATCH_SIZE="8192"
+UBATCH_SIZE="2048"
 
 # NOTE:
 # This server may include a Quadro K620 display GPU.
@@ -128,10 +130,12 @@ sudo docker run -d \
   --model "$MODEL_PATH" \
   --n-gpu-layers -1 \
   --ctx-size "$CONTEXT_SIZE" \
+  --parallel 2 \
+  --batch-size "$BATCH_SIZE" \
+  --ubatch-size "$UBATCH_SIZE" \
   --tensor-split "$TENSOR_SPLIT" \
   --host 0.0.0.0 \
   --port "$HOST_PORT" \
-  --embeddings
 
 echo ""
 echo "✅ Server launch requested:"
