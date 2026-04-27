@@ -62,3 +62,7 @@ dmypy.json
 .DS_Store
 Thumbs.db
 ```
+# Qonduit web console local dependencies/build output
+qonduit-web-console/node_modules/
+qonduit-web-console/dist/
+qonduit-web-console/.vite/
