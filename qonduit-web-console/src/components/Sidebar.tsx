@@ -1,5 +1,6 @@
 import React from 'react';
 import { Page } from '../types';
+import { VERSION } from '../constants/version';
 
 interface SidebarProps {
   currentPage: Page;
@@ -56,7 +57,7 @@ const Sidebar: React.FC<SidebarProps> = ({ currentPage, onChangePage }) => {
       <div className="p-4 border-t border-[var(--border-subtle)]">
         <div className="flex items-center justify-between px-2 py-2 rounded-lg bg-[var(--bg-primary)]/50 border border-[var(--border-subtle)]/50">
           <span className="text-xs text-[var(--text-secondary)]">Version</span>
-          <span className="text-xs font-mono text-[var(--text-tertiary)]">v0.1.0</span>
+          <span className="text-xs font-mono text-[var(--text-tertiary)]">v{VERSION}</span>
         </div>
       </div>
     </aside>
