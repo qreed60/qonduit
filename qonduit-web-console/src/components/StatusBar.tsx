@@ -16,7 +16,7 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
   };
 
   const getStatusIcon = (status: 'success' | 'warning' | 'error') => {
-    const iconProps = "w-3.5 h-3.5 flex-shrink-0";
+    const iconProps = "w-2 h-2 flex-shrink-0";
     switch (status) {
       case 'success':
         return (
