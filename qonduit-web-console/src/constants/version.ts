@@ -1,2 +1,2 @@
 // Application version
-export const VERSION = '0.1.1';
+export const VERSION = '0.1.2';
