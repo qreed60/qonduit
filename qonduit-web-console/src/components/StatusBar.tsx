@@ -15,10 +15,34 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
     }
   };
 
+  const getStatusIcon = (status: 'success' | 'warning' | 'error') => {
+    const iconProps = "w-3.5 h-3.5 flex-shrink-0";
+    switch (status) {
+      case 'success':
+        return (
+          <svg className={iconProps} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+          </svg>
+        );
+      case 'warning':
+        return (
+          <svg className={iconProps} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        );
+      case 'error':
+        return (
+          <svg className={iconProps} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        );
+    }
+  };
+
   const statusColorMap = {
-    success: 'bg-[var(--status-success)]/10 text-[var(--status-success)] border-[var(--status-success)]/20',
-    warning: 'bg-[var(--status-warning)]/10 text-[var(--status-warning)] border-[var(--status-warning)]/20',
-    error: 'bg-[var(--status-error)]/10 text-[var(--status-error)] border-[var(--status-error)]/20',
+    success: 'border-[var(--status-success)]/30 text-[var(--status-success)]',
+    warning: 'border-[var(--status-warning)]/30 text-[var(--status-warning)]',
+    error: 'border-[var(--status-error)]/30 text-[var(--status-error)]',
   };
 
   return (
@@ -26,24 +50,27 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
       {/* Gateway Status */}
       <div className="flex items-center space-x-3">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Gateway</span>
-        <div className={`px-3 py-1.5 rounded-lg text-xs font-mono border ${statusColorMap[getStatusColor(settings.gatewayBaseUrl)]} transition-colors`}>
-          {settings.gatewayBaseUrl}
+        <div className={`px-2 py-1 rounded-lg text-xs font-mono border flex items-center space-x-2 ${statusColorMap[getStatusColor(settings.gatewayBaseUrl)]} transition-colors`}>
+          {getStatusIcon(getStatusColor(settings.gatewayBaseUrl))}
+          <span className="truncate max-w-[120px]">{settings.gatewayBaseUrl}</span>
         </div>
       </div>
 
       {/* Direct Status */}
       <div className="flex items-center space-x-3">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Direct</span>
-        <div className={`px-3 py-1.5 rounded-lg text-xs font-mono border ${statusColorMap[getStatusColor(settings.directBaseUrl)]} transition-colors`}>
-          {settings.directBaseUrl}
+        <div className={`px-2 py-1 rounded-lg text-xs font-mono border flex items-center space-x-2 ${statusColorMap[getStatusColor(settings.directBaseUrl)]} transition-colors`}>
+          {getStatusIcon(getStatusColor(settings.directBaseUrl))}
+          <span className="truncate max-w-[120px]">{settings.directBaseUrl}</span>
         </div>
       </div>
 
       {/* Router Status */}
       <div className="flex items-center space-x-3">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Router</span>
-        <div className={`px-3 py-1.5 rounded-lg text-xs font-mono border ${statusColorMap[getStatusColor(settings.routerBaseUrl)]} transition-colors`}>
-          {settings.routerBaseUrl}
+        <div className={`px-2 py-1 rounded-lg text-xs font-mono border flex items-center space-x-2 ${statusColorMap[getStatusColor(settings.routerBaseUrl)]} transition-colors`}>
+          {getStatusIcon(getStatusColor(settings.routerBaseUrl))}
+          <span className="truncate max-w-[120px]">{settings.routerBaseUrl}</span>
         </div>
       </div>
 
@@ -58,7 +85,7 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
       {/* Model Pill */}
       <div className="flex items-center space-x-3">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Model</span>
-        <div className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border-primary)] truncate max-w-[250px]">
+        <div className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border-primary)] truncate max-w-[200px]">
           {settings.defaultModel}
         </div>
       </div>
