@@ -3,7 +3,7 @@ import { Settings, ModelsResponse, Model } from '../types';
 const DEFAULT_SETTINGS: Settings = {
   gatewayBaseUrl: 'http://192.168.5.5:8090',
   directBaseUrl: 'http://192.168.5.5:8080',
-  routerBaseUrl: 'http://192.168.5.5:8090',
+  routerBaseUrl: 'http://192.168.5.5:5001',
   apiKey: 'local',
   defaultModel: 'Qwen3-Coder-Next-IQ4_NL.gguf',
   defaultProvider: 'Direct',
@@ -37,7 +37,7 @@ export async function fetchModels(baseUrl: string): Promise<Model[]> {
 
 export async function testConnection(url: string): Promise<boolean> {
   try {
-    const response = await fetch(url, { method: 'HEAD' });
+    const response = await fetch(`${url}/health`, { method: 'HEAD' });
     return response.ok;
   } catch {
     return false;

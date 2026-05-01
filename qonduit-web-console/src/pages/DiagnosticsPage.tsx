@@ -2,6 +2,16 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { testConnection, getSettings } from '../services/api';
 import StatusBar from '../components/StatusBar';
 
+// Test router health with the correct endpoint
+async function testRouterHealth(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${url}/api/v1/qonduit-router/health`, { method: 'HEAD' });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 const DiagnosticsPage: React.FC = () => {
   const settings = getSettings();
   const [connectionStatus, setConnectionStatus] = useState<{
@@ -34,7 +44,7 @@ const DiagnosticsPage: React.FC = () => {
     try {
       const gateway = await testConnection(settings.gatewayBaseUrl);
       const direct = await testConnection(settings.directBaseUrl);
-      const router = await testConnection(settings.routerBaseUrl);
+      const router = await testRouterHealth(settings.routerBaseUrl);
 
       // Update status with new results
       setConnectionStatus({ gateway, direct, router });
