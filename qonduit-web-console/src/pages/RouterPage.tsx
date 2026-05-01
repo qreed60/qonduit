@@ -23,7 +23,7 @@ const RouterPage: React.FC = () => {
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-semibold text-[var(--text-primary)]">Router Status</h3>
             <div className="flex items-center space-x-2">
-              <div style={{ width: '8px', height: '8px', backgroundColor: 'var(--status-success)', borderRadius: '50%' }} className="animate-pulse"></div>
+              <div style={{ width: '16px', height: '16px', backgroundColor: 'var(--status-success)', borderRadius: '50%' }} className="animate-pulse"></div>
               <span className="text-sm text-[var(--status-success)] font-medium">Active</span>
             </div>
           </div>
@@ -80,7 +80,7 @@ const RouterPage: React.FC = () => {
               disabled
               className="flex items-center justify-center space-x-3 px-6 py-3 bg-[var(--bg-secondary)]/50 border border-[var(--border-primary)] rounded-xl text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] disabled:cursor-not-allowed transition-colors"
             >
-              <svg style={{ width: '20px', height: '20px' }} className="text-[var(--accent-primary)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg style={{ width: '16px', height: '16px' }} className="text-[var(--accent-primary)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
@@ -90,7 +90,7 @@ const RouterPage: React.FC = () => {
               disabled
               className="flex items-center justify-center space-x-3 px-6 py-3 bg-[var(--bg-secondary)]/50 border border-[var(--border-primary)] rounded-xl text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] disabled:cursor-not-allowed transition-colors"
             >
-              <svg style={{ width: '20px', height: '20px' }} className="text-[var(--status-error)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg style={{ width: '16px', height: '16px' }} className="text-[var(--status-error)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
               </svg>

@@ -47,7 +47,7 @@ const Toast: React.FC<ToastProps> = ({ message, type = 'info', onClose }) => {
           className="ml-4 hover:text-[var(--text-primary)]/70 focus:outline-none transition-colors"
         >
           <svg
-            style={{ width: '20px', height: '20px' }}
+            style={{ width: '16px', height: '16px' }}
             fill="none"
             stroke="currentColor"
             viewBox="0 0 24 24"

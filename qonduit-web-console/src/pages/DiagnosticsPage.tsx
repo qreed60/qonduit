@@ -41,8 +41,8 @@ const DiagnosticsPage: React.FC = () => {
 
   const getStatusIcon = (status: boolean | null) => {
     const iconStyle: React.CSSProperties = {
-      width: '8px',
-      height: '8px',
+      width: '16px',
+      height: '16px',
       flexShrink: 0,
     };
     

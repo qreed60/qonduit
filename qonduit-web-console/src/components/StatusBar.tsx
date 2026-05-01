@@ -17,8 +17,8 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
 
   const getStatusIcon = (status: 'success' | 'warning' | 'error') => {
     const dotStyle: React.CSSProperties = {
-      width: '8px',
-      height: '8px',
+      width: '16px',
+      height: '16px',
       borderRadius: '50%',
       flexShrink: 0,
     };
