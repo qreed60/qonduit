@@ -826,10 +826,15 @@ async def startup() -> None:
     ensure_collection()
     await ingestion_manager.start()
     logger.info(
-        "gateway_startup llama_base=%s default_context_size=%s default_mode=%s "
-        "gateway_data_dir=%s default_project=%s",
+        "gateway_startup llama_base=%s effective_context_size=%s "
+        "default_max_tokens=%s allow_client_context_size=%s "
+        "allow_client_max_tokens=%s default_mode=%s gateway_data_dir=%s "
+        "default_project=%s",
         LLAMA_BASE,
-        DEFAULT_CONTEXT_SIZE,
+        EFFECTIVE_CONTEXT_SIZE,
+        DEFAULT_MAX_TOKENS,
+        ALLOW_CLIENT_CONTEXT_SIZE,
+        ALLOW_CLIENT_MAX_TOKENS,
         DEFAULT_MODE,
         GATEWAY_DATA_DIR,
         DEFAULT_PROJECT_NAMESPACE,
@@ -866,6 +871,24 @@ def env_int(name: str, default: int) -> int:
     return value
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(
+        "invalid_bool_env name=%s raw=%s fallback=%s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
 def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -881,8 +904,11 @@ def env_json(name: str, default: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
-LLAMA_BASE = env_str("LLAMA_BASE", "http://192.168.5.5:8080")
-DEFAULT_CONTEXT_SIZE = max(env_int("DEFAULT_CONTEXT_SIZE", 65536), 1024)
+LLAMA_BASE = env_str("LLAMA_BASE", "http://127.0.0.1:8080")
+EFFECTIVE_CONTEXT_SIZE = max(env_int("EFFECTIVE_CONTEXT_SIZE", 131072), 1024)
+DEFAULT_MAX_TOKENS = max(env_int("DEFAULT_MAX_TOKENS", 4096), 1)
+ALLOW_CLIENT_CONTEXT_SIZE = env_bool("ALLOW_CLIENT_CONTEXT_SIZE", False)
+ALLOW_CLIENT_MAX_TOKENS = env_bool("ALLOW_CLIENT_MAX_TOKENS", True)
 DEFAULT_MODE = env_str("DEFAULT_MODE", "chat")
 GATEWAY_DATA_DIR = env_str("GATEWAY_DATA_DIR", "/app/data")
 DEFAULT_PROJECT_NAMESPACE = env_str("DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID)
@@ -1011,7 +1037,7 @@ class GatewayChatRequest(BaseModel):
     messages: list[ChatMessage]
     model: str
     context_size: int | None = Field(default=None)
-    max_tokens: int = Field(default=2048)
+    max_tokens: int | None = Field(default=None)
     temperature: float = Field(default=0.7)
     stream: bool = False
     user: str | None = None
@@ -1407,14 +1433,9 @@ def resolve_conversation_id(req: GatewayChatRequest, request: Request) -> str:
 
 
 def resolve_context_size(req: GatewayChatRequest, state: dict[str, Any]) -> int:
-    if req.context_size is not None:
+    if ALLOW_CLIENT_CONTEXT_SIZE and req.context_size is not None:
         return max(int(req.context_size), 1024)
-
-    last_size = state.get("last_context_size")
-    if isinstance(last_size, int) and last_size >= 1024:
-        return last_size
-
-    return DEFAULT_CONTEXT_SIZE
+    return EFFECTIVE_CONTEXT_SIZE
 
 
 def sanitize_identifier(value: str | None, fallback: str) -> str:
@@ -2948,7 +2969,12 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     )
 
     budget = build_budget(context_size)
-    max_tokens = min(req.max_tokens, budget.reserved_output)
+    requested_max_tokens = (
+        req.max_tokens
+        if ALLOW_CLIENT_MAX_TOKENS and req.max_tokens is not None
+        else DEFAULT_MAX_TOKENS
+    )
+    max_tokens = min(max(int(requested_max_tokens), 1), budget.reserved_output)
 
     latest_text = latest_user_text(req.messages)
 
