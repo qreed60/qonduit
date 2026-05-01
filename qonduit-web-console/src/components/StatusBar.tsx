@@ -16,26 +16,20 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
   };
 
   const getStatusIcon = (status: 'success' | 'warning' | 'error') => {
-    const iconProps = "w-2 h-2 flex-shrink-0";
+    const dotStyle: React.CSSProperties = {
+      width: '8px',
+      height: '8px',
+      borderRadius: '50%',
+      flexShrink: 0,
+    };
+    
     switch (status) {
       case 'success':
-        return (
-          <svg className={iconProps} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
-          </svg>
-        );
+        return <div style={{ ...dotStyle, backgroundColor: 'var(--status-success)' }} />;
       case 'warning':
-        return (
-          <svg className={iconProps} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-        );
+        return <div style={{ ...dotStyle, backgroundColor: 'var(--status-warning)' }} />;
       case 'error':
-        return (
-          <svg className={iconProps} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        );
+        return <div style={{ ...dotStyle, backgroundColor: 'var(--status-error)' }} />;
     }
   };
 
