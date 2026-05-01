@@ -23,10 +23,13 @@ class DynamicBudget:
 def build_budget(context_size: int) -> DynamicBudget:
     hard_context = max(2048, int(context_size))
 
-    # Safer defaults for local 64k inference:
-    # keep generation room large and trim prompts earlier.
-    if hard_context >= 65536:
-        reserved_output = 4096
+    # Keep generation room large on high-context models.
+    if hard_context >= 131072:
+        reserved_output = 8192
+        safety_margin = 4096
+        prompt_target = 90000
+    elif hard_context >= 65536:
+        reserved_output = 6144
         safety_margin = 4096
         prompt_target = 46000
     elif hard_context >= 32768:
