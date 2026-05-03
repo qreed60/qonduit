@@ -1,15 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { getSettings } from '../services/api';
-import {
-  testEndpoint,
-  testRouterHealth,
-  testWebuiEndpoint,
-  getRouterStatus,
-  fetchRouterModels,
-  launchModel as apiLaunchModel,
-  stopModel as apiStopModel,
-} from '../services/api';
-import { Settings } from '../types';
+import { getSettings, fetchProviderModels, launchModel as apiLaunchModel, stopModel as apiStopModel, testEndpoint, testRouterHealth, testWebuiEndpoint, getRouterStatus } from '../services/api';
+import { Settings, ProviderType, SelectableModel, Model } from '../types';
 import { ENDPOINTS } from '../config/endpoints';
 import StatusBar from '../components/StatusBar';
 import Toast from '../components/Toast';
@@ -41,6 +32,8 @@ const DashboardPage: React.FC = () => {
     exists: boolean;
   } | null>(null);
   const [routerModels, setRouterModels] = useState<Array<{ name: string; path: string }>>([]);
+  const [providerModels, setProviderModels] = useState<SelectableModel[]>([]);
+  const [providerModelsError, setProviderModelsError] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState('');
   const [ctxSize, setCtxSize] = useState(4096);
   const [suggestedCtx, setSuggestedCtx] = useState<number | null>(null);
@@ -55,7 +48,7 @@ const DashboardPage: React.FC = () => {
   }, []);
 
   const fetchDashboardData = async () => {
-    // Fetch router status
+    // Fetch router status (always, for health card and logs)
     try {
       const status = await getRouterStatus();
       setRouterStatus({ running: status.running, exists: status.exists });
@@ -63,23 +56,66 @@ const DashboardPage: React.FC = () => {
       // Router might not be available
     }
 
-    // Fetch router models
+    // Fetch router models (for launch/stop when provider is Router)
     try {
-      const data = await fetchRouterModels();
-      setRouterModels(data.models || []);
-      if (data.suggested_ctx) {
-        setSuggestedCtx(data.suggested_ctx);
-        if (!selectedModel) {
-          setCtxSize(data.suggested_ctx);
+      const data = await fetchProviderModels('Router');
+      if (Array.isArray(data)) {
+        // Gateway/Direct returned Model[] — not expected here
+        setRouterModels([]);
+      } else {
+        setRouterModels(data.models || []);
+        if (data.suggested_ctx) {
+          setSuggestedCtx(data.suggested_ctx);
+          if (!selectedModel) {
+            setCtxSize(data.suggested_ctx);
+          }
         }
       }
-    } catch {
-      // Models might not be available
+    } catch (err) {
+      // Router models might not be available
     }
+
+    // Fetch provider models based on selected provider
+    await fetchProviderModelsList(settings.defaultProvider);
 
     // Test endpoint health
     await testAllEndpoints();
   };
+
+  const fetchProviderModelsList = async (provider: ProviderType) => {
+      setProviderModelsError(null);
+      try {
+        const data = await fetchProviderModels(provider);
+  
+        if (provider === 'Router') {
+          // Router returns { models, suggested_ctx }
+          if (Array.isArray(data)) {
+            // Unexpected: Router returned array instead of object
+            setProviderModels([]);
+          } else {
+            setProviderModels(data.models.map((m) => ({ name: m.name, path: m.path })));
+            if (data.suggested_ctx) {
+              setSuggestedCtx(data.suggested_ctx);
+            }
+          }
+        } else if (provider === 'WebUI') {
+          setProviderModels([]);
+        } else {
+          // Gateway/Direct return Model[]
+          const models = data as Model[];
+          setProviderModels(models.map((m) => ({ name: m.id })));
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to load models';
+        setProviderModelsError(`${provider} models unavailable: ${msg}`);
+        setProviderModels([]);
+      }
+    };
+
+  // Re-fetch provider models when provider changes
+  useEffect(() => {
+    fetchProviderModelsList(settings.defaultProvider);
+  }, [settings.defaultProvider]);
 
   const testAllEndpoints = async () => {
      setHealthLoading(true);
@@ -156,12 +192,18 @@ const DashboardPage: React.FC = () => {
 
   // Auto-select first model if none selected and models available
   useEffect(() => {
-    if (!selectedModel && routerModels.length > 0) {
-      setSelectedModel(routerModels[0].name);
+    if (!selectedModel && providerModels.length > 0) {
+      setSelectedModel(providerModels[0].name);
     }
-  }, [routerModels, selectedModel]);
+  }, [providerModels, selectedModel]);
 
   const mode = settings.endpointMode;
+
+  // Determine which models to show in ModelControlCard
+  // Router provider → router models (launch/stop enabled)
+  // Other providers → provider models (launch/stop disabled)
+  const isRouterProvider = settings.defaultProvider === 'Router';
+  const displayModels = isRouterProvider ? routerModels : providerModels;
 
   const comingSoonItems = [
      {
@@ -299,7 +341,7 @@ const DashboardPage: React.FC = () => {
         <div className="mb-6">
           <ModelControlCard
             routerStatus={routerStatus}
-            models={routerModels}
+            models={displayModels}
             selectedModel={selectedModel}
             ctxSize={ctxSize}
             suggestedCtx={suggestedCtx}
@@ -310,6 +352,8 @@ const DashboardPage: React.FC = () => {
             loading={actionLoading}
             actionStatus={actionStatus}
             actionMessage={actionMessage}
+            provider={settings.defaultProvider}
+            providerModelsError={providerModelsError}
           />
         </div>
 

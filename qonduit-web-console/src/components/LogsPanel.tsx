@@ -219,47 +219,66 @@ const LogsPanel: React.FC<LogsPanelProps> = ({ routerStatus }) => {
       )}
 
       {/* Logs Display */}
-      <div className={`px-4 pb-4 ${isExpanded ? 'pt-2' : ''}`}>
-        <div className={`bg-bg-terminal rounded-lg border border-border-subtle overflow-hidden ${containerHeight}`}>
-          <div className="h-full overflow-y-auto font-mono text-xs p-3">
-            {logs.length === 0 ? (
-              <div className="flex items-center justify-center h-full text-text-tertiary">
-                {error ? (
-                  <div className="text-center">
-                    <AlertCircle className="w-8 h-8 text-status-error mx-auto mb-2" />
-                    <p className="text-status-error mb-1">Connection Error</p>
-                    <p className="text-xs text-text-tertiary mb-3">{error}</p>
-                    {isRunning && (
-                      <button
-                        onClick={reconnect}
-                        className="px-3 py-1.5 rounded-lg text-xs font-medium border border-status-warning/30 text-status-warning hover:bg-status-warning/10 transition-all duration-200"
-                      >
-                        Reconnect
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  <div className="text-center">
-                    <Terminal className="w-8 h-8 text-text-tertiary/50 mx-auto mb-2" />
-                    <p className="text-text-tertiary text-sm">No logs yet</p>
-                    <p className="text-text-tertiary/60 text-xs mt-1">Start a model to see logs here</p>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="space-y-0.5">
-                {filteredLogs.map((log, idx) => (
-                  <div key={idx} className={`${getLogColor(log)} hover:bg-white/5 px-1 -mx-1 rounded transition-colors`}>
-                    <span className="text-text-tertiary/40 select-none mr-3">{String(idx + 1).padStart(4, ' ')}</span>
-                    {log}
-                  </div>
-                ))}
-                <div ref={logsEndRef} />
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
+       <div className={`px-4 pb-4 ${isExpanded ? 'pt-2' : ''}`}>
+         <div className={`bg-bg-terminal rounded-lg border border-border-subtle overflow-hidden ${containerHeight}`}>
+           <div className="h-full overflow-y-auto font-mono text-xs p-3">
+             {logs.length === 0 ? (
+               <div className="flex items-center justify-center h-full text-text-tertiary">
+                 {error ? (
+                   <div className="text-center">
+                     <AlertCircle className="w-8 h-8 text-status-error mx-auto mb-2" />
+                     <p className="text-status-error mb-1">Connection Error</p>
+                     <p className="text-xs text-text-tertiary mb-3">{error}</p>
+                     {isRunning && (
+                       <button
+                         onClick={reconnect}
+                         className="px-3 py-1.5 rounded-lg text-xs font-medium border border-status-warning/30 text-status-warning hover:bg-status-warning/10 transition-all duration-200"
+                       >
+                         Reconnect
+                       </button>
+                     )}
+                   </div>
+                 ) : !routerStatus ? (
+                   <div className="text-center">
+                     <Terminal className="w-8 h-8 text-text-tertiary/50 mx-auto mb-2" />
+                     <p className="text-text-tertiary text-sm">Router not available</p>
+                     <p className="text-text-tertiary/60 text-xs mt-1">Check that the Router service is running</p>
+                   </div>
+                 ) : isRunning ? (
+                   <div className="text-center">
+                     <Terminal className="w-8 h-8 text-text-tertiary/50 mx-auto mb-2" />
+                     <p className="text-text-tertiary text-sm">Waiting for logs...</p>
+                     <p className="text-text-tertiary/60 text-xs mt-1">Logs will appear once the model starts</p>
+                   </div>
+                 ) : (
+                   <div className="text-center">
+                     <Terminal className="w-8 h-8 text-text-tertiary/50 mx-auto mb-2" />
+                     <p className="text-text-tertiary text-sm">No logs yet</p>
+                     <p className="text-text-tertiary/60 text-xs mt-1">Launch a model to see logs here</p>
+                     <button
+                       onClick={startStreaming}
+                       className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-accent-primary/10 text-accent-primary border border-accent-primary/20 hover:bg-accent-primary/20 transition-colors"
+                     >
+                       <Play className="w-3 h-3" />
+                       Start Streaming
+                     </button>
+                   </div>
+                 )}
+               </div>
+             ) : (
+               <div className="space-y-0.5">
+                 {filteredLogs.map((log, idx) => (
+                   <div key={idx} className={`${getLogColor(log)} hover:bg-white/5 px-1 -mx-1 rounded transition-colors`}>
+                     <span className="text-text-tertiary/40 select-none mr-3">{String(idx + 1).padStart(4, ' ')}</span>
+                     {log}
+                   </div>
+                 ))}
+                 <div ref={logsEndRef} />
+               </div>
+             )}
+           </div>
+         </div>
+       </div>
     </div>
   );
 };

@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Model } from '../types';
-import { fetchGatewayModels, fetchDirectModels } from '../services/api';
+import { fetchGatewayModels, fetchDirectModels, fetchRouterModels } from '../services/api';
 import Toast from '../components/Toast';
 import {
   RefreshCw,
@@ -10,10 +9,20 @@ import {
   Zap,
   AlertCircle,
   Server,
+  Router,
 } from 'lucide-react';
 
+interface ModelCardData {
+  id: string;
+  name: string;
+  provider: 'Gateway' | 'Direct' | 'Router';
+  created?: number;
+  owned_by?: string;
+  path?: string;
+}
+
 const ModelsPage: React.FC = () => {
-  const [models, setModels] = useState<Model[]>([]);
+  const [models, setModels] = useState<ModelCardData[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -28,33 +37,64 @@ const ModelsPage: React.FC = () => {
     setError(null);
     setModels([]);
 
+    const allModels: ModelCardData[] = [];
+    let hasAnyModels = false;
+
+    // Fetch from gateway
     try {
-      const allModels: Model[] = [];
+      const gatewayModels = await fetchGatewayModels();
+      gatewayModels.forEach((m) => {
+        allModels.push({
+          id: `gateway:${m.id}`,
+          name: m.id,
+          provider: 'Gateway',
+          created: m.created,
+          owned_by: m.owned_by,
+        });
+        hasAnyModels = true;
+      });
+    } catch (err) {
+      console.log('Gateway models unavailable:', err);
+    }
 
-      // Fetch from gateway
-      try {
-        const gatewayModels = await fetchGatewayModels();
-        allModels.push(...gatewayModels.map((m) => ({ ...m, id: `gateway:${m.id}` })));
-      } catch (err) {
-        console.log('Gateway models unavailable:', err);
-      }
+    // Fetch from direct
+    try {
+      const directModels = await fetchDirectModels();
+      directModels.forEach((m) => {
+        allModels.push({
+          id: `direct:${m.id}`,
+          name: m.id,
+          provider: 'Direct',
+          created: m.created,
+          owned_by: m.owned_by,
+        });
+        hasAnyModels = true;
+      });
+    } catch (err) {
+      console.log('Direct models unavailable:', err);
+    }
 
-      // Fetch from direct
-      try {
-        const directModels = await fetchDirectModels();
-        allModels.push(...directModels.map((m) => ({ ...m, id: `direct:${m.id}` })));
-      } catch (err) {
-        console.log('Direct models unavailable:', err);
-      }
-
-      setModels(allModels);
-      if (allModels.length === 0) {
-        setError('No models found from either gateway or direct endpoint');
+    // Fetch from router
+    try {
+      const routerData = await fetchRouterModels();
+      if (routerData.models) {
+        routerData.models.forEach((m) => {
+          allModels.push({
+            id: `router:${m.name}`,
+            name: m.name,
+            provider: 'Router',
+            path: m.path,
+          });
+          hasAnyModels = true;
+        });
       }
     } catch (err) {
-      setError('Failed to load models. Check your network connection.');
-    } finally {
-      setLoading(false);
+      console.log('Router models unavailable:', err);
+    }
+
+    setModels(allModels);
+    if (!hasAnyModels && allModels.length === 0) {
+      setError('No models found from any endpoint (Gateway, Direct, or Router)');
     }
   };
 
@@ -66,18 +106,30 @@ const ModelsPage: React.FC = () => {
     } catch { /* ignore */ }
   };
 
-  const getProvider = (id: string) => {
-    return id.startsWith('gateway:') ? 'Gateway' : 'Direct';
-  };
-
   const getProviderColor = (provider: string) => {
-    return provider === 'Gateway'
-      ? 'bg-accent-primary/10 text-accent-primary'
-      : 'bg-accent-secondary/10 text-accent-secondary';
+    switch (provider) {
+      case 'Gateway':
+        return 'bg-accent-primary/10 text-accent-primary';
+      case 'Direct':
+        return 'bg-accent-secondary/10 text-accent-secondary';
+      case 'Router':
+        return 'bg-accent-tertiary/10 text-accent-tertiary';
+      default:
+        return 'bg-bg-tertiary text-text-tertiary';
+    }
   };
 
   const getProviderIcon = (provider: string) => {
-    return provider === 'Gateway' ? <Globe className="w-3.5 h-3.5" /> : <Zap className="w-3.5 h-3.5" />;
+    switch (provider) {
+      case 'Gateway':
+        return <Globe className="w-3.5 h-3.5" />;
+      case 'Direct':
+        return <Zap className="w-3.5 h-3.5" />;
+      case 'Router':
+        return <Router className="w-3.5 h-3.5" />;
+      default:
+        return <Server className="w-3.5 h-3.5" />;
+    }
   };
 
   return (
@@ -89,7 +141,7 @@ const ModelsPage: React.FC = () => {
             Available Models
           </h2>
           <p className="text-sm text-text-secondary mt-0.5">
-            Models from Gateway and Direct endpoints
+            Models from Gateway, Direct, and Router endpoints
           </p>
         </div>
         <button
@@ -139,8 +191,7 @@ const ModelsPage: React.FC = () => {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {models.map((model) => {
-              const provider = getProvider(model.id);
-              const cleanId = model.id.replace(/^gateway:|^direct:/, '');
+              const cleanId = model.id.replace(/^gateway:|^direct:|^router:/, '');
               return (
                 <div
                   key={model.id}
@@ -148,13 +199,15 @@ const ModelsPage: React.FC = () => {
                 >
                   <div className="flex items-start justify-between mb-3">
                     <div className="flex items-center gap-2">
-                      <div className={`px-2 py-0.5 rounded text-xs font-medium flex items-center gap-1 ${getProviderColor(provider)}`}>
-                        {getProviderIcon(provider)}
-                        {provider}
+                      <div className={`px-2 py-0.5 rounded text-xs font-medium flex items-center gap-1 ${getProviderColor(model.provider)}`}>
+                        {getProviderIcon(model.provider)}
+                        {model.provider}
                       </div>
-                      <span className="text-[10px] text-text-tertiary">
-                        {new Date(model.created * 1000).toLocaleDateString()}
-                      </span>
+                      {model.created && (
+                        <span className="text-[10px] text-text-tertiary">
+                          {new Date(model.created * 1000).toLocaleDateString()}
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -162,13 +215,18 @@ const ModelsPage: React.FC = () => {
                     <p className="text-xs font-mono text-text-primary truncate" title={cleanId}>
                       {cleanId}
                     </p>
+                    {model.path && (
+                      <p className="text-[10px] font-mono text-text-tertiary truncate mt-1" title={model.path}>
+                        {model.path}
+                      </p>
+                    )}
                   </div>
 
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3 text-xs text-text-tertiary">
-                      <span>{model.object}</span>
+                      <span>{model.provider === 'Router' ? 'GGUF' : model.owned_by || model.id}</span>
                       <span>·</span>
-                      <span>{model.owned_by}</span>
+                      <span>{model.provider === 'Router' ? 'Launchable' : model.id.startsWith('gateway') ? 'Gateway' : 'Direct'}</span>
                     </div>
                     <button
                       onClick={() => handleCopyId(model.id)}

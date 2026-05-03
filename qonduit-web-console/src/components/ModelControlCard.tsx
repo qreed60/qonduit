@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useState } from 'react';
 import StatusBadge from './StatusBadge';
+import { ProviderType, SelectableModel } from '../types';
 import {
   Play,
   Square,
@@ -11,7 +12,7 @@ import {
 
 interface ModelControlCardProps {
   routerStatus: { running: boolean; exists: boolean } | null;
-  models: Array<{ name: string; path: string }>;
+  models: SelectableModel[];
   selectedModel: string;
   ctxSize: number;
   suggestedCtx: number | null;
@@ -22,9 +23,19 @@ interface ModelControlCardProps {
   loading: boolean;
   actionStatus: 'idle' | 'launching' | 'stopping' | 'success' | 'error';
   actionMessage: string;
+  /** Which provider is currently selected */
+  provider?: ProviderType;
+  /** Error message from provider model loading */
+  providerModelsError?: string | null;
 }
 
-const PRESET_CTX = [512, 2048, 4096, 8192];
+/**
+ * Context size presets supporting up to 262k context models.
+ */
+const PRESET_CTX = [4096, 8192, 16384, 32768, 65536, 131072, 262144];
+const SLIDER_MIN = 512;
+const SLIDER_MAX = 262144;
+const SLIDER_STEP = 512;
 
 const ModelControlCard: React.FC<ModelControlCardProps> = ({
   routerStatus,
@@ -39,19 +50,45 @@ const ModelControlCard: React.FC<ModelControlCardProps> = ({
   loading,
   actionStatus,
   actionMessage,
+  provider = 'Router',
+  providerModelsError,
 }) => {
+  const isRouterProvider = provider === 'Router';
   const isRunning = routerStatus?.running;
-  const canLaunch = !isRunning && !loading && models.length > 0 && !!selectedModel;
-  const canStop = isRunning && !loading;
+  // Launch/stop only works for Router provider
+  const canLaunch = isRouterProvider && !isRunning && !loading && models.length > 0 && !!selectedModel;
+  const canStop = isRouterProvider && isRunning && !loading;
+
+  const [customCtxInput, setCustomCtxInput] = useState('');
 
   const handlePresetClick = (ctx: number) => {
     onCtxChange(ctx);
+    setCustomCtxInput('');
+  };
+
+  const handleCustomCtxChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setCustomCtxInput(e.target.value);
+  };
+
+  const handleCustomCtxSubmit = () => {
+    const val = parseInt(customCtxInput, 10);
+    if (!isNaN(val) && val >= SLIDER_MIN && val <= SLIDER_MAX && val % SLIDER_STEP === 0) {
+      onCtxChange(val);
+      setCustomCtxInput('');
+    }
+  };
+
+  const handleCustomCtxKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      handleCustomCtxSubmit();
+    }
   };
 
   const isPreset = PRESET_CTX.includes(ctxSize);
 
   // Determine why launch might be disabled
   const launchDisabledReason = () => {
+    if (!isRouterProvider) return 'Launch/stop is only available for Router provider';
     if (!routerStatus) return 'Router not available';
     if (isRunning) return 'Model is already running';
     if (loading) return 'Action in progress';
@@ -65,14 +102,22 @@ const ModelControlCard: React.FC<ModelControlCardProps> = ({
       {/* Header */}
       <div className="flex items-center justify-between mb-5">
         <div>
-          <h3 className="text-base font-semibold text-text-primary">Model Control</h3>
+          <h3 className="text-base font-semibold text-text-primary">
+            {isRouterProvider ? 'Router Model Control' : `${provider} Model Selection`}
+          </h3>
           <p className="text-xs text-text-secondary mt-0.5">
-            {isRunning ? 'Model is currently running' : models.length > 0 ? 'Select and launch a model' : 'No models available'}
+            {isRouterProvider
+              ? (isRunning ? 'Model is currently running' : models.length > 0 ? 'Select and launch a model' : 'No models available')
+              : (models.length > 0 ? `${models.length} model(s) available` : 'No models available')
+            }
           </p>
         </div>
         <StatusBadge
-          status={isRunning ? 'online' : !routerStatus ? 'unknown' : 'offline'}
-          label={isRunning ? 'Running' : !routerStatus ? 'Checking...' : 'Stopped'}
+          status={isRouterProvider ? (isRunning ? 'online' : !routerStatus ? 'unknown' : 'offline') : (models.length > 0 ? 'online' : 'offline')}
+          label={isRouterProvider
+            ? (isRunning ? 'Running' : !routerStatus ? 'Checking...' : 'Stopped')
+            : (models.length > 0 ? 'Available' : 'Unavailable')
+          }
         />
       </div>
 
@@ -84,20 +129,20 @@ const ModelControlCard: React.FC<ModelControlCardProps> = ({
         <select
           value={selectedModel}
           onChange={(e) => onSelectModel(e.target.value)}
-          disabled={loading || isRunning}
+          disabled={loading || isRunning || !isRouterProvider}
           className="w-full px-4 py-2.5 bg-bg-secondary border border-border-primary rounded-lg text-text-primary text-sm focus:outline-none focus:border-accent-primary/50 focus:ring-1 focus:ring-accent-primary/50 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
         >
           <option value="">Choose a model...</option>
           {models.map((m) => (
             <option key={m.name} value={m.name}>
-              {m.name}
+              {m.name}{m.path ? ` (${m.path.split('/').pop()})` : ''}
             </option>
           ))}
         </select>
         {models.length === 0 && !loading && (
           <p className="text-xs text-text-tertiary mt-1.5 flex items-center gap-1">
             <AlertCircle className="w-3 h-3" />
-            Router API unavailable — check connection
+            {providerModelsError || (isRouterProvider ? 'Router API unavailable — check connection' : `${provider} models unavailable`)}
           </p>
         )}
       </div>
@@ -108,7 +153,7 @@ const ModelControlCard: React.FC<ModelControlCardProps> = ({
           <label className="block text-xs font-medium text-text-secondary">
             Context Size
           </label>
-          <span className="text-xs font-mono text-accent-primary font-semibold">{ctxSize}</span>
+          <span className="text-xs font-mono text-accent-primary font-semibold">{ctxSize.toLocaleString()}</span>
         </div>
 
         {/* Preset Buttons */}
@@ -129,13 +174,36 @@ const ModelControlCard: React.FC<ModelControlCardProps> = ({
           ))}
         </div>
 
+        {/* Custom Input */}
+        <div className="flex gap-2 mb-2">
+          <input
+            type="number"
+            min={SLIDER_MIN}
+            max={SLIDER_MAX}
+            step={SLIDER_STEP}
+            value={customCtxInput}
+            onChange={handleCustomCtxChange}
+            onKeyDown={handleCustomCtxKeyDown}
+            placeholder="Custom (multiple of 512)"
+            disabled={loading || isRunning}
+            className="flex-1 px-3 py-1.5 bg-bg-secondary border border-border-primary rounded-md text-xs text-text-primary focus:outline-none focus:border-accent-primary/50 disabled:opacity-50 disabled:cursor-not-allowed"
+          />
+          <button
+            onClick={handleCustomCtxSubmit}
+            disabled={loading || isRunning || !customCtxInput}
+            className="px-3 py-1.5 bg-bg-secondary border border-border-primary rounded-md text-xs font-medium text-text-secondary hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
+          >
+            Apply
+          </button>
+        </div>
+
         {/* Slider */}
         <div className="relative">
           <input
             type="range"
-            min="512"
-            max="8192"
-            step="512"
+            min={String(SLIDER_MIN)}
+            max={String(SLIDER_MAX)}
+            step={String(SLIDER_STEP)}
             value={ctxSize}
             onChange={(e) => onCtxChange(Number(e.target.value))}
             disabled={loading || isRunning}
@@ -237,7 +305,7 @@ const ModelControlCard: React.FC<ModelControlCardProps> = ({
           <Cpu className="w-4 h-4 text-status-success flex-shrink-0" />
           <div className="min-w-0 flex-1">
             <p className="text-xs font-medium text-status-success">Model Running</p>
-            <p className="text-[10px] text-text-tertiary truncate">{selectedModel} · ctx: {ctxSize}</p>
+            <p className="text-[10px] text-text-tertiary truncate">{selectedModel} · ctx: {ctxSize.toLocaleString()}</p>
           </div>
         </div>
       )}

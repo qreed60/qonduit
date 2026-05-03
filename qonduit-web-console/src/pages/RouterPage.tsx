@@ -7,6 +7,7 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
+  ExternalLink,
 } from 'lucide-react';
 
 const RouterPage: React.FC = () => {
@@ -50,7 +51,7 @@ const RouterPage: React.FC = () => {
           Router
         </h2>
         <p className="text-sm text-text-secondary mt-1">
-          Model routing and request optimization
+          Launch and manage local GGUF models via the Qonduit Router
         </p>
       </div>
 
@@ -93,7 +94,15 @@ const RouterPage: React.FC = () => {
 
         {/* Model Info */}
         <div className="bg-bg-card rounded-xl border border-border-primary p-5">
-          <h3 className="text-sm font-semibold text-text-primary mb-4">Loaded Models</h3>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-sm font-semibold text-text-primary">Launchable Models</h3>
+            {routerStatus?.running && (
+              <span className="flex items-center gap-1 text-[10px] font-medium text-status-success bg-status-success/10 px-2 py-0.5 rounded-full">
+                <Cpu className="w-3 h-3" />
+                Model Active
+              </span>
+            )}
+          </div>
           {loading ? (
             <div className="flex items-center justify-center py-8">
               <Loader2 className="w-6 h-6 text-text-tertiary animate-spin" />
@@ -116,6 +125,12 @@ const RouterPage: React.FC = () => {
                         ctx: {suggestedCtx}
                       </span>
                     )}
+                    {routerStatus?.running && (
+                      <span className="flex items-center gap-1 text-[10px] text-status-success bg-status-success/10 px-2 py-0.5 rounded-full">
+                        <CheckCircle2 className="w-3 h-3" />
+                        Running
+                      </span>
+                    )}
                   </div>
                 </div>
               ))}
@@ -123,9 +138,32 @@ const RouterPage: React.FC = () => {
           ) : (
             <div className="text-center py-8">
               <p className="text-text-tertiary text-sm">No models available</p>
-              <p className="text-text-tertiary/60 text-xs mt-1">Launch a model from the Dashboard</p>
+              <p className="text-text-tertiary/60 text-xs mt-1">Add GGUF files to the Router's model directory</p>
             </div>
           )}
+        </div>
+
+        {/* Launch Instructions */}
+        <div className="bg-bg-card rounded-xl border border-border-primary p-5">
+          <h3 className="text-sm font-semibold text-text-primary mb-3">How to Launch a Model</h3>
+          <div className="space-y-2">
+            <p className="text-xs text-text-secondary leading-relaxed">
+              Router models are local GGUF files that can be launched and stopped via the Router API.
+              They are separate from Gateway and Direct models which are used for chat inference.
+            </p>
+            <ol className="text-xs text-text-secondary space-y-1.5 list-decimal list-inside">
+              <li>Go to the <span className="text-accent-primary font-medium">Dashboard</span></li>
+              <li>Set <span className="text-accent-primary font-medium">Default Provider</span> to "Router" in Settings</li>
+              <li>Select a model from the dropdown and click <span className="text-accent-primary font-medium">Launch Model</span></li>
+            </ol>
+            <a
+              href="#/dashboard"
+              className="inline-flex items-center gap-1.5 mt-3 px-3 py-1.5 bg-accent-primary/10 text-accent-primary border border-accent-primary/20 rounded-lg text-xs font-medium hover:bg-accent-primary/20 transition-colors"
+            >
+              <ExternalLink className="w-3 h-3" />
+              Go to Dashboard
+            </a>
+          </div>
         </div>
 
         {/* Info */}
@@ -134,7 +172,8 @@ const RouterPage: React.FC = () => {
           <p className="text-xs text-text-secondary leading-relaxed">
             The Qonduit Router manages model lifecycle, handles intelligent request routing,
             and provides a unified API for chat completions. It runs as a containerized service
-            on your local network.
+            on your local network. Router models are GGUF files that are launched/stopped via the
+            Flask API, while Gateway and Direct models are used for inference through their respective endpoints.
           </p>
         </div>
       </div>

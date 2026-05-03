@@ -1,4 +1,4 @@
-import { Settings, ModelsResponse, Model } from '../types';
+import { Settings, ModelsResponse, Model, ProviderType, ChatMessage } from '../types';
 import { getMode, apiPath } from '../config/endpoints';
 
 const DEFAULT_SETTINGS: Settings = {
@@ -46,6 +46,8 @@ export function saveSettings(settings: Settings): void {
   localStorage.setItem('qonduit-settings', JSON.stringify(settings));
 }
 
+// ── Internal helpers (kept for backward compatibility) ──────────────────────
+
 /**
  * Fetch models from the Memory Gateway (OpenAI-compatible /v1/models).
  */
@@ -69,6 +71,90 @@ export async function fetchDirectModels(): Promise<Model[]> {
   const data: ModelsResponse = await response.json();
   return data.data;
 }
+
+/**
+ * Fetch the list of GGUF models from the Flask router API.
+ * Returns raw shape — not a standard OpenAI /v1/models response.
+ */
+export async function fetchRouterModels(): Promise<{ models: Array<{ name: string; path: string }>; suggested_ctx: number }> {
+  const response = await fetch(apiPath('router', '/api/v1/qonduit-router/models'));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const data = await response.json();
+  return { models: data.models ?? [], suggested_ctx: data.suggested_ctx ?? 8192 };
+}
+
+// ── Unified provider model fetcher ──────────────────────────────────────────
+
+/**
+ * Router models response shape — different from OpenAI /v1/models.
+ */
+export interface RouterModelsResponse {
+  models: Array<{ name: string; path: string }>;
+  suggested_ctx: number;
+}
+
+/**
+ * Fetch models from the correct endpoint based on the provider type.
+ *
+ * | Provider | Endpoint                              | Response shape       |
+ * |----------|---------------------------------------|----------------------|
+ * | Gateway  | gatewayBase + /v1/models              | OpenAI ModelsResponse|
+ * | Router   | routerBase + /api/v1/qonduit-router/models | RouterModelsResponse |
+ * | Direct   | llamaBase + /v1/models                | OpenAI ModelsResponse|
+ * | WebUI    | N/A — external link only              | Empty array          |
+ */
+export async function fetchProviderModels(provider: ProviderType): Promise<Model[] | RouterModelsResponse> {
+  switch (provider) {
+    case 'Gateway':
+      return fetchGatewayModels();
+    case 'Direct':
+      return fetchDirectModels();
+    case 'Router':
+      return fetchRouterModels();
+    case 'WebUI':
+      return { models: [], suggested_ctx: 8192 };
+    default:
+      return { models: [], suggested_ctx: 8192 };
+  }
+}
+
+// ── Chat completions ────────────────────────────────────────────────────────
+
+/**
+ * Send a chat request to the Gateway's /v1/chat/completions endpoint.
+ *
+ * @param model   — Model ID to use for completion
+ * @param messages — Array of chat messages
+ * @param ctxSize — Context size (optional, defaults to 8192)
+ */
+export async function fetchChatCompletions(
+  model: string,
+  messages: ChatMessage[],
+  ctxSize: number = 8192,
+): Promise<{ choices: Array<{ message: ChatMessage; finish_reason: string | null }> }> {
+  const response = await fetch(apiPath('gateway', '/v1/chat/completions'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.7,
+      max_tokens: 4096,
+      stream: false,
+      // Pass context size if the backend supports it
+      ...(ctxSize !== 8192 && { context_size: ctxSize }),
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`HTTP ${response.status}: ${body}`);
+  }
+  return response.json();
+}
+
+// ── Health checks ───────────────────────────────────────────────────────────
 
 /**
  * Test whether an endpoint is reachable by hitting its /health path.
@@ -106,16 +192,7 @@ export async function testRouterHealth(): Promise<boolean> {
   }
 }
 
-/**
- * Fetch the list of GGUF models from the Flask router API.
- */
-export async function fetchRouterModels(): Promise<{ models: Array<{ name: string; path: string }>; suggested_ctx: number }> {
-  const response = await fetch(apiPath('router', '/api/v1/qonduit-router/models'));
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  return response.json();
-}
+// ── Router control ──────────────────────────────────────────────────────────
 
 /**
  * Launch a model via the Flask router API.
@@ -179,6 +256,8 @@ export async function llamaReady(): Promise<boolean> {
     return false;
   }
 }
+
+// ── Logs streaming ──────────────────────────────────────────────────────────
 
 /**
  * Stream logs from the router API (SSE via fetch ReadableStream).
