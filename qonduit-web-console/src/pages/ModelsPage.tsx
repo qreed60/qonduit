@@ -1,10 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Model, Settings } from '../types';
-import { fetchModels, getSettings } from '../services/api';
+import { Model } from '../types';
+import { fetchGatewayModels, fetchDirectModels } from '../services/api';
 import Toast from '../components/Toast';
 
 const ModelsPage: React.FC = () => {
-  const [settings] = useState<Settings>(getSettings());
   const [models, setModels] = useState<Model[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -12,7 +11,7 @@ const ModelsPage: React.FC = () => {
 
   useEffect(() => {
     loadModels();
-  }, [settings]);
+  }, []);
 
   const loadModels = async () => {
     setLoading(true);
@@ -24,7 +23,7 @@ const ModelsPage: React.FC = () => {
 
       // Fetch from gateway
       try {
-        const gatewayModels = await fetchModels(settings.gatewayBaseUrl);
+        const gatewayModels = await fetchGatewayModels();
         allModels.push(...gatewayModels.map((m) => ({ ...m, id: `gateway:${m.id}` })));
       } catch (err) {
         console.log('Gateway models unavailable:', err);
@@ -32,7 +31,7 @@ const ModelsPage: React.FC = () => {
 
       // Fetch from direct
       try {
-        const directModels = await fetchModels(settings.directBaseUrl);
+        const directModels = await fetchDirectModels();
         allModels.push(...directModels.map((m) => ({ ...m, id: `direct:${m.id}` })));
       } catch (err) {
         console.log('Direct models unavailable:', err);

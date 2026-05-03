@@ -1,10 +1,10 @@
+export type EndpointMode = 'local' | 'public';
+
 export interface Settings {
-  gatewayBaseUrl: string;
-  directBaseUrl: string;
-  routerBaseUrl: string;
   apiKey: string;
   defaultModel: string;
   defaultProvider: 'Direct' | 'Gateway';
+  endpointMode: EndpointMode;
 }
 
 export interface Model {
@@ -25,4 +25,4 @@ export interface ApiError {
   code?: number;
 }
 
-export type Page = 'chat' | 'models' | 'router' | 'diagnostics' | 'settings';
+export type Page = 'dashboard' | 'chat' | 'models' | 'router' | 'diagnostics' | 'settings';

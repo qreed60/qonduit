@@ -9,6 +9,7 @@ interface SidebarProps {
 
 const Sidebar: React.FC<SidebarProps> = ({ currentPage, onChangePage }) => {
   const pages: { id: Page; label: string; icon: string }[] = [
+    { id: 'dashboard', label: 'Dashboard', icon: '📊' },
     { id: 'chat', label: 'Chat', icon: '💬' },
     { id: 'models', label: 'Models', icon: '🤖' },
     { id: 'router', label: 'Router', icon: '🌐' },

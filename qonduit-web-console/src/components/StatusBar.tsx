@@ -1,75 +1,55 @@
 import React from 'react';
 import { Settings } from '../types';
+import { ENDPOINTS } from '../config/endpoints';
 
 interface StatusBarProps {
   settings: Settings;
 }
 
 const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
-  const getStatusColor = (url: string) => {
-    try {
-      const urlObj = new URL(url);
-      return urlObj.hostname === '192.168.5.5' ? 'success' : 'warning';
-    } catch {
-      return 'error';
-    }
-  };
+  const mode = settings.endpointMode;
 
-  const getStatusIcon = (status: 'success' | 'warning' | 'error') => {
-    const dotStyle: React.CSSProperties = {
-      width: '16px',
-      height: '16px',
-      borderRadius: '50%',
-      flexShrink: 0,
-    };
-    
-    switch (status) {
-      case 'success':
-        return <div style={{ ...dotStyle, backgroundColor: 'var(--status-success)' }} />;
-      case 'warning':
-        return <div style={{ ...dotStyle, backgroundColor: 'var(--status-warning)' }} />;
-      case 'error':
-        return <div style={{ ...dotStyle, backgroundColor: 'var(--status-error)' }} />;
-    }
-  };
-
-  const statusColorMap = {
-    success: 'border-[var(--status-success)]/30 text-[var(--status-success)]',
-    warning: 'border-[var(--status-warning)]/30 text-[var(--status-warning)]',
-    error: 'border-[var(--status-error)]/30 text-[var(--status-error)]',
-  };
+  const modeLabel = mode === 'public' ? 'Public' : 'Local';
+  const modeColor = mode === 'public'
+    ? 'bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] border-[var(--accent-primary)]/20'
+    : 'bg-[var(--bg-tertiary)] text-[var(--text-tertiary)] border-[var(--border-primary)]';
 
   return (
-    <header className="h-16 bg-[var(--bg-secondary)] border-b border-[var(--border-subtle)] flex items-center px-6 space-x-6">
-      {/* Gateway Status */}
-      <div className="flex items-center space-x-3">
+    <header className="h-16 bg-[var(--bg-secondary)] border-b border-[var(--border-subtle)] flex items-center px-6 space-x-4 overflow-x-auto">
+      {/* Mode Badge */}
+      <div className="flex items-center space-x-2 flex-shrink-0">
+        <span className="text-sm font-medium text-[var(--text-secondary)]">Mode</span>
+        <span className={`px-2 py-1 rounded-lg text-xs font-medium border ${modeColor}`}>
+          {modeLabel}
+        </span>
+      </div>
+
+      {/* Gateway */}
+      <div className="flex items-center space-x-2 flex-shrink-0">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Gateway</span>
-        <div className={`px-2 py-1 rounded-lg text-xs font-mono border flex items-center space-x-2 ${statusColorMap[getStatusColor(settings.gatewayBaseUrl)]} transition-colors`}>
-          {getStatusIcon(getStatusColor(settings.gatewayBaseUrl))}
-          <span className="truncate max-w-[120px]">{settings.gatewayBaseUrl}</span>
-        </div>
+        <span className="px-2 py-1 rounded-lg text-xs font-mono border border-[var(--border-primary)]/50 text-[var(--text-secondary)] truncate max-w-[140px]">
+          {ENDPOINTS.gateway[mode]}
+        </span>
       </div>
 
-      {/* Direct Status */}
-      <div className="flex items-center space-x-3">
+      {/* Direct (llama.cpp) */}
+      <div className="flex items-center space-x-2 flex-shrink-0">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Direct</span>
-        <div className={`px-2 py-1 rounded-lg text-xs font-mono border flex items-center space-x-2 ${statusColorMap[getStatusColor(settings.directBaseUrl)]} transition-colors`}>
-          {getStatusIcon(getStatusColor(settings.directBaseUrl))}
-          <span className="truncate max-w-[120px]">{settings.directBaseUrl}</span>
-        </div>
+        <span className="px-2 py-1 rounded-lg text-xs font-mono border border-[var(--border-primary)]/50 text-[var(--text-secondary)] truncate max-w-[140px]">
+          {ENDPOINTS.llama[mode]}
+        </span>
       </div>
 
-      {/* Router Status */}
-      <div className="flex items-center space-x-3">
+      {/* Router */}
+      <div className="flex items-center space-x-2 flex-shrink-0">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Router</span>
-        <div className={`px-2 py-1 rounded-lg text-xs font-mono border flex items-center space-x-2 ${statusColorMap[getStatusColor(settings.routerBaseUrl)]} transition-colors`}>
-          {getStatusIcon(getStatusColor(settings.routerBaseUrl))}
-          <span className="truncate max-w-[120px]">{settings.routerBaseUrl}</span>
-        </div>
+        <span className="px-2 py-1 rounded-lg text-xs font-mono border border-[var(--border-primary)]/50 text-[var(--text-secondary)] truncate max-w-[140px]">
+          {ENDPOINTS.router[mode]}
+        </span>
       </div>
 
       {/* Provider Pill */}
-      <div className="flex items-center space-x-3">
+      <div className="flex items-center space-x-2 flex-shrink-0">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Provider</span>
         <div className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] border border-[var(--accent-primary)]/20">
           {settings.defaultProvider}
@@ -77,9 +57,9 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
       </div>
 
       {/* Model Pill */}
-      <div className="flex items-center space-x-3">
+      <div className="flex items-center space-x-2 flex-shrink-0">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Model</span>
-        <div className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border-primary)] truncate max-w-[200px]">
+        <div className="px-2 py-1 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border-primary)] truncate max-w-[180px]">
           {settings.defaultModel}
         </div>
       </div>

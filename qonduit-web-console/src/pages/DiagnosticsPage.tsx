@@ -1,16 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { testConnection, getSettings } from '../services/api';
+import { testEndpoint, testRouterHealth, getSettings } from '../services/api';
+import { ENDPOINTS } from '../config/endpoints';
 import StatusBar from '../components/StatusBar';
-
-// Test router health with the correct endpoint
-async function testRouterHealth(url: string): Promise<boolean> {
-  try {
-    const response = await fetch(`${url}/api/v1/qonduit-router/health`, { method: 'HEAD' });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
 
 const DiagnosticsPage: React.FC = () => {
   const settings = getSettings();
@@ -42,9 +33,9 @@ const DiagnosticsPage: React.FC = () => {
   const performConnectionTest = useCallback(async () => {
     setIsCheckingConnectivity(true);
     try {
-      const gateway = await testConnection(settings.gatewayBaseUrl);
-      const direct = await testConnection(settings.directBaseUrl);
-      const router = await testRouterHealth(settings.routerBaseUrl);
+      const gateway = await testEndpoint('gateway');
+      const direct = await testEndpoint('llama');
+      const router = await testRouterHealth();
 
       // Update status with new results
       setConnectionStatus({ gateway, direct, router });
@@ -59,7 +50,7 @@ const DiagnosticsPage: React.FC = () => {
     } finally {
       setIsCheckingConnectivity(false);
     }
-  }, [settings]);
+  }, []);
 
   // Initial test on mount
   useEffect(() => {
@@ -207,8 +198,8 @@ const DiagnosticsPage: React.FC = () => {
                 </div>
                 <div>
                   <p className="font-medium text-[var(--text-primary)]">Gateway</p>
-                  <p className="text-xs text-[var(--text-secondary)] truncate max-w-[200px]" title={settings.gatewayBaseUrl}>
-                    {settings.gatewayBaseUrl}
+                  <p className="text-xs text-[var(--text-secondary)] truncate max-w-[200px]" title={ENDPOINTS.gateway.local}>
+                    {ENDPOINTS.gateway.local}
                   </p>
                 </div>
               </div>
@@ -228,8 +219,8 @@ const DiagnosticsPage: React.FC = () => {
                 </div>
                 <div>
                   <p className="font-medium text-[var(--text-primary)]">Direct</p>
-                  <p className="text-xs text-[var(--text-secondary)] truncate max-w-[200px]" title={settings.directBaseUrl}>
-                    {settings.directBaseUrl}
+                  <p className="text-xs text-[var(--text-secondary)] truncate max-w-[200px]" title={ENDPOINTS.llama.local}>
+                    {ENDPOINTS.llama.local}
                   </p>
                 </div>
               </div>
@@ -249,8 +240,8 @@ const DiagnosticsPage: React.FC = () => {
                 </div>
                 <div>
                   <p className="font-medium text-[var(--text-primary)]">Router</p>
-                  <p className="text-xs text-[var(--text-secondary)] truncate max-w-[200px]" title={settings.routerBaseUrl}>
-                    {settings.routerBaseUrl}
+                  <p className="text-xs text-[var(--text-secondary)] truncate max-w-[200px]" title={ENDPOINTS.router.local}>
+                    {ENDPOINTS.router.local}
                   </p>
                 </div>
               </div>

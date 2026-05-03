@@ -1,8 +1,10 @@
 import React from 'react';
 import { getSettings } from '../services/api';
+import { ENDPOINTS } from '../config/endpoints';
 
 const RouterPage: React.FC = () => {
   const settings = getSettings();
+  const mode = settings.endpointMode;
 
   return (
     <div className="p-6 h-full flex flex-col">
@@ -29,7 +31,7 @@ const RouterPage: React.FC = () => {
           </div>
           <div className="bg-[var(--bg-secondary)]/50 rounded-xl p-4 border border-[var(--border-subtle)]">
             <p className="text-sm text-[var(--text-secondary)] mb-1">Router Endpoint</p>
-            <p className="text-sm font-mono text-[var(--text-primary)] break-all">{settings.routerBaseUrl}</p>
+            <p className="text-sm font-mono text-[var(--text-primary)] break-all">{ENDPOINTS.router[mode]}</p>
           </div>
         </div>
 

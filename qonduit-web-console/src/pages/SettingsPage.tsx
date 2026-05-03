@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Settings } from '../types';
 import { getSettings, saveSettings } from '../services/api';
+import { ENDPOINTS, getMode, setMode } from '../config/endpoints';
 import Toast from '../components/Toast';
 
 const SettingsPage: React.FC = () => {
@@ -21,6 +22,11 @@ const SettingsPage: React.FC = () => {
     setIsDirty(true);
   };
 
+  const handleModeChange = (mode: 'local' | 'public') => {
+    setMode(mode);
+    setIsDirty(true);
+  };
+
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
     saveSettings(formData);
@@ -35,6 +41,8 @@ const SettingsPage: React.FC = () => {
     setIsDirty(false);
   };
 
+  const currentMode = getMode();
+
   return (
     <div className="p-6 h-full flex flex-col">
       {/* Header */}
@@ -43,7 +51,7 @@ const SettingsPage: React.FC = () => {
           Settings
         </h2>
         <p className="text-[var(--text-secondary)] mt-2">
-          Configure API endpoints and default model settings
+          Configure endpoint mode and default model settings
         </p>
       </div>
 
@@ -51,54 +59,78 @@ const SettingsPage: React.FC = () => {
       <div className="flex-1 overflow-y-auto">
         <form onSubmit={handleSave} className="max-w-4xl">
           <div className="space-y-6">
-            {/* API Endpoints Card */}
+            {/* Endpoint Mode Card */}
             <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 shadow-lg shadow-black/20">
-              <div className="flex items-center justify-between mb-6">
-                <h3 className="text-lg font-semibold text-[var(--text-primary)]">API Endpoints</h3>
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold text-[var(--text-primary)]">Endpoint Mode</h3>
                 <div className="flex items-center space-x-2">
-                  <span className="text-xs text-[var(--text-secondary)]">Endpoints</span>
+                  <span className="text-xs text-[var(--text-secondary)]">Mode</span>
+                  <span className={`px-2 py-1 rounded-lg text-xs font-medium ${
+                    currentMode === 'public'
+                      ? 'bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] border border-[var(--accent-primary)]/20'
+                      : 'bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border-primary)]'
+                  }`}>
+                    {currentMode === 'public' ? 'Public' : 'Local'}
+                  </span>
                 </div>
               </div>
-              <div className="space-y-5">
-                <div>
-                  <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
-                    Gateway Base URL
-                  </label>
-                  <input
-                    type="text"
-                    name="gatewayBaseUrl"
-                    value={formData.gatewayBaseUrl}
-                    onChange={handleChange}
-                    className="w-full px-5 py-3 bg-[var(--bg-secondary)] border border-[var(--border-primary)] rounded-xl text-[var(--text-primary)] placeholder-[var(--text-tertiary)] focus:outline-none focus:border-[var(--accent-primary)]/50 focus:ring-1 focus:ring-[var(--accent-primary)]/50 transition-all duration-200"
-                    placeholder="http://192.168.5.5:8090"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
-                    Direct Base URL
-                  </label>
-                  <input
-                    type="text"
-                    name="directBaseUrl"
-                    value={formData.directBaseUrl}
-                    onChange={handleChange}
-                    className="w-full px-5 py-3 bg-[var(--bg-secondary)] border border-[var(--border-primary)] rounded-xl text-[var(--text-primary)] placeholder-[var(--text-tertiary)] focus:outline-none focus:border-[var(--accent-primary)]/50 focus:ring-1 focus:ring-[var(--accent-primary)]/50 transition-all duration-200"
-                    placeholder="http://192.168.5.5:8080"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
-                    Router Base URL
-                  </label>
-                  <input
-                    type="text"
-                    name="routerBaseUrl"
-                    value={formData.routerBaseUrl}
-                    onChange={handleChange}
-                    className="w-full px-5 py-3 bg-[var(--bg-secondary)] border border-[var(--border-primary)] rounded-xl text-[var(--text-primary)] placeholder-[var(--text-tertiary)] focus:outline-none focus:border-[var(--accent-primary)]/50 focus:ring-1 focus:ring-[var(--accent-primary)]/50 transition-all duration-200"
-                    placeholder="http://192.168.5.5:8090"
-                  />
-                </div>
+              <p className="text-sm text-[var(--text-secondary)] mb-4">
+                Choose whether to connect to local services or the public Qonduit endpoints.
+                <span className="block text-xs mt-1 text-[var(--text-tertiary)]">
+                  The Router API requires local network access and may not work in public mode.
+                </span>
+              </p>
+              <div className="flex space-x-4">
+                <button
+                  type="button"
+                  onClick={() => handleModeChange('local')}
+                  className={`flex-1 px-6 py-4 rounded-xl border-2 text-left transition-all duration-200 ${
+                    currentMode === 'local'
+                      ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/5'
+                      : 'border-[var(--border-primary)] bg-[var(--bg-secondary)]/30 hover:border-[var(--border-primary)]/60'
+                  }`}
+                >
+                  <div className="flex items-center space-x-3">
+                    <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                      currentMode === 'local' ? 'border-[var(--accent-primary)]' : 'border-[var(--border-primary)]'
+                    }`}>
+                      {currentMode === 'local' && (
+                        <div className="w-2 h-2 rounded-full bg-[var(--accent-primary)]" />
+                      )}
+                    </div>
+                    <div>
+                      <p className="font-medium text-[var(--text-primary)]">Local</p>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        {ENDPOINTS.router.local}
+                      </p>
+                    </div>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleModeChange('public')}
+                  className={`flex-1 px-6 py-4 rounded-xl border-2 text-left transition-all duration-200 ${
+                    currentMode === 'public'
+                      ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/5'
+                      : 'border-[var(--border-primary)] bg-[var(--bg-secondary)]/30 hover:border-[var(--border-primary)]/60'
+                  }`}
+                >
+                  <div className="flex items-center space-x-3">
+                    <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                      currentMode === 'public' ? 'border-[var(--accent-primary)]' : 'border-[var(--border-primary)]'
+                    }`}>
+                      {currentMode === 'public' && (
+                        <div className="w-2 h-2 rounded-full bg-[var(--accent-primary)]" />
+                      )}
+                    </div>
+                    <div>
+                      <p className="font-medium text-[var(--text-primary)]">Public</p>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        {ENDPOINTS.router.public}
+                      </p>
+                    </div>
+                  </div>
+                </button>
               </div>
             </div>
 
@@ -151,6 +183,19 @@ const SettingsPage: React.FC = () => {
                     placeholder="local"
                   />
                 </div>
+              </div>
+            </div>
+
+            {/* Active Endpoints Card */}
+            <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 shadow-lg shadow-black/20">
+              <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-4">Active Endpoints</h3>
+              <div className="space-y-3">
+                {Object.entries(ENDPOINTS).map(([key, urls]) => (
+                  <div key={key} className="flex items-center justify-between p-3 bg-[var(--bg-secondary)]/30 rounded-xl border border-[var(--border-subtle)]">
+                    <span className="text-sm font-medium text-[var(--text-primary)] capitalize">{key}</span>
+                    <span className="text-xs font-mono text-[var(--text-secondary)]">{urls[currentMode]}</span>
+                  </div>
+                ))}
               </div>
             </div>
 

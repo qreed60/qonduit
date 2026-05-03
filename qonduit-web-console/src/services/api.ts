@@ -1,45 +1,199 @@
 import { Settings, ModelsResponse, Model } from '../types';
+import { getMode, apiPath } from '../config/endpoints';
 
 const DEFAULT_SETTINGS: Settings = {
-  gatewayBaseUrl: 'http://192.168.5.5:8090',
-  directBaseUrl: 'http://192.168.5.5:8080',
-  routerBaseUrl: 'http://192.168.5.5:5001',
   apiKey: 'local',
   defaultModel: 'Qwen3-Coder-Next-IQ4_NL.gguf',
   defaultProvider: 'Direct',
+  endpointMode: 'local',
 };
 
-export function getSettings(): Settings {
-  const saved = localStorage.getItem('qonduit-settings');
-  if (saved) {
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+/**
+ * Migrate old localStorage settings that contain the deprecated URL fields.
+ * If the stored settings have gatewayBaseUrl/directBaseUrl/routerBaseUrl,
+ * strip them out and save the cleaned version with the new endpointMode.
+ */
+function migrateSettings(): Settings {
+  const raw = localStorage.getItem('qonduit-settings');
+  if (!raw) return DEFAULT_SETTINGS;
+
+  try {
+    const parsed: Record<string, unknown> = JSON.parse(raw);
+    const hasOldFields =
+      'gatewayBaseUrl' in parsed ||
+      'directBaseUrl' in parsed ||
+      'routerBaseUrl' in parsed;
+
+    if (hasOldFields) {
+      const { gatewayBaseUrl, directBaseUrl, routerBaseUrl, ...clean } = parsed;
+      const migrated: Settings = { ...DEFAULT_SETTINGS, ...clean, endpointMode: getMode() };
+      localStorage.setItem('qonduit-settings', JSON.stringify(migrated));
+      return migrated;
+    }
+  } catch {
+    // If JSON is malformed, fall through to defaults
   }
-  return DEFAULT_SETTINGS;
+
+  const saved: Partial<Settings> = JSON.parse(raw);
+  return { ...DEFAULT_SETTINGS, ...saved, endpointMode: getMode() };
+}
+
+export function getSettings(): Settings {
+  return migrateSettings();
 }
 
 export function saveSettings(settings: Settings): void {
   localStorage.setItem('qonduit-settings', JSON.stringify(settings));
 }
 
-export async function fetchModels(baseUrl: string): Promise<Model[]> {
-  try {
-    const response = await fetch(`${baseUrl}/v1/models`);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    const data: ModelsResponse = await response.json();
-    return data.data;
-  } catch (error) {
-    console.error('Error fetching models:', error);
-    throw error;
+/**
+ * Fetch models from the Memory Gateway (OpenAI-compatible /v1/models).
+ */
+export async function fetchGatewayModels(): Promise<Model[]> {
+  const response = await fetch(apiPath('gateway', '/v1/models'));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
   }
+  const data: ModelsResponse = await response.json();
+  return data.data;
 }
 
-export async function testConnection(url: string): Promise<boolean> {
+/**
+ * Fetch models from the direct llama.cpp endpoint (OpenAI-compatible /v1/models).
+ */
+export async function fetchDirectModels(): Promise<Model[]> {
+  const response = await fetch(apiPath('llama', '/v1/models'));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const data: ModelsResponse = await response.json();
+  return data.data;
+}
+
+/**
+ * Test whether an endpoint is reachable by hitting its /health path.
+ */
+export async function testEndpoint(key: 'gateway' | 'llama' | 'router'): Promise<boolean> {
   try {
-    const response = await fetch(`${url}/health`, { method: 'HEAD' });
+    const response = await fetch(apiPath(key, '/health'), { method: 'HEAD' });
     return response.ok;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Test the router health endpoint (POST /health on the Flask router API).
+ */
+export async function testRouterHealth(): Promise<boolean> {
+  try {
+    const response = await fetch(apiPath('router', '/api/v1/qonduit-router/health'), { method: 'GET' });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fetch the list of GGUF models from the Flask router API.
+ */
+export async function fetchRouterModels(): Promise<{ models: Array<{ name: string; path: string }>; suggested_ctx: number }> {
+  const response = await fetch(apiPath('router', '/api/v1/qonduit-router/models'));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Launch a model via the Flask router API.
+ */
+export async function launchModel(modelName: string, ctxSize: number): Promise<{ ok: boolean; message: string }> {
+  const response = await fetch(apiPath('router', '/api/v1/qonduit-router/launch'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: modelName, context_size: ctxSize }),
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Stop the llama_server container.
+ */
+export async function stopModel(): Promise<{ ok: boolean; message: string }> {
+  const response = await fetch(apiPath('router', '/api/v1/qonduit-router/stop'), { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Get the router status (container running/exists, webui/llama URLs).
+ */
+export async function getRouterStatus(): Promise<{
+  running: boolean;
+  exists: boolean;
+  webui: string;
+  llama: string;
+}> {
+  const response = await fetch(apiPath('router', '/api/v1/qonduit-router/status'));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Get the suggested context size for a model.
+ */
+export async function suggestContext(modelName: string): Promise<{ suggested_ctx: number }> {
+  const response = await fetch(`${apiPath('router', '/api/v1/qonduit-router/context/suggest')}?model=${encodeURIComponent(modelName)}`);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Probe the llama.cpp /health endpoint directly.
+ */
+export async function llamaReady(): Promise<boolean> {
+  try {
+    const response = await fetch(apiPath('llama', '/health'));
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stream logs from the router API (SSE via fetch ReadableStream).
+ */
+export async function* streamLogs(onMessage: (line: string) => void): AsyncIterable<void> {
+  const response = await fetch(apiPath('router', '/api/v1/qonduit-router/logs'));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (line.trim()) onMessage(line.trim());
+      }
+    }
+  } finally {
+    reader.releaseLock();
   }
 }
