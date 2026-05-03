@@ -41,14 +41,22 @@ const StatusBar: React.FC<StatusBarProps> = ({ settings }) => {
       </div>
 
       {/* Router */}
-      <div className="flex items-center space-x-2 flex-shrink-0">
-        <span className="text-sm font-medium text-[var(--text-secondary)]">Router</span>
-        <span className="px-2 py-1 rounded-lg text-xs font-mono border border-[var(--border-primary)]/50 text-[var(--text-secondary)] truncate max-w-[140px]">
-          {ENDPOINTS.router[mode]}
-        </span>
-      </div>
-
-      {/* Provider Pill */}
+       <div className="flex items-center space-x-2 flex-shrink-0">
+         <span className="text-sm font-medium text-[var(--text-secondary)]">Router</span>
+         <span className="px-2 py-1 rounded-lg text-xs font-mono border border-[var(--border-primary)]/50 text-[var(--text-secondary)] truncate max-w-[140px]">
+           {ENDPOINTS.router[mode]}
+         </span>
+       </div>
+ 
+       {/* WebUI */}
+       <div className="flex items-center space-x-2 flex-shrink-0">
+         <span className="text-sm font-medium text-[var(--text-secondary)]">WebUI</span>
+         <span className="px-2 py-1 rounded-lg text-xs font-mono border border-[var(--border-primary)]/50 text-[var(--text-secondary)] truncate max-w-[140px]">
+           {ENDPOINTS.webui[mode]}
+         </span>
+       </div>
+ 
+       {/* Provider Pill */}
       <div className="flex items-center space-x-2 flex-shrink-0">
         <span className="text-sm font-medium text-[var(--text-secondary)]">Provider</span>
         <div className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] border border-[var(--accent-primary)]/20">
