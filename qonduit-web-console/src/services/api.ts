@@ -73,9 +73,21 @@ export async function fetchDirectModels(): Promise<Model[]> {
 /**
  * Test whether an endpoint is reachable by hitting its /health path.
  */
-export async function testEndpoint(key: 'gateway' | 'llama' | 'router'): Promise<boolean> {
+export async function testEndpoint(key: 'gateway' | 'llama' | 'router' | 'webui'): Promise<boolean> {
   try {
     const response = await fetch(apiPath(key, '/health'), { method: 'HEAD' });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Test the WebUI health endpoint (Open WebUI typically uses /health).
+ */
+export async function testWebuiEndpoint(): Promise<boolean> {
+  try {
+    const response = await fetch(apiPath('webui', '/health'), { method: 'HEAD' });
     return response.ok;
   } catch {
     return false;

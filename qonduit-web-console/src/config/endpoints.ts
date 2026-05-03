@@ -8,27 +8,110 @@
  * Public mode uses the deployed qneural.org domains.
  *
  * Vite env overrides (VITE_QONDUIT_*_BASE) take precedence over defaults.
+ * Runtime overrides (stored in localStorage) take precedence over everything.
  */
 
 export type EndpointMode = 'local' | 'public';
+export type EndpointKey = 'gateway' | 'router' | 'llama' | 'webui';
 
 // ── Local LAN defaults ──────────────────────────────────────────────────────
 
-const LOCAL_DEFAULTS = {
-  gatewayBase: 'http://192.168.5.5:8090',
-  routerBase: 'http://192.168.5.5:5001',
-  llamaBase: 'http://192.168.5.5:8080',
-  webuiBase: 'http://192.168.5.5:3000',
+const LOCAL_DEFAULTS: Record<EndpointKey, string> = {
+  gateway: 'http://192.168.5.5:8090',
+  router: 'http://192.168.5.5:5001',
+  llama: 'http://192.168.5.5:8080',
+  webui: 'http://192.168.5.5:3000',
 };
 
 // ── Public / reverse-proxy defaults ─────────────────────────────────────────
 
-const PUBLIC_DEFAULTS = {
-  gatewayBase: 'https://memory.qneural.org',
-  routerBase: 'https://router.qneural.org',
-  llamaBase: 'https://llama.qneural.org',
-  webuiBase: 'https://openai.qneural.org',
+const PUBLIC_DEFAULTS: Record<EndpointKey, string> = {
+  gateway: 'https://memory.qneural.org',
+  router: 'https://router.qneural.org',
+  llama: 'https://llama.qneural.org',
+  webui: 'https://openai.qneural.org',
 };
+
+// ── URL Validation ──────────────────────────────────────────────────────────
+
+/**
+ * Validate that a URL string is well-formed and has a proper protocol.
+ */
+export function validateEndpoint(url: string): { valid: boolean; error?: string } {
+  if (!url || typeof url !== 'string') {
+    return { valid: false, error: 'URL is required' };
+  }
+
+  // Check for malformed protocol (e.g., "https:/" instead of "https://")
+  if (/^https?:\/[^/]/.test(url)) {
+    return { valid: false, error: 'Malformed URL — missing slash in protocol' };
+  }
+
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { valid: false, error: 'Protocol must be http:// or https://' };
+    }
+    if (!parsed.hostname) {
+      return { valid: false, error: 'Missing hostname' };
+    }
+    return { valid: true };
+  } catch {
+    return { valid: false, error: 'Invalid URL format' };
+  }
+}
+
+// ── Runtime Overrides (localStorage) ────────────────────────────────────────
+
+const OVERRIDES_KEY = 'qonduit-endpoint-overrides';
+
+interface EndpointOverrides {
+  gateway?: string;
+  router?: string;
+  llama?: string;
+  webui?: string;
+}
+
+function getOverrides(): EndpointOverrides {
+  try {
+    const raw = localStorage.getItem(OVERRIDES_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveOverrides(overrides: EndpointOverrides): void {
+  localStorage.setItem(OVERRIDES_KEY, JSON.stringify(overrides));
+}
+
+/**
+ * Set a runtime override for a specific endpoint.
+ * Overrides persist in localStorage and survive mode switches.
+ */
+export function setEndpointOverride(key: EndpointKey, url: string): void {
+  const overrides = getOverrides();
+  if (url) {
+    overrides[key] = url;
+  } else {
+    delete overrides[key];
+  }
+  saveOverrides(overrides);
+}
+
+/**
+ * Clear all runtime endpoint overrides.
+ */
+export function clearEndpointOverrides(): void {
+  localStorage.removeItem(OVERRIDES_KEY);
+}
+
+/**
+ * Check if a specific endpoint has a runtime override.
+ */
+export function hasEndpointOverride(key: EndpointKey): boolean {
+  return !!getOverrides()[key];
+}
 
 // ── Vite env overrides (set at build time) ──────────────────────────────────
 
@@ -38,42 +121,29 @@ function envOverride(key: string): string | undefined {
 
 // ── Resolved endpoint sets ──────────────────────────────────────────────────
 
-const LOCAL_ENDPOINTS = {
-  gatewayBase: envOverride('VITE_QONDUIT_GATEWAY_BASE') ?? LOCAL_DEFAULTS.gatewayBase,
-  routerBase: envOverride('VITE_QONDUIT_ROUTER_BASE') ?? LOCAL_DEFAULTS.routerBase,
-  llamaBase: envOverride('VITE_QONDUIT_LLAMA_BASE') ?? LOCAL_DEFAULTS.llamaBase,
-  webuiBase: envOverride('VITE_QONDUIT_WEBUI_BASE') ?? LOCAL_DEFAULTS.webuiBase,
-};
+function resolveEndpoints(): Record<EndpointKey, { local: string; public: string }> {
+  const overrides = getOverrides();
 
-const PUBLIC_ENDPOINTS = {
-  gatewayBase: envOverride('VITE_QONDUIT_GATEWAY_BASE') ?? PUBLIC_DEFAULTS.gatewayBase,
-  routerBase: envOverride('VITE_QONDUIT_ROUTER_BASE') ?? PUBLIC_DEFAULTS.routerBase,
-  llamaBase: envOverride('VITE_QONDUIT_LLAMA_BASE') ?? PUBLIC_DEFAULTS.llamaBase,
-  webuiBase: envOverride('VITE_QONDUIT_WEBUI_BASE') ?? PUBLIC_DEFAULTS.webuiBase,
-};
+  const local: Record<EndpointKey, string> = {} as Record<EndpointKey, string>;
+  const pub: Record<EndpointKey, string> = {} as Record<EndpointKey, string>;
+
+  for (const key of Object.keys(LOCAL_DEFAULTS) as EndpointKey[]) {
+    local[key] = envOverride(`VITE_QONDUIT_${key.toUpperCase()}_BASE`)
+      ?? overrides[key]
+      ?? LOCAL_DEFAULTS[key];
+    pub[key] = envOverride(`VITE_QONDUIT_${key.toUpperCase()}_BASE`)
+      ?? overrides[key]
+      ?? PUBLIC_DEFAULTS[key];
+  }
+
+  return { gateway: local.gateway, router: local.router, llama: local.llama, webui: local.webui } as unknown as Record<EndpointKey, { local: string; public: string }>;
+}
+
+const RESOLVED = resolveEndpoints();
 
 // ── ENDPOINTS map (backward-compatible keys) ────────────────────────────────
 
-export const ENDPOINTS = {
-  gateway: {
-    local: LOCAL_ENDPOINTS.gatewayBase,
-    public: PUBLIC_ENDPOINTS.gatewayBase,
-  },
-  router: {
-    local: LOCAL_ENDPOINTS.routerBase,
-    public: PUBLIC_ENDPOINTS.routerBase,
-  },
-  llama: {
-    local: LOCAL_ENDPOINTS.llamaBase,
-    public: PUBLIC_ENDPOINTS.llamaBase,
-  },
-  webui: {
-    local: LOCAL_ENDPOINTS.webuiBase,
-    public: PUBLIC_ENDPOINTS.webuiBase,
-  },
-} as const;
-
-export type EndpointKey = keyof typeof ENDPOINTS;
+export const ENDPOINTS: Record<EndpointKey, { local: string; public: string }> = RESOLVED;
 
 // ── Named accessors (preferred for new code) ────────────────────────────────
 
@@ -88,8 +158,7 @@ export const WEBUI_BASE = ENDPOINTS.webui;
  */
 export function getEndpoint(key: EndpointKey): string {
   const mode = getMode();
-  const urls = ENDPOINTS[key];
-  return mode === 'public' ? urls.public : urls.local;
+  return ENDPOINTS[key][mode];
 }
 
 /**

@@ -1,5 +1,12 @@
 export type EndpointMode = 'local' | 'public';
 
+export interface EndpointOverrides {
+  gateway?: string;
+  router?: string;
+  llama?: string;
+  webui?: string;
+}
+
 export interface Settings {
   apiKey: string;
   defaultModel: string;

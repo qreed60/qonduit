@@ -1,0 +1,18 @@
+{
+  "name": "qonduit-root",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "npm --prefix qonduit-web-console run dev -- --host 0.0.0.0",
+    "build": "npm --prefix qonduit-web-console run build",
+    "typecheck": "npm --prefix qonduit-web-console run typecheck",
+    "lint": "npm --prefix qonduit-web-console run lint",
+    "install:web": "npm --prefix qonduit-web-console install"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "lucide-react": "^1.14.0"
+  }
+}

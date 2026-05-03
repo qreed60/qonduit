@@ -1,16 +1,23 @@
 import React, { useState, useEffect } from 'react';
-import { Settings } from '../types';
+import { Settings, EndpointOverrides } from '../types';
 import { getSettings, saveSettings } from '../services/api';
-import { ENDPOINTS, getMode, setMode } from '../config/endpoints';
+import { ENDPOINTS, getMode, setMode, setEndpointOverride, clearEndpointOverrides, hasEndpointOverride, validateEndpoint } from '../config/endpoints';
 import Toast from '../components/Toast';
 
 const SettingsPage: React.FC = () => {
   const [formData, setFormData] = useState<Settings>(getSettings());
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isDirty, setIsDirty] = useState(false);
+  const [overrides, setOverrides] = useState<EndpointOverrides>({});
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
     setFormData(getSettings());
+    // Load runtime overrides
+    try {
+      const raw = localStorage.getItem('qonduit-endpoint-overrides');
+      if (raw) setOverrides(JSON.parse(raw));
+    } catch { /* ignore */ }
   }, []);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
@@ -36,12 +43,54 @@ const SettingsPage: React.FC = () => {
   };
 
   const handleReset = () => {
-    const defaults = getSettings();
-    setFormData(defaults);
-    setIsDirty(false);
-  };
-
-  const currentMode = getMode();
+     const defaults = getSettings();
+     setFormData(defaults);
+     setIsDirty(false);
+   };
+ 
+   const handleOverrideChange = (key: string, value: string) => {
+     setOverrides((prev) => ({ ...prev, [key]: value }));
+     // Validate in real-time
+     const result = validateEndpoint(value);
+     setValidationErrors((prev) => {
+       const next = { ...prev };
+       if (value && !result.valid) next[key] = result.error || '';
+       else delete next[key];
+       return next;
+     });
+   };
+ 
+   const handleApplyOverrides = () => {
+     for (const [key, value] of Object.entries(overrides)) {
+       if (value) {
+         const result = validateEndpoint(value);
+         if (!result.valid) {
+           setToastMessage(`Invalid ${key} endpoint: ${result.error}`);
+           setTimeout(() => setToastMessage(null), 4000);
+           return;
+         }
+         setEndpointOverride(key as 'gateway' | 'router' | 'llama' | 'webui', value);
+       }
+     }
+     setToastMessage('Endpoint overrides applied — page will refresh');
+     setTimeout(() => {
+       setToastMessage(null);
+       window.location.reload();
+     }, 2000);
+   };
+ 
+   const handleClearOverrides = () => {
+     clearEndpointOverrides();
+     setOverrides({});
+     setValidationErrors({});
+     setToastMessage('Endpoint overrides cleared — page will refresh');
+     setTimeout(() => {
+       setToastMessage(null);
+       window.location.reload();
+     }, 2000);
+   };
+ 
+   const currentMode = getMode();
 
   return (
     <div className="p-6 h-full flex flex-col">
@@ -186,9 +235,72 @@ const SettingsPage: React.FC = () => {
               </div>
             </div>
 
-            {/* Active Endpoints Card */}
-            <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 shadow-lg shadow-black/20">
-              <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-4">Active Endpoints</h3>
+            {/* Runtime Endpoint Overrides Card */}
+             <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 shadow-lg shadow-black/20">
+               <div className="flex items-center justify-between mb-4">
+                 <div>
+                   <h3 className="text-lg font-semibold text-[var(--text-primary)]">Runtime Endpoint Overrides</h3>
+                   <p className="text-sm text-[var(--text-secondary)] mt-1">
+                     Override endpoints without rebuilding. Changes apply after reload.
+                   </p>
+                 </div>
+                 <button
+                   type="button"
+                   onClick={handleClearOverrides}
+                   className="px-4 py-2 rounded-lg text-xs font-medium border border-border-primary text-text-secondary hover:bg-bg-tertiary hover:text-text-primary transition-all duration-200"
+                 >
+                   Clear All
+                 </button>
+               </div>
+               <div className="space-y-3">
+                 {(Object.keys(ENDPOINTS) as Array<keyof typeof ENDPOINTS>).map((key) => {
+                   const currentValue = overrides[key] || ENDPOINTS[key][currentMode];
+                   const hasOverride = hasEndpointOverride(key);
+                   const error = validationErrors[key];
+                   return (
+                     <div key={key} className="flex items-center gap-3">
+                       <span className="text-sm font-medium text-[var(--text-secondary)] w-20 capitalize">{key}</span>
+                       <input
+                         type="text"
+                         value={currentValue}
+                         onChange={(e) => handleOverrideChange(key, e.target.value)}
+                         placeholder={`http://...`}
+                         className={`flex-1 px-4 py-2.5 bg-[var(--bg-secondary)] border rounded-xl text-[var(--text-primary)] text-sm font-mono focus:outline-none focus:ring-1 transition-all duration-200 ${
+                           error
+                             ? 'border-[var(--status-error)]/50 focus:border-[var(--status-error)]/50 focus:ring-[var(--status-error)]/50'
+                             : hasOverride
+                             ? 'border-[var(--accent-primary)]/50 focus:border-[var(--accent-primary)]/50 focus:ring-[var(--accent-primary)]/50'
+                             : 'border-[var(--border-primary)] focus:border-[var(--accent-primary)]/50 focus:ring-[var(--accent-primary)]/50'
+                         }`}
+                       />
+                       {hasOverride && (
+                         <span className="text-xs text-[var(--accent-primary)] font-medium">Override</span>
+                       )}
+                     </div>
+                   );
+                 })}
+               </div>
+               {Object.keys(validationErrors).length > 0 && (
+                 <div className="mt-3 space-y-1">
+                   {Object.entries(validationErrors).map(([key, error]) => (
+                     <p key={key} className="text-xs text-[var(--status-error)]">{key}: {error}</p>
+                   ))}
+                 </div>
+               )}
+               <div className="mt-4 flex gap-3">
+                 <button
+                   type="button"
+                   onClick={handleApplyOverrides}
+                   className="px-6 py-2.5 rounded-xl font-medium bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-tertiary)] hover:from-[var(--accent-primary-hover)] hover:to-[var(--accent-tertiary)] text-white shadow-lg shadow-[var(--accent-primary)]/20 transition-all duration-200"
+                 >
+                   Apply &amp; Reload
+                 </button>
+               </div>
+             </div>
+ 
+             {/* Active Endpoints Card */}
+             <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 shadow-lg shadow-black/20">
+               <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-4">Active Endpoints</h3>
               <div className="space-y-3">
                 {Object.entries(ENDPOINTS).map(([key, urls]) => (
                   <div key={key} className="flex items-center justify-between p-3 bg-[var(--bg-secondary)]/30 rounded-xl border border-[var(--border-subtle)]">

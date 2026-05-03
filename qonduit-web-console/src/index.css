@@ -25,8 +25,6 @@
   --color-accent-primary-hover: #6a4eff;
   --color-accent-secondary: #ec4899;
   --color-accent-tertiary: #8b5cf6;
-  --color-accent-gradient-start: #7b61ff;
-  --color-accent-gradient-end: #8b5cf6;
 
   /* Status colors */
   --color-status-success: #10b981;
@@ -37,7 +35,6 @@
   /* Shadows */
   --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4);
   --shadow-card-hover: 0 8px 32px rgba(123, 97, 255, 0.15);
-  --shadow-glow: 0 0 20px rgba(123, 97, 255, 0.1);
 }
 
 /* Base styles */

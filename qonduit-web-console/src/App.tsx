@@ -40,23 +40,23 @@ function AppContent() {
   };
 
   return (
-    <div className="flex h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] transition-colors duration-300">
-      <Sidebar currentPage={currentPage} onChangePage={handleChangePage} />
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <main className="flex-1 overflow-y-auto bg-[var(--bg-primary)]">
-          <Routes>
-            <Route path="/" element={<DashboardPage />} />
-            <Route path="/dashboard" element={<DashboardPage />} />
-            <Route path="/chat" element={<ChatPage />} />
-            <Route path="/models" element={<ModelsPage />} />
-            <Route path="/router" element={<RouterPage />} />
-            <Route path="/diagnostics" element={<DiagnosticsPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
-          </Routes>
-        </main>
-      </div>
-    </div>
-  );
+     <div className="flex h-screen bg-bg-primary text-text-primary transition-colors duration-300">
+       <Sidebar currentPage={currentPage} onChangePage={handleChangePage} />
+       <div className="flex-1 flex flex-col min-w-0 overflow-hidden lg:ml-0">
+         <main className="flex-1 overflow-y-auto bg-bg-primary">
+           <Routes>
+             <Route path="/" element={<DashboardPage />} />
+             <Route path="/dashboard" element={<DashboardPage />} />
+             <Route path="/chat" element={<ChatPage />} />
+             <Route path="/models" element={<ModelsPage />} />
+             <Route path="/router" element={<RouterPage />} />
+             <Route path="/diagnostics" element={<DiagnosticsPage />} />
+             <Route path="/settings" element={<SettingsPage />} />
+           </Routes>
+         </main>
+       </div>
+     </div>
+   );
 }
 
 function App() {

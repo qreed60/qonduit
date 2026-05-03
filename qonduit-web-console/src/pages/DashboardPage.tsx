@@ -3,6 +3,7 @@ import { getSettings } from '../services/api';
 import {
   testEndpoint,
   testRouterHealth,
+  testWebuiEndpoint,
   getRouterStatus,
   fetchRouterModels,
   launchModel as apiLaunchModel,
@@ -17,6 +18,14 @@ import ModelControlCard from '../components/ModelControlCard';
 import LogsPanel from '../components/LogsPanel';
 import SystemOverview from '../components/SystemOverview';
 import ComingSoon from '../components/ComingSoon';
+import {
+  BookOpen,
+  Settings2,
+  Wrench,
+  BarChart3,
+  Shield,
+  Database,
+} from 'lucide-react';
 
 const DashboardPage: React.FC = () => {
   const [settings] = useState<Settings>(getSettings());
@@ -24,7 +33,8 @@ const DashboardPage: React.FC = () => {
     gateway: boolean | null;
     llama: boolean | null;
     router: boolean | null;
-  }>({ gateway: null, llama: null, router: null });
+    webui: boolean | null;
+  }>({ gateway: null, llama: null, router: null, webui: null });
   const [healthLoading, setHealthLoading] = useState(false);
   const [routerStatus, setRouterStatus] = useState<{
     running: boolean;
@@ -72,18 +82,19 @@ const DashboardPage: React.FC = () => {
   };
 
   const testAllEndpoints = async () => {
-    setHealthLoading(true);
-    try {
-      const [gateway, llama, router] = await Promise.all([
-        testEndpoint('gateway').catch(() => false),
-        testEndpoint('llama').catch(() => false),
-        testRouterHealth().catch(() => false),
-      ]);
-      setEndpointHealth({ gateway, llama, router });
-    } finally {
-      setHealthLoading(false);
-    }
-  };
+     setHealthLoading(true);
+     try {
+       const [gateway, llama, router, webui] = await Promise.all([
+         testEndpoint('gateway').catch(() => false),
+         testEndpoint('llama').catch(() => false),
+         testRouterHealth().catch(() => false),
+         testWebuiEndpoint().catch(() => false),
+       ]);
+       setEndpointHealth({ gateway, llama, router, webui });
+     } finally {
+       setHealthLoading(false);
+     }
+   };
 
   const handleLaunch = async () => {
     if (!selectedModel) return;
@@ -153,22 +164,43 @@ const DashboardPage: React.FC = () => {
   const mode = settings.endpointMode;
 
   const comingSoonItems = [
-    {
-      icon: '📚',
-      title: 'RAG Collections',
-      description: 'Manage document collections for retrieval-augmented generation',
-    },
-    {
-      icon: '⚙️',
-      title: 'Gateway Settings',
-      description: 'Configure memory gateway parameters and behavior',
-    },
-    {
-      icon: '🔧',
-      title: 'Tool Toggles & Diagnostics',
-      description: 'Enable tools and run advanced diagnostics',
-    },
-  ];
+     {
+       icon: <BookOpen className="w-4 h-4" />,
+       title: 'RAG Collections',
+       description: 'Manage document collections for retrieval-augmented generation',
+       category: 'ai' as const,
+     },
+     {
+       icon: <Settings2 className="w-4 h-4" />,
+       title: 'Gateway Settings',
+       description: 'Configure memory gateway parameters and behavior',
+       category: 'infra' as const,
+     },
+     {
+       icon: <Wrench className="w-4 h-4" />,
+       title: 'Tool Toggles',
+       description: 'Enable tools and function calling for models',
+       category: 'tools' as const,
+     },
+     {
+       icon: <BarChart3 className="w-4 h-4" />,
+       title: 'Usage Analytics',
+       description: 'Track model usage, costs, and performance metrics',
+       category: 'tools' as const,
+     },
+     {
+       icon: <Shield className="w-4 h-4" />,
+       title: 'Access Control',
+       description: 'Manage user permissions and API key rotation',
+       category: 'infra' as const,
+     },
+     {
+       icon: <Database className="w-4 h-4" />,
+       title: 'Vector Store',
+       description: 'Configure and manage vector embeddings storage',
+       category: 'ai' as const,
+     },
+   ];
 
   return (
     <div className="flex flex-col h-full bg-bg-primary">
@@ -188,69 +220,80 @@ const DashboardPage: React.FC = () => {
         </div>
 
         {/* System Overview */}
-        <div className="mb-6">
-          <SystemOverview
-            endpointHealth={endpointHealth}
-            healthLoading={healthLoading}
-            routerStatus={routerStatus}
-            selectedModel={selectedModel}
-            onRefresh={testAllEndpoints}
-            onLaunch={handleLaunch}
-            onStop={handleStop}
-            actionLoading={actionLoading}
-            actionStatus={actionStatus}
-            actionMessage={actionMessage}
-          />
-        </div>
+         <div className="mb-6">
+           <SystemOverview
+             endpointHealth={endpointHealth}
+             healthLoading={healthLoading}
+             routerStatus={routerStatus}
+             selectedModel={selectedModel}
+             onRefresh={testAllEndpoints}
+           />
+         </div>
 
         {/* Endpoint Cards */}
-        <div className="mb-6">
-          <h2 className="text-lg font-semibold text-text-primary mb-4">Endpoints</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <EndpointCard
-              name="Memory Gateway"
-              icon="🌐"
-              description="OpenAI-compatible API gateway"
-              url={ENDPOINTS.gateway[mode]}
-              status={endpointHealth.gateway === true ? 'online' : endpointHealth.gateway === false ? 'offline' : healthLoading ? 'loading' : 'unknown'}
-              onTest={() => {
-                setHealthLoading(true);
-                testEndpoint('gateway')
-                  .then((result) => setEndpointHealth((prev) => ({ ...prev, gateway: result })))
-                  .finally(() => setHealthLoading(false));
-              }}
-              testLoading={healthLoading}
-            />
-            <EndpointCard
-              name="Direct (llama.cpp)"
-              icon="⚡"
-              description="Direct llama.cpp inference server"
-              url={ENDPOINTS.llama[mode]}
-              status={endpointHealth.llama === true ? 'online' : endpointHealth.llama === false ? 'offline' : healthLoading ? 'loading' : 'unknown'}
-              onTest={() => {
-                setHealthLoading(true);
-                testEndpoint('llama')
-                  .then((result) => setEndpointHealth((prev) => ({ ...prev, llama: result })))
-                  .finally(() => setHealthLoading(false));
-              }}
-              testLoading={healthLoading}
-            />
-            <EndpointCard
-              name="Router API"
-              icon="🔀"
-              description="Model router and container manager"
-              url={ENDPOINTS.router[mode]}
-              status={endpointHealth.router === true ? 'online' : endpointHealth.router === false ? 'offline' : healthLoading ? 'loading' : 'unknown'}
-              onTest={() => {
-                setHealthLoading(true);
-                testRouterHealth()
-                  .then((result) => setEndpointHealth((prev) => ({ ...prev, router: result })))
-                  .finally(() => setHealthLoading(false));
-              }}
-              testLoading={healthLoading}
-            />
-          </div>
-        </div>
+         <div className="mb-6">
+           <h2 className="text-lg font-semibold text-text-primary mb-4">Endpoints</h2>
+           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+             <EndpointCard
+               name="Memory Gateway"
+               icon="🌐"
+               description="Chat completions & memory"
+               url={ENDPOINTS.gateway[mode]}
+               status={endpointHealth.gateway === true ? 'online' : endpointHealth.gateway === false ? 'offline' : healthLoading ? 'loading' : 'unknown'}
+               onTest={() => {
+                 setHealthLoading(true);
+                 testEndpoint('gateway')
+                   .then((result) => setEndpointHealth((prev) => ({ ...prev, gateway: result })))
+                   .finally(() => setHealthLoading(false));
+               }}
+               testLoading={healthLoading}
+             />
+             <EndpointCard
+                name="Direct (llama.cpp)"
+                icon="⚡"
+                description="Direct inference server"
+                url={ENDPOINTS.llama[mode]}
+                status={endpointHealth.llama === true ? 'online' : endpointHealth.llama === false ? 'offline' : healthLoading ? 'loading' : 'unknown'}
+                externalUrl={ENDPOINTS.llama[mode]}
+                onTest={() => {
+                  setHealthLoading(true);
+                  testEndpoint('llama')
+                    .then((result) => setEndpointHealth((prev) => ({ ...prev, llama: result })))
+                    .finally(() => setHealthLoading(false));
+                }}
+                testLoading={healthLoading}
+              />
+              <EndpointCard
+                name="Router API"
+                icon="🔀"
+                description="Model router & container manager"
+                url={ENDPOINTS.router[mode]}
+                status={endpointHealth.router === true ? 'online' : endpointHealth.router === false ? 'offline' : healthLoading ? 'loading' : 'unknown'}
+                onTest={() => {
+                  setHealthLoading(true);
+                  testRouterHealth()
+                    .then((result) => setEndpointHealth((prev) => ({ ...prev, router: result })))
+                    .finally(() => setHealthLoading(false));
+                }}
+                testLoading={healthLoading}
+              />
+              <EndpointCard
+                name="Open WebUI"
+                icon="💬"
+                description="Web-based chat interface"
+                url={ENDPOINTS.webui[mode]}
+                status={endpointHealth.webui === true ? 'online' : endpointHealth.webui === false ? 'offline' : healthLoading ? 'loading' : 'unknown'}
+                externalUrl={ENDPOINTS.webui[mode]}
+                onTest={() => {
+                  setHealthLoading(true);
+                  testWebuiEndpoint()
+                    .then((result) => setEndpointHealth((prev) => ({ ...prev, webui: result })))
+                    .finally(() => setHealthLoading(false));
+                }}
+                testLoading={healthLoading}
+              />
+           </div>
+         </div>
 
         {/* Model Control */}
         <div className="mb-6">

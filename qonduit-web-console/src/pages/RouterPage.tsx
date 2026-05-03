@@ -1,106 +1,140 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { getSettings } from '../services/api';
+import { getRouterStatus, fetchRouterModels } from '../services/api';
 import { ENDPOINTS } from '../config/endpoints';
+import {
+  Cpu,
+  AlertCircle,
+  CheckCircle2,
+  Loader2,
+} from 'lucide-react';
 
 const RouterPage: React.FC = () => {
   const settings = getSettings();
   const mode = settings.endpointMode;
+  const [routerStatus, setRouterStatus] = useState<{ running: boolean; exists: boolean } | null>(null);
+  const [routerModels, setRouterModels] = useState<Array<{ name: string; path: string }>>([]);
+  const [suggestedCtx, setSuggestedCtx] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true);
+      try {
+        const status = await getRouterStatus();
+        setRouterStatus({ running: status.running, exists: status.exists });
+
+        try {
+          const data = await fetchRouterModels();
+          setRouterModels(data.models || []);
+          if (data.suggested_ctx) setSuggestedCtx(data.suggested_ctx);
+        } catch { /* models may not be available */ }
+      } catch {
+        // Router may not be available
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+    // Refresh every 10 seconds
+    const interval = setInterval(fetchData, 10000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <div className="p-6 h-full flex flex-col">
       {/* Header */}
       <div className="mb-6">
-        <h2 className="text-2xl font-bold bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-tertiary)] bg-clip-text text-transparent">
+        <h2 className="text-xl font-bold bg-gradient-to-r from-accent-primary to-accent-tertiary bg-clip-text text-transparent">
           Router
         </h2>
-        <p className="text-[var(--text-secondary)] mt-2">
-          Intelligent model routing and request optimization
+        <p className="text-sm text-text-secondary mt-1">
+          Model routing and request optimization
         </p>
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 overflow-y-auto">
-        {/* Router Status Card */}
-        <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 mb-6 shadow-lg shadow-black/20">
+      <div className="flex-1 overflow-y-auto space-y-4">
+        {/* Router Status */}
+        <div className="bg-bg-card rounded-xl border border-border-primary p-5">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold text-[var(--text-primary)]">Router Status</h3>
-            <div className="flex items-center space-x-2">
-              <div style={{ width: '16px', height: '16px', backgroundColor: 'var(--status-success)', borderRadius: '50%' }} className="animate-pulse"></div>
-              <span className="text-sm text-[var(--status-success)] font-medium">Active</span>
+            <h3 className="text-sm font-semibold text-text-primary">Router Status</h3>
+            {loading ? (
+              <Loader2 className="w-4 h-4 text-text-tertiary animate-spin" />
+            ) : routerStatus ? (
+              <div className="flex items-center gap-2">
+                {routerStatus.running ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-status-success" />
+                    <span className="text-xs font-medium text-status-success">Running</span>
+                  </>
+                ) : routerStatus.exists ? (
+                  <>
+                    <AlertCircle className="w-4 h-4 text-status-warning" />
+                    <span className="text-xs font-medium text-status-warning">Stopped</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertCircle className="w-4 h-4 text-text-tertiary" />
+                    <span className="text-xs font-medium text-text-tertiary">Not Found</span>
+                  </>
+                )}
+              </div>
+            ) : (
+              <span className="text-xs text-text-tertiary">Unknown</span>
+            )}
+          </div>
+          <div className="bg-bg-secondary/50 rounded-lg p-3 border border-border-subtle">
+            <p className="text-xs text-text-secondary mb-1">Router Endpoint</p>
+            <p className="text-xs font-mono text-text-primary break-all">{ENDPOINTS.router[mode]}</p>
+          </div>
+        </div>
+
+        {/* Model Info */}
+        <div className="bg-bg-card rounded-xl border border-border-primary p-5">
+          <h3 className="text-sm font-semibold text-text-primary mb-4">Loaded Models</h3>
+          {loading ? (
+            <div className="flex items-center justify-center py-8">
+              <Loader2 className="w-6 h-6 text-text-tertiary animate-spin" />
             </div>
-          </div>
-          <div className="bg-[var(--bg-secondary)]/50 rounded-xl p-4 border border-[var(--border-subtle)]">
-            <p className="text-sm text-[var(--text-secondary)] mb-1">Router Endpoint</p>
-            <p className="text-sm font-mono text-[var(--text-primary)] break-all">{ENDPOINTS.router[mode]}</p>
-          </div>
-        </div>
-
-        {/* Active Model Card */}
-        <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 mb-6 shadow-lg shadow-black/20">
-          <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-4">Active Model</h3>
-          <div className="flex items-center justify-between bg-[var(--bg-secondary)]/50 rounded-xl p-4 border border-[var(--border-subtle)]">
-            <div>
-              <p className="text-sm text-[var(--text-secondary)] mb-1">Current Model</p>
-              <p className="text-[var(--text-primary)] font-medium truncate max-w-xs" title={settings.defaultModel}>
-                {settings.defaultModel}
-              </p>
+          ) : routerModels.length > 0 ? (
+            <div className="space-y-2">
+              {routerModels.map((model) => (
+                <div
+                  key={model.name}
+                  className="flex items-center justify-between bg-bg-secondary/50 rounded-lg p-3 border border-border-subtle"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-mono text-text-primary truncate">{model.name}</p>
+                    <p className="text-[10px] text-text-tertiary truncate mt-0.5">{model.path}</p>
+                  </div>
+                  <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+                    {suggestedCtx && (
+                      <span className="flex items-center gap-1 text-[10px] text-accent-primary">
+                        <Cpu className="w-3 h-3" />
+                        ctx: {suggestedCtx}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
-            <button
-              disabled
-              className="px-4 py-2 bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] border border-[var(--accent-primary)]/20 rounded-lg text-sm font-medium disabled:cursor-not-allowed hover:bg-[var(--accent-primary)]/20 transition-colors"
-            >
-              View Details
-            </button>
-          </div>
+          ) : (
+            <div className="text-center py-8">
+              <p className="text-text-tertiary text-sm">No models available</p>
+              <p className="text-text-tertiary/60 text-xs mt-1">Launch a model from the Dashboard</p>
+            </div>
+          )}
         </div>
 
-        {/* Switch Model Card */}
-        <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 mb-6 shadow-lg shadow-black/20">
-          <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-4">Switch Model</h3>
-          <p className="text-sm text-[var(--text-secondary)] mb-4">
-            Select a different model to route requests through the router
-          </p>
-          <div className="bg-[var(--bg-secondary)]/50 rounded-xl p-4 border border-[var(--border-subtle)]">
-            <select
-              disabled
-              className="w-full bg-[var(--bg-primary)] border border-[var(--border-primary)] rounded-lg px-4 py-3 text-[var(--text-primary)] focus:outline-none disabled:opacity-50 cursor-not-allowed"
-            >
-              <option>Qwen3-Coder-Next-IQ4_NL.gguf</option>
-              <option value="other">Other Models (Not Available)</option>
-            </select>
-            <p className="text-xs text-[var(--text-tertiary)] mt-3">
-              Model switching functionality will be implemented in a future milestone
-            </p>
-          </div>
-        </div>
-
-        {/* Lifecycle Controls Card */}
-        <div className="bg-[var(--bg-card)] rounded-2xl border border-[var(--border-primary)] p-6 shadow-lg shadow-black/20">
-          <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-4">Lifecycle Controls</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <button
-              disabled
-              className="flex items-center justify-center space-x-3 px-6 py-3 bg-[var(--bg-secondary)]/50 border border-[var(--border-primary)] rounded-xl text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] disabled:cursor-not-allowed transition-colors"
-            >
-              <svg style={{ width: '16px', height: '16px' }} className="text-[var(--accent-primary)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              <span className="font-medium">Start Router</span>
-            </button>
-            <button
-              disabled
-              className="flex items-center justify-center space-x-3 px-6 py-3 bg-[var(--bg-secondary)]/50 border border-[var(--border-primary)] rounded-xl text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] disabled:cursor-not-allowed transition-colors"
-            >
-              <svg style={{ width: '16px', height: '16px' }} className="text-[var(--status-error)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
-              </svg>
-              <span className="font-medium">Stop Router</span>
-            </button>
-          </div>
-          <p className="text-xs text-[var(--text-tertiary)] mt-4 text-center">
-            Router lifecycle controls will be implemented in a future milestone
+        {/* Info */}
+        <div className="bg-bg-card rounded-xl border border-border-primary p-5">
+          <h3 className="text-sm font-semibold text-text-primary mb-3">About the Router</h3>
+          <p className="text-xs text-text-secondary leading-relaxed">
+            The Qonduit Router manages model lifecycle, handles intelligent request routing,
+            and provides a unified API for chat completions. It runs as a containerized service
+            on your local network.
           </p>
         </div>
       </div>

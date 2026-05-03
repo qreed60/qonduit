@@ -1,0 +1,12 @@
+{
+  "extends": "./qonduit-web-console/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["qonduit-web-console/src/**/*"],
+  "references": [
+    {
+      "path": "./qonduit-web-console/tsconfig.node.json"
+    }
+  ]
+}
