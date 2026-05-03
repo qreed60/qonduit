@@ -20,10 +20,6 @@ export const ENDPOINTS = {
     local: 'http://127.0.0.1:8080',
     public: 'https://llama.qneural.org',
   },
-  webui: {
-    local: 'http://127.0.0.1:3000',
-    public: 'https://openai.qneural.org',
-  },
 } as const;
 
 export type EndpointKey = keyof typeof ENDPOINTS;

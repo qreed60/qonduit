@@ -132,13 +132,11 @@ export async function stopModel(): Promise<{ ok: boolean; message: string }> {
 }
 
 /**
- * Get the router status (container running/exists, webui/llama URLs).
+ * Get the router status (container running/exists).
  */
 export async function getRouterStatus(): Promise<{
   running: boolean;
   exists: boolean;
-  webui: string;
-  llama: string;
 }> {
   const response = await fetch(apiPath('router', '/api/v1/qonduit-router/status'));
   if (!response.ok) {

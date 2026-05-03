@@ -66,3 +66,4 @@ Thumbs.db
 qonduit-web-console/node_modules/
 qonduit-web-console/dist/
 qonduit-web-console/.vite/
+.dyad/
