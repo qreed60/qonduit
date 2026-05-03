@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { getSettings } from '../services/api';
 import {
   testEndpoint,
@@ -12,7 +12,6 @@ import { Settings } from '../types';
 import { ENDPOINTS } from '../config/endpoints';
 import StatusBar from '../components/StatusBar';
 import Toast from '../components/Toast';
-import StatusBadge from '../components/StatusBadge';
 import EndpointCard from '../components/EndpointCard';
 import ModelControlCard from '../components/ModelControlCard';
 import LogsPanel from '../components/LogsPanel';
