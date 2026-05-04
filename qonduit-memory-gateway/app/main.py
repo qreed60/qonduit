@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import httpx
@@ -47,6 +48,37 @@ import shutil
 app = FastAPI(title="Qonduit Memory Gateway")
 logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
+
+# ── CORS middleware ──────────────────────────────────────────────────────────
+# Environment-driven origin list with safe defaults.
+#   CORS_ORIGINS   – comma-separated list of allowed origins (env override)
+#   CORS_ALLOW_ALL – set to "true" to allow all origins (local testing only)
+_cors_raw = os.getenv(
+    "CORS_ORIGINS",
+    ",".join([
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://192.168.4.250:5173",
+        "http://192.168.4.250:5174",
+        "http://192.168.5.5:5173",
+        "http://192.168.5.5:5174",
+        "https://bolt.qneural.org",
+    ]),
+)
+
+if os.getenv("CORS_ALLOW_ALL", "").lower() == "true":
+    _allowed_origins = ["*"]
+else:
+    _allowed_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ToolResult(BaseModel):
@@ -1329,6 +1361,7 @@ async def ingestion_enqueue(req: IngestionEnqueueRequest) -> dict:
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models() -> dict:
+    logger.info("models_endpoint_called llama_base=%s", LLAMA_BASE)
     alias_models = list(alias_models_for_models_endpoint())
 
     try:
@@ -1356,6 +1389,11 @@ async def list_models() -> dict:
         )
         raise upstream_error(response.status_code, response.text)
 
+    logger.info(
+        "models_proxy_upstream_ok status=%s keys=%s",
+        response.status_code,
+        list(response.json().keys()) if response.content else [],
+    )
     try:
         upstream = response.json()
         if isinstance(upstream, dict):
