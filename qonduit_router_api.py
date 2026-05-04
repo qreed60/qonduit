@@ -11,6 +11,57 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
+# ── CORS middleware (after_request handler) ─────────────────────────────────
+# Environment-driven origin list with safe defaults.
+#   ROUTER_CORS_ALLOW_ALL – set to "true" to allow all origins (local testing only)
+#   ROUTER_CORS_ORIGINS   – comma-separated list of allowed origins (env override)
+_ROUTER_CORS_RAW = os.getenv(
+    "ROUTER_CORS_ORIGINS",
+    ",".join([
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:32112",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://192.168.4.250:5173",
+        "http://192.168.4.250:5174",
+        "http://192.168.4.250:32112",
+        "http://192.168.5.5:5173",
+        "http://192.168.5.5:5174",
+        "http://192.168.5.5:32112",
+        "https://bolt.qneural.org",
+    ]),
+)
+
+if os.getenv("ROUTER_CORS_ALLOW_ALL", "").lower() == "true":
+    _router_cors_origins = ["*"]
+else:
+    _router_cors_origins = [o.strip() for o in _ROUTER_CORS_RAW.split(",") if o.strip()]
+
+_ALLOWED_METHODS = {"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"}
+_ALLOWED_HEADERS = {"Content-Type", "Authorization", "Accept", "Origin"}
+
+
+@app.after_request
+def _cors_headers(response: Response) -> Response:
+    origin = request.headers.get("Origin", "")
+    if not origin:
+        return response
+
+    # Wildcard mode: allow any origin (no credentials)
+    if _router_cors_origins == ["*"]:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    elif origin in _router_cors_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        return response
+
+    response.headers["Access-Control-Allow-Methods"] = ", ".join(sorted(_ALLOWED_METHODS))
+    response.headers["Access-Control-Allow-Headers"] = ", ".join(sorted(_ALLOWED_HEADERS))
+    response.headers["Access-Control-Max-Age"] = "3600"
+    return response
+
 QONDUIT_MODEL_DIR = Path("/mnt/models/llm")
 QONDUIT_SCRIPT_PATH = "/opt/llama_go3.sh"
 QONDUIT_CONTAINER_NAME = "llama_server"
