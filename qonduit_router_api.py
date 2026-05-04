@@ -60,6 +60,16 @@ def _cors_headers(response: Response) -> Response:
     response.headers["Access-Control-Allow-Methods"] = ", ".join(sorted(_ALLOWED_METHODS))
     response.headers["Access-Control-Allow-Headers"] = ", ".join(sorted(_ALLOWED_HEADERS))
     response.headers["Access-Control-Max-Age"] = "3600"
+
+    # ── Private Network Access (PNA) ──────────────────────────────────────
+    # Respond to Chrome's PNA preflight: Access-Control-Request-Private-Network
+    pna_request = request.headers.get("Access-Control-Request-Private-Network")
+    if pna_request and pna_request.lower() == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    elif _router_cors_origins == ["*"]:
+        # Always advertise PNA when allow-all is enabled
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+
     return response
 
 QONDUIT_MODEL_DIR = Path("/mnt/models/llm")
