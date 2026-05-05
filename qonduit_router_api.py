@@ -1149,7 +1149,7 @@ def _hf_repo_gguf_files_internal(repo_id: str) -> Optional[dict]:
             # If size is missing/zero, try HEAD request to resolve URL
             if not size or size == 0:
                 resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{path}"
-                head_size = _get_file_size_via_head(resolve_url, timeout=_QONDUIT_HF_NETWORK_TIMEOUT_SECONDS)
+                head_size = _get_file_size_via_head(resolve_url, timeout=_QONDUIT_HF_NETWORK_TIMEOUT)
                 if head_size and head_size > 0:
                     size = head_size
 
