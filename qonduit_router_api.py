@@ -617,16 +617,18 @@ _hf_search_cooldown: dict[str, float] = {}
 
 # ── Quantization order mapping ──────────────────────────────────────────────
 _QUANT_ORDER = [
-    "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L",
-    "Q4_0", "Q4_K_S", "Q4_K_M",
-    "Q5_0", "Q5_K_S", "Q5_K_M",
-    "Q6_K",
-    "Q8_0",
-    "IQ2_XS", "IQ2_HS", "IQ2_S", "IQ2_M",
-    "IQ3_XS", "IQ3_YS", "IQ3_S",
-    "IQ4_XS", "IQ4_NL",
+    "Q2_K", "Q2_K_XL",
+    "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K_XL",
+    "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q4_K_L", "Q4_K_XL",
+    "Q5_0", "Q5_1", "Q5_K_S", "Q5_K_M", "Q5_K_L", "Q5_K_XL",
+    "Q6_K", "Q6_K_XL",
+    "Q8_0", "Q8_K", "Q8_K_XL",
     "IQ1_S", "IQ1_M",
-    "F16", "F32", "BF16",
+    "IQ2_XS", "IQ2_HS", "IQ2_S", "IQ2_M", "IQ2_XXS",
+    "IQ3_XS", "IQ3_YS", "IQ3_S", "IQ3_M", "IQ3_XXS",
+    "IQ4_XS", "IQ4_NL", "IQ4_XXS",
+    "MXFP4", "MXFP4_MOE",
+    "BF16", "F16", "F32",
 ]
 
 
@@ -635,9 +637,11 @@ def _get_model_dir() -> Path:
     return _QONDUIT_MODEL_DIR
 
 
-def _human_size(nbytes: int) -> str:
+def _human_size(nbytes: int | float) -> str:
     """Format bytes as a human-readable string (e.g. '24.8 GiB')."""
-    if nbytes < 0:
+    if not isinstance(nbytes, (int, float)) or nbytes < 0:
+        return "unknown"
+    if nbytes == 0:
         return "0 B"
     units = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)]
     for unit, divisor in units:
@@ -646,7 +650,154 @@ def _human_size(nbytes: int) -> str:
             if unit == "GiB":
                 return f"{value:.1f} {unit}"
             return f"{int(value)} {unit}"
-    return f"{nbytes} B"
+    return f"{int(nbytes)} B"
+
+
+def _human_size_metric(nbytes: int | float) -> str:
+    """Format bytes as decimal GB/MB (e.g. '24.8 GB')."""
+    if not isinstance(nbytes, (int, float)) or nbytes < 0:
+        return "unknown"
+    if nbytes == 0:
+        return "0 B"
+    units = [("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000), ("B", 1)]
+    for unit, divisor in units:
+        if nbytes >= divisor:
+            value = nbytes / divisor
+            if unit in ("GB",):
+                return f"{value:.1f} {unit}"
+            return f"{int(value)} {unit}"
+    return f"{int(nbytes)} B"
+
+
+def _parse_parameter_size(text: str) -> tuple[Optional[str], Optional[float], Optional[str]]:
+    """Infer model parameter size from a repo ID, model ID, or filename.
+
+    Returns (parameter_size_str, parameter_size_num, parameter_size_unit)
+    e.g. ("35B", 35.0, "B") or ("unknown", None, None)
+
+    Handles MoE names like 35B-A3B → total=35B, active=3B.
+    """
+    if not text:
+        return None, None, None
+
+    # Common parameter size patterns: 0.5B, 1.5B, 7B, 35B, 70B, etc.
+    # Also handle MoE: 35B-A3B, 14B-A2.7B
+    # Look for patterns like N.B or NMB where N is a number
+    match = re.search(
+        r'(?<!\d)(\d+(?:\.\d+)?)([Bb])(?!\d)',
+        text,
+    )
+    if match:
+        num_str = match.group(1)
+        unit = match.group(2).upper()
+        try:
+            num = float(num_str)
+            # Normalize: if num < 1000, treat as B (billions of params)
+            if num < 1000:
+                return f"{num_str}{unit}", num, unit
+        except (ValueError, OverflowError):
+            pass
+
+    # Try to extract active parameters from MoE patterns like A3B
+    active_match = re.search(r'A(\d+(?:\.\d+)?)([Bb])(?!\d)', text)
+    active_num_str = None
+    if active_match:
+        active_num_str = active_match.group(1)
+        active_unit = active_match.group(2).upper()
+        try:
+            active_num = float(active_num_str)
+            return None, None, None  # We'll handle MoE separately
+        except (ValueError, OverflowError):
+            pass
+
+    return None, None, None
+
+
+def _parse_total_and_active_params(text: str) -> tuple[Optional[str], Optional[float], Optional[str], Optional[str], Optional[float]]:
+    """Parse total and active parameter sizes from MoE model names.
+
+    Examples:
+        'Qwen3.6-35B-A3B-GGUF' → ('35B', 35.0, 'B', '3B', 3.0)
+        'model-70B-A32B' → ('70B', 70.0, 'B', '32B', 32.0)
+        'llama-7B' → ('7B', 7.0, 'B', None, None)
+
+    Returns (total_str, total_num, total_unit, active_str, active_num)
+    """
+    if not text:
+        return None, None, None, None, None
+
+    # Match total params: number followed by B before -A
+    total_match = re.search(r'(?<!\d)(\d+(?:\.\d+)?)([Bb])(?=\s*-[Aa])', text)
+    active_match = re.search(r'-[Aa](\d+(?:\.\d+)?)([Bb])(?=\s*[-_]|$)', text)
+
+    total_str = None
+    total_num = None
+    active_str = None
+    active_num = None
+
+    if total_match:
+        try:
+            total_num = float(total_match.group(1))
+            total_str = f"{total_match.group(1)}{total_match.group(2).upper()}"
+        except (ValueError, OverflowError):
+            pass
+
+    if active_match and total_num is not None:
+        try:
+            active_num = float(active_match.group(1))
+            active_str = f"{active_match.group(1)}{active_match.group(2).upper()}"
+        except (ValueError, OverflowError):
+            pass
+
+    return total_str, total_num, "B", active_str, active_num
+
+
+def _get_file_size_via_head(url: str, timeout: float = 5.0) -> int | None:
+    """Try to get file size via HEAD request to the resolve URL.
+
+    Returns size in bytes or None on failure.
+    """
+    if not url:
+        return None
+    try:
+        resp = requests.head(url, timeout=timeout, allow_redirects=True)
+        if resp.status_code in (200, 206, 301, 302, 307, 308):
+            cl = resp.headers.get("Content-Length")
+            if cl:
+                try:
+                    return int(cl)
+                except (ValueError, TypeError):
+                    pass
+    except (requests.RequestException, OSError, ValueError):
+        pass
+    return None
+
+
+def _size_fields(nbytes: int | float | None) -> dict:
+    """Build size-related fields for a file entry.
+
+    Returns dict with:
+      - size_bytes: int or None
+      - size_human: str (GiB/MiB)
+      - size_human_metric: str (GB/MB)
+      - size_gib: float or None
+      - size_gb: float or None
+    """
+    if isinstance(nbytes, (int, float)) and nbytes > 0:
+        return {
+            "size_bytes": int(nbytes),
+            "size_human": _human_size(nbytes),
+            "size_human_metric": _human_size_metric(nbytes),
+            "size_gib": round(nbytes / (1 << 30), 2),
+            "size_gb": round(nbytes / 1_000_000_000, 2),
+        }
+    return {
+        "size_bytes": None,
+        "size_human": "unknown",
+        "size_human_metric": "unknown",
+        "size_gib": None,
+        "size_gb": None,
+    }
 
 
 def _validate_model_filename(name: str) -> Optional[str]:
@@ -721,20 +872,46 @@ def _ensure_under_model_dir(path: Path) -> bool:
 def _parse_quant_from_filename(filename: str) -> str:
     """Extract quantization type from a GGUF filename.
 
+    Handles modern quant names including _XL, _XXS variants, MXFP4, BF16, etc.
+
     Examples:
-        'model-Q4_K_M.gguf' -> 'Q4_K_M'
+        'model-Q4_K_XL.gguf' -> 'Q4_K_XL'
         'llama-3b-Q8_0.gguf' -> 'Q8_0'
         'model-IQ4_XS.gguf' -> 'IQ4_XS'
+        'model-IQ2_XXS.gguf' -> 'IQ2_XXS'
+        'model-BF16.gguf' -> 'BF16'
     """
-    stem = Path(filename).stem  # e.g. 'model-Q4_K_M'
-    for quant in _QUANT_ORDER:
-        if quant in stem:
-            return quant
-    # Fallback: try to find any known quant pattern in the stem
-    import re
-    match = re.search(r'\b(Q[2-9]|IQ[1-4])_(?:K_)?[0-9_]+\b', stem, re.IGNORECASE)
-    if match:
-        return match.group(0).upper()
+    stem = Path(filename).stem  # e.g. 'model-Q4_K_XL'
+    name = stem
+
+    # Sort by length descending so longer names (Q4_K_XL) match before shorter (Q4_K)
+    known_quants = sorted(_QUANT_ORDER, key=len, reverse=True)
+
+    for q in known_quants:
+        if q in name:
+            return q
+
+    # Fallback: regex for common patterns
+    patterns = [
+        r'\b(Q8_K(?:_XL)?)\b',
+        r'\b(Q6_K(?:_XL)?)\b',
+        r'\b(Q5_K(?:_XL|_L|_M|_S)?|Q5_[01])\b',
+        r'\b(Q4_K(?:_XL|_L|_M|_S)?|Q4_[01])\b',
+        r'\b(Q3_K(?:_XL|_L|_M|_S)?)\b',
+        r'\b(Q2_K(?:_XL)?)\b',
+        r'\b(IQ3_XXS|IQ3_XS|IQ3_M|IQ3_S)\b',
+        r'\b(IQ4_XXS|IQ4_XS|IQ4_NL)\b',
+        r'\b(IQ2_XXS|IQ2_XS|IQ2_S|IQ2_M)\b',
+        r'\b(IQ1_[MS])\b',
+        r'\b(MXFP4(?:_MOE)?)\b',
+        r'\b(BF16)\b',
+        r'\b(F16|F32)\b',
+    ]
+    for pat in patterns:
+        m = re.search(pat, name)
+        if m:
+            return m.group(1)
+
     return "unknown"
 
 
@@ -903,16 +1080,25 @@ def _hf_search_models(query: str, limit: int, sort: str) -> tuple[dict, bool, fl
                 break
         raw_results = verified
 
-    # Add GGUF counts if not already set
+    # Add GGUF counts and parameter sizes if not already set
     for item in raw_results:
         if "gguf_count" not in item:
             gguf_info = _hf_repo_gguf_files_internal(item["repo_id"])
             if gguf_info:
                 item["gguf_count"] = gguf_info.get("gguf_count", 0)
                 item["sample_gguf_files"] = gguf_info.get("sample_files", [])
+                item["parameter_size"] = gguf_info.get("parameter_size")
+                item["parameter_size_num"] = gguf_info.get("parameter_size_num")
+                item["parameter_size_unit"] = gguf_info.get("parameter_size_unit")
+                item["parameter_size_active"] = gguf_info.get("parameter_size_active")
+                item["parameter_size_active_num"] = gguf_info.get("parameter_size_active_num")
             else:
                 item["gguf_count"] = 0
                 item["sample_gguf_files"] = []
+                fp, fn, fu = _parse_total_and_active_params(item.get("model_id", item.get("repo_id", "")))
+                item["parameter_size"] = fp
+                item["parameter_size_num"] = fn
+                item["parameter_size_unit"] = fu
 
     return raw_results, was_cached, age
 
@@ -941,23 +1127,54 @@ def _hf_repo_gguf_files_internal(repo_id: str) -> Optional[dict]:
     if not isinstance(siblings, list):
         return {"repo_id": repo_id, "gguf_count": 0, "files": []}
 
+    # Extract repo ID for parameter size inference
+    repo_parts = repo_id.split("/")
+    repo_name = repo_parts[-1] if repo_parts else repo_id
+
+    # Infer parameter size from repo name
+    param_total, param_num, param_unit, param_active_total, param_active_num = _parse_total_and_active_params(repo_name)
+
     gguf_files = []
     for sibling in siblings:
         if not isinstance(sibling, dict):
             continue
         path = sibling.get("rfilename") or sibling.get("path", "")
         if path.lower().endswith(".gguf"):
-            size = sibling.get("size", 0)
+            filename = Path(path).name
             quant = _parse_quant_from_filename(path)
+
+            # Start with sibling-provided size
+            size = sibling.get("size") if isinstance(sibling.get("size"), (int, float)) else None
+
+            # If size is missing/zero, try HEAD request to resolve URL
+            if not size or size == 0:
+                resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{path}"
+                head_size = _get_file_size_via_head(resolve_url, timeout=_QONDUIT_HF_NETWORK_TIMEOUT_SECONDS)
+                if head_size and head_size > 0:
+                    size = head_size
+
+            # Build size fields
+            sf = _size_fields(size)
+
+            # Infer parameter size from filename
+            fp, fn, fu = _parse_total_and_active_params(filename)
+
+            # Build downloadable URL
+            blob_url = f"https://huggingface.co/{repo_id}/blob/main/{path}"
+            resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{path}"
+
             gguf_files.append({
-                "filename": Path(path).name,
+                "filename": filename,
                 "path": path,
-                "size_bytes": size if isinstance(size, int) else 0,
-                "size_human": _human_size(size) if isinstance(size, (int, float)) and size >= 0 else "",
                 "is_gguf": True,
                 "quant": quant,
                 "downloadable": True,
-                "url": f"https://huggingface.co/{repo_id}/blob/main/{path}",
+                "url": blob_url,
+                "resolve_url": resolve_url,
+                **sf,
+                "parameter_size": fp,
+                "parameter_size_num": fn,
+                "parameter_size_unit": fu,
             })
 
     # Sort by quant order
@@ -973,6 +1190,11 @@ def _hf_repo_gguf_files_internal(repo_id: str) -> Optional[dict]:
         "url": f"https://huggingface.co/{repo_id}",
         "gated": raw.get("gated", False),
         "private": raw.get("private", False),
+        "parameter_size": param_total,
+        "parameter_size_num": param_num,
+        "parameter_size_unit": param_unit,
+        "parameter_size_active": param_active_total,
+        "parameter_size_active_num": param_active_num,
     }
 
 
@@ -1008,52 +1230,69 @@ def qonduit_hf_search():
         # Rate-limit identical queries
         cooldown_key = f"cooldown:{query}:{sort}"
         now = time.time()
+        in_cooldown = False
         if cooldown_key in _hf_search_cooldown:
             last_time = _hf_search_cooldown[cooldown_key]
             elapsed = now - last_time
             if elapsed < _QONDUIT_HF_SEARCH_COOLDOWN:
-                retry_after = round(_QONDUIT_HF_SEARCH_COOLDOWN - elapsed, 1)
-                return jsonify({
-                    "ok": False,
-                    "error": "rate_limited",
-                    "query": query,
-                    "limit": limit,
-                    "sort": sort,
-                    "require_gguf": _QONDUIT_HF_REQUIRE_GGUF,
-                    "source": "huggingface",
-                    "hf_models_url": f"https://huggingface.co/models?search={requests.utils.quote(query)}",
-                    "cached": False,
-                    "cache_age_seconds": 0,
-                    "results": [],
-                    "retry_after_seconds": retry_after,
-                }), 429
+                in_cooldown = True
+
+        # Check result cache FIRST (before rate-limit blocks)
+        cache_key = f"search:{query}:{sort}:{limit}"
+        cached_results = None
+        cached_age = 0
+        if cache_key in _hf_cache:
+            raw_results, cached_at = _hf_cache[cache_key]
+            if raw_results is not None and isinstance(raw_results, list):
+                cached_results = raw_results
+                cached_age = round(now - cached_at, 1)
+
+        # If cache exists, return it (with rate_limited flag if in cooldown)
+        if cached_results is not None:
+            hf_models_url = f"https://huggingface.co/models?search={requests.utils.quote(query)}"
+            resp = {
+                "ok": True,
+                "query": query,
+                "count": len(cached_results),
+                "limit": limit,
+                "sort": sort,
+                "require_gguf": _QONDUIT_HF_REQUIRE_GGUF,
+                "source": "huggingface",
+                "hf_models_url": hf_models_url,
+                "cached": True,
+                "cache_age_seconds": cached_age,
+                "results": cached_results,
+                "error": None,
+            }
+            if in_cooldown:
+                resp["rate_limited"] = True
+                resp["retry_after_seconds"] = round(_QONDUIT_HF_SEARCH_COOLDOWN - (now - _hf_search_cooldown[cooldown_key]), 1)
+            return jsonify(resp)
+
+        # If in cooldown and NO cache, return 429
+        if in_cooldown:
+            retry_after = round(_QONDUIT_HF_SEARCH_COOLDOWN - (now - _hf_search_cooldown[cooldown_key]), 1)
+            return jsonify({
+                "ok": False,
+                "error": "rate_limited",
+                "query": query,
+                "limit": limit,
+                "sort": sort,
+                "require_gguf": _QONDUIT_HF_REQUIRE_GGUF,
+                "source": "huggingface",
+                "hf_models_url": f"https://huggingface.co/models?search={requests.utils.quote(query)}",
+                "cached": False,
+                "cache_age_seconds": 0,
+                "results": [],
+                "retry_after_seconds": retry_after,
+            }), 429
+
         _hf_search_cooldown[cooldown_key] = now
 
         # Check cooldown cache expiry too
         for key in list(_hf_search_cooldown.keys()):
             if key.startswith("cooldown:") and now - _hf_search_cooldown[key] > _QONDUIT_HF_CACHE_TTL * 2:
                 del _hf_search_cooldown[key]
-
-        # Check result cache
-        cache_key = f"search:{query}:{sort}:{limit}"
-        if cache_key in _hf_cache:
-            raw_results, cached_at = _hf_cache[cache_key]
-            if raw_results is not None and isinstance(raw_results, list):
-                hf_models_url = f"https://huggingface.co/models?search={requests.utils.quote(query)}"
-                return jsonify({
-                    "ok": True,
-                    "query": query,
-                    "count": len(raw_results),
-                    "limit": limit,
-                    "sort": sort,
-                    "require_gguf": _QONDUIT_HF_REQUIRE_GGUF,
-                    "source": "huggingface",
-                    "hf_models_url": hf_models_url,
-                    "cached": True,
-                    "cache_age_seconds": round(now - cached_at, 1),
-                    "results": raw_results,
-                    "error": None,
-                })
 
         # Fetch from HF
         results, was_cached, cache_age = _hf_search_models(query, limit, sort)
@@ -1131,6 +1370,66 @@ def qonduit_hf_repo_files():
                 "cached": False,
             }), 400
 
+        # Check cooldown for repo files
+        cooldown_key = f"cooldown:repofiles:{repo_id}"
+        now = time.time()
+        in_cooldown = False
+        if cooldown_key in _hf_search_cooldown:
+            last_time = _hf_search_cooldown[cooldown_key]
+            elapsed = now - last_time
+            if elapsed < _QONDUIT_HF_SEARCH_COOLDOWN:
+                in_cooldown = True
+
+        # Check result cache FIRST
+        cache_key = f"repofiles:{repo_id}"
+        cached_results = None
+        cached_age = 0
+        if cache_key in _hf_cache:
+            raw_results, cached_at = _hf_cache[cache_key]
+            if raw_results is not None and isinstance(raw_results, dict):
+                cached_results = raw_results
+                cached_age = round(now - cached_at, 1)
+
+        # If cache exists, return it (with rate_limited flag if in cooldown)
+        if cached_results is not None:
+            resp = {
+                "ok": True,
+                "repo_id": repo_id,
+                "url": cached_results.get("url", f"https://huggingface.co/{repo_id}"),
+                "gguf_count": cached_results.get("gguf_count", 0),
+                "gated": cached_results.get("gated", False),
+                "private": cached_results.get("private", False),
+                "cached": True,
+                "cache_age_seconds": cached_age,
+                "files": cached_results.get("files", []),
+                "parameter_size": cached_results.get("parameter_size"),
+                "parameter_size_num": cached_results.get("parameter_size_num"),
+                "parameter_size_unit": cached_results.get("parameter_size_unit"),
+                "parameter_size_active": cached_results.get("parameter_size_active"),
+                "parameter_size_active_num": cached_results.get("parameter_size_active_num"),
+                "error": None,
+            }
+            if in_cooldown:
+                resp["rate_limited"] = True
+                resp["retry_after_seconds"] = round(_QONDUIT_HF_SEARCH_COOLDOWN - (now - _hf_search_cooldown[cooldown_key]), 1)
+            return jsonify(resp)
+
+        # If in cooldown and NO cache, return 429
+        if in_cooldown:
+            retry_after = round(_QONDUIT_HF_SEARCH_COOLDOWN - (now - _hf_search_cooldown[cooldown_key]), 1)
+            return jsonify({
+                "ok": False,
+                "error": "rate_limited",
+                "repo_id": repo_id,
+                "url": f"https://huggingface.co/{repo_id}",
+                "gguf_count": 0,
+                "files": [],
+                "cached": False,
+                "retry_after_seconds": retry_after,
+            }), 429
+
+        _hf_search_cooldown[cooldown_key] = now
+
         def _fetch() -> Optional[dict]:
             return _hf_repo_gguf_files_internal(repo_id)
 
@@ -1162,6 +1461,11 @@ def qonduit_hf_repo_files():
             "cached": was_cached,
             "cache_age_seconds": cache_age,
             "files": files,
+            "parameter_size": result.get("parameter_size"),
+            "parameter_size_num": result.get("parameter_size_num"),
+            "parameter_size_unit": result.get("parameter_size_unit"),
+            "parameter_size_active": result.get("parameter_size_active"),
+            "parameter_size_active_num": result.get("parameter_size_active_num"),
             "error": None,
         })
 
