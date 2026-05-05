@@ -520,67 +520,43 @@ def qonduit_logs():
     if denied:
         return denied
 
-    def generate():
-        last_container_check = 0
-        while True:
-            now = time.time()
-            # Check container existence every 3 seconds to avoid excessive subprocess calls
-            if now - last_container_check > 3:
-                exists_result = subprocess.run(
-                    ["sudo", "docker", "ps", "-a", "-q", "-f", f"name={QONDUIT_CONTAINER_NAME}"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                container_id = exists_result.stdout.strip()
-                last_container_check = now
-            else:
-                container_id = None
+    try:
+        result = subprocess.run(
+            ["sudo", "docker", "logs", "--tail", "300", QONDUIT_CONTAINER_NAME],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
 
-            # If we don't have a container_id yet, check
-            if not container_id:
-                yield "[qonduit] waiting for llama_server container...\n"
-                time.sleep(2)
-                continue
-
-            proc = subprocess.Popen(
-                ["sudo", "docker", "logs", "--tail", "200", "-f", QONDUIT_CONTAINER_NAME],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+        if result.returncode == 0:
+            logs_text = result.stdout if result.stdout else result.stderr
+            return Response(
+                (logs_text if logs_text else "[router] No log output available.\n"),
+                mimetype="text/plain",
             )
 
-            try:
-                assert proc.stdout is not None
-                line_buf = ""
-                for chunk in iter(proc.stdout.read, ""):
-                    line_buf += chunk
-                    lines = line_buf.split("\n")
-                    # Yield all complete lines
-                    for line in lines[:-1]:
-                        yield line + "\n"
-                    # Keep the last partial line
-                    line_buf = lines[-1]
+        # Container doesn't exist or docker failed
+        stderr = result.stderr.strip() if result.stderr else "docker returned non-zero exit"
+        return Response(
+            f"[router] llama_server logs unavailable.\n[router] docker returned: {stderr}\n",
+            mimetype="text/plain",
+        )
 
-                # Flush remaining buffer
-                if line_buf:
-                    yield line_buf
-                    if not line_buf.endswith("\n"):
-                        yield "\n"
-
-            except GeneratorExit:
-                proc.kill()
-                raise
-            finally:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-            yield "[qonduit] log stream ended, reconnecting...\n"
-            time.sleep(2)
-
-    return Response(generate(), mimetype="text/plain")
+    except subprocess.TimeoutExpired:
+        return Response(
+            "[router] llama_server logs unavailable.\n[router] docker logs timed out.\n",
+            mimetype="text/plain",
+        )
+    except FileNotFoundError:
+        return Response(
+            "[router] llama_server logs unavailable.\n[router] docker not found.\n",
+            mimetype="text/plain",
+        )
+    except Exception as e:
+        return Response(
+            f"[router] llama_server logs unavailable.\n[router] error: {e}\n",
+            mimetype="text/plain",
+        )
 
 @app.get("/api/v1/qonduit-router/context/suggest")
 def qonduit_context_suggest():
