@@ -1095,10 +1095,12 @@ def _hf_search_models(query: str, limit: int, sort: str) -> tuple[dict, bool, fl
             else:
                 item["gguf_count"] = 0
                 item["sample_gguf_files"] = []
-                fp, fn, fu = _parse_total_and_active_params(item.get("model_id", item.get("repo_id", "")))
+                fp, fn, fu, fa, fan = _parse_total_and_active_params(item.get("model_id", item.get("repo_id", "")))
                 item["parameter_size"] = fp
                 item["parameter_size_num"] = fn
                 item["parameter_size_unit"] = fu
+                item["parameter_size_active"] = fa
+                item["parameter_size_active_num"] = fan
 
     return raw_results, was_cached, age
 
@@ -1157,7 +1159,7 @@ def _hf_repo_gguf_files_internal(repo_id: str) -> Optional[dict]:
             sf = _size_fields(size)
 
             # Infer parameter size from filename
-            fp, fn, fu = _parse_total_and_active_params(filename)
+            fp, fn, fu, fa, fan = _parse_total_and_active_params(filename)
 
             # Build downloadable URL
             blob_url = f"https://huggingface.co/{repo_id}/blob/main/{path}"
@@ -1175,6 +1177,8 @@ def _hf_repo_gguf_files_internal(repo_id: str) -> Optional[dict]:
                 "parameter_size": fp,
                 "parameter_size_num": fn,
                 "parameter_size_unit": fu,
+                "parameter_size_active": fa,
+                "parameter_size_active_num": fan,
             })
 
     # Sort by quant order
