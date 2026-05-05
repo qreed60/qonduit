@@ -123,8 +123,12 @@ sudo docker run -d \
   -p "$HOST_PORT:$HOST_PORT" \
   -v /mnt/models:/mnt/models \
   --env PYTHONUNBUFFERED=1 \
+  --env QONDUIT_MODEL_NAME="$MODEL_NAME" \
+  --env QONDUIT_CONTEXT_SIZE="$CONTEXT_SIZE" \
   --log-opt mode=non-blocking \
   --log-opt max-buffer-size=4m \
+  --label qonduit.model="$MODEL_NAME" \
+  --label qonduit.context_size="$CONTEXT_SIZE" \
   "$IMAGE_NAME" \
   ./build/bin/llama-server \
   --model "$MODEL_PATH" \

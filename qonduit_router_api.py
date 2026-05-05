@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import json
+import math
 import os
+import re
 import time
 import requests
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
+
+# ── State file path ─────────────────────────────────────────────────────────
+_STATE_DIR = Path("/var/lib/qonduit-router")
+_STATE_FILE = _STATE_DIR / "state.json"
+_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── CORS middleware (after_request handler) ─────────────────────────────────
 # Environment-driven origin list with safe defaults.
@@ -122,6 +131,46 @@ def _docker_container_running() -> bool:
     return bool(result.stdout.strip())
 
 
+def _docker_container_id() -> str:
+    """Return the container ID if running, empty string otherwise."""
+    result = subprocess.run(
+        ["sudo", "docker", "ps", "-q", "-f", f"name={QONDUIT_CONTAINER_NAME}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def _docker_container_image() -> str:
+    """Return the image name of the running container, empty string otherwise."""
+    result = subprocess.run(
+        ["sudo", "docker", "inspect", "-f", "{{.Config.Image}}", QONDUIT_CONTAINER_NAME],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return ""
+
+
+def _docker_container_labels() -> dict[str, str]:
+    """Return the labels of the running container."""
+    try:
+        result = subprocess.run(
+            ["sudo", "docker", "inspect", "-f", "{{json .Config.Labels}}", QONDUIT_CONTAINER_NAME],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
 def _qonduit_model_list() -> list[str]:
     if not QONDUIT_MODEL_DIR.exists():
         return []
@@ -131,10 +180,95 @@ def _qonduit_model_list() -> list[str]:
     )
 
 
+def _qonduit_model_metadata() -> list[dict[str, Any]]:
+    """Return enriched metadata for every GGUF model on disk."""
+    if not QONDUIT_MODEL_DIR.exists():
+        return []
+
+    running = _docker_container_running()
+    labels = _docker_container_labels() if running else {}
+    running_model = labels.get("qonduit.model", "")
+    suggested_ctx = _qonduit_suggested_ctx()
+
+    results: list[dict[str, Any]] = []
+    for path in sorted(QONDUIT_MODEL_DIR.glob("*.gguf"), key=lambda p: p.name.lower()):
+        stat = path.stat()
+        name = path.name
+        size_bytes = stat.st_size
+        results.append({
+            "name": name,
+            "id": name,
+            "path": str(path.relative_to(QONDUIT_MODEL_DIR)),
+            "file_size_bytes": size_bytes,
+            "file_size_human": _format_bytes_human(size_bytes),
+            "parameter_size": _extract_parameter_size(name),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            "suggested_context": suggested_ctx,
+            "launchable": True,
+            "is_running": name == running_model and running,
+        })
+    return results
+
+
+def _extract_parameter_size(filename: str) -> str:
+    """Best-effort extraction of parameter size (e.g. '35B') from a GGUF filename."""
+    match = re.search(r'(?i)(\d+(?:\.\d+)?)\s*(B|b)', filename)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    return "unknown"
+
+
 def _qonduit_suggested_ctx() -> int:
-    # Keep it simple for now. Match your current launcher default behavior closely.
-    # You can replace this later with smarter heuristics by file size or VRAM.
     return 65536
+
+
+def _format_bytes_human(nbytes: int) -> str:
+    """Format bytes as a human-readable string (e.g. '24.8 GiB')."""
+    if nbytes < 0:
+        return "0 B"
+    units = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)]
+    for unit, divisor in units:
+        if nbytes >= divisor:
+            value = nbytes / divisor
+            if unit == "GiB":
+                return f"{value:.1f} {unit}"
+            return f"{int(value)} {unit}"
+    return f"{nbytes} B"
+
+
+def _read_state() -> dict[str, Any]:
+    """Read the state file, returning empty dict if missing or invalid."""
+    try:
+        if _STATE_FILE.exists():
+            with open(_STATE_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _write_state(model: str, context_size: int) -> None:
+    """Write the current launch state to disk."""
+    try:
+        state = {
+            "model": model,
+            "context_size": context_size,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _STATE_FILE.write_text(json.dumps(state, indent=2))
+    except OSError:
+        pass
+
+
+def _clear_state() -> None:
+    """Clear the state file (e.g. after stop)."""
+    try:
+        if _STATE_FILE.exists():
+            _STATE_FILE.unlink()
+    except OSError:
+        pass
 
 
 @app.get("/api/v1/qonduit-router/health")
@@ -156,10 +290,12 @@ def qonduit_models():
         return denied
 
     models = _qonduit_model_list()
+    enriched = _qonduit_model_metadata()
     return jsonify(
         {
             "ok": True,
-            "models": models,
+            "models": enriched,
+            "model_names": models,
             "suggested_context": _qonduit_suggested_ctx(),
             "count": len(models),
         }
@@ -172,15 +308,52 @@ def qonduit_status():
     if denied:
         return denied
 
-    return jsonify(
-        {
-            "ok": True,
-            "container_name": QONDUIT_CONTAINER_NAME,
-            "running": _docker_container_running(),
-            "exists": _docker_container_exists(),
-            "webui_base": QONDUIT_WEBUI_BASE,
-            "llama_base": QONDUIT_LLAMA_BASE,
-        }
+    state = _read_state()
+    running = _docker_container_running()
+    labels = _docker_container_labels() if running else {}
+
+    # Try to get model/context from container labels first, then state file
+    running_model = labels.get("qonduit.model", state.get("model", ""))
+    context_size = labels.get("qonduit.context_size", "")
+    if context_size:
+        try:
+            context_size = int(context_size)
+        except (ValueError, TypeError):
+            context_size = state.get("context_size", 0)
+    else:
+        context_size = state.get("context_size", 0)
+
+    # Check readiness via llama health endpoint
+    is_ready = False
+    try:
+        resp = requests.get(f"{QONDUIT_LLAMA_BASE}/health", timeout=2)
+        is_ready = resp.status_code == 200
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "container_name": QONDUIT_CONTAINER_NAME,
+        "running": running,
+        "exists": _docker_container_exists(),
+        "webui_base": QONDUIT_WEBUI_BASE,
+        "llama_base": QONDUIT_LLAMA_BASE,
+        "running_model": running_model,
+        "context_size": context_size,
+        "last_launch": state.get("started_at", ""),
+        "ready": is_ready,
+        "container_id": _docker_container_id() if running else "",
+        "image": _docker_container_image() if running else "",
+    })
+
+
+def _safe_launch(model: str, context_size: int) -> subprocess.Popen:
+    """Launch llama_server via the launcher script, writing state."""
+    _write_state(model, context_size)
+    return subprocess.Popen(
+        ["sudo", QONDUIT_SCRIPT_PATH, model, str(context_size)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
@@ -203,11 +376,8 @@ def qonduit_launch():
     if model not in _qonduit_model_list():
         return jsonify({"ok": False, "error": "model_not_found", "model": model}), 404
 
-    proc = subprocess.Popen(
-        ["sudo", QONDUIT_SCRIPT_PATH, model, context],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    ctx_int = int(context)
+    proc = _safe_launch(model, ctx_int)
 
     return jsonify(
         {
@@ -215,7 +385,7 @@ def qonduit_launch():
             "started": True,
             "pid": proc.pid,
             "model": model,
-            "context_size": int(context),
+            "context_size": ctx_int,
             "llama_base": QONDUIT_LLAMA_BASE,
             "webui_base": QONDUIT_WEBUI_BASE,
         }
@@ -234,8 +404,115 @@ def qonduit_stop():
         text=True,
         check=False,
     )
+    _clear_state()
 
     return jsonify({"ok": True, "stopped": True, "container_name": QONDUIT_CONTAINER_NAME})
+
+
+@app.post("/api/v1/qonduit-router/restart")
+def qonduit_restart():
+    denied = _require_local()
+    if denied:
+        return denied
+
+    payload = request.get_json(silent=True) or {}
+    model = (payload.get("model") or "").strip()
+    context = str(payload.get("context_size") or "").strip()
+
+    # If no model provided, try current running model from state/labels
+    if not model:
+        state = _read_state()
+        model = state.get("model", "")
+        if not model:
+            return jsonify({"ok": False, "error": "model_required"}), 400
+
+    # If no context provided, try current from state or labels
+    if not context:
+        state = _read_state()
+        context = str(state.get("context_size", ""))
+    if not context:
+        context = str(_qonduit_suggested_ctx())
+
+    if model not in _qonduit_model_list():
+        return jsonify({"ok": False, "error": "model_not_found", "model": model}), 404
+
+    ctx_int = int(context)
+    proc = _safe_launch(model, ctx_int)
+
+    return jsonify(
+        {
+            "ok": True,
+            "restarted": True,
+            "model": model,
+            "context_size": ctx_int,
+            "pid": proc.pid,
+        }
+    )
+
+
+@app.get("/api/v1/qonduit-router/gpu")
+def qonduit_gpu():
+    denied = _require_local()
+    if denied:
+        return denied
+
+    try:
+        result = subprocess.run(
+            [
+                "sudo", "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "nvidia-smi failed")
+
+        gpus: list[dict[str, Any]] = []
+        total_mib = 0
+        used_mib = 0
+        free_mib = 0
+
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5:
+                continue
+            idx = int(parts[0])
+            name = parts[1]
+            mem_total = int(parts[2])
+            mem_used = int(parts[3])
+            mem_free = int(parts[4])
+
+            gpus.append({
+                "index": idx,
+                "name": name,
+                "memory_total_mib": mem_total,
+                "memory_used_mib": mem_used,
+                "memory_free_mib": mem_free,
+            })
+            total_mib += mem_total
+            used_mib += mem_used
+            free_mib += mem_free
+
+        return jsonify({
+            "ok": True,
+            "gpus": gpus,
+            "memory_total_mib": total_mib,
+            "memory_used_mib": used_mib,
+            "memory_free_mib": free_mib,
+            "memory_total_human": _format_bytes_human(total_mib * 1024 * 1024),
+            "memory_used_human": _format_bytes_human(used_mib * 1024 * 1024),
+            "memory_free_human": _format_bytes_human(free_mib * 1024 * 1024),
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "gpu_query_failed",
+            "detail": str(e),
+        }), 503
 
 @app.get("/api/v1/qonduit-router/logs")
 def qonduit_logs():
@@ -244,15 +521,24 @@ def qonduit_logs():
         return denied
 
     def generate():
+        last_container_check = 0
         while True:
-            exists = subprocess.run(
-                ["sudo", "docker", "ps", "-a", "-q", "-f", f"name={QONDUIT_CONTAINER_NAME}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout.strip()
+            now = time.time()
+            # Check container existence every 3 seconds to avoid excessive subprocess calls
+            if now - last_container_check > 3:
+                exists_result = subprocess.run(
+                    ["sudo", "docker", "ps", "-a", "-q", "-f", f"name={QONDUIT_CONTAINER_NAME}"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                container_id = exists_result.stdout.strip()
+                last_container_check = now
+            else:
+                container_id = None
 
-            if not exists:
+            # If we don't have a container_id yet, check
+            if not container_id:
                 yield "[qonduit] waiting for llama_server container...\n"
                 time.sleep(2)
                 continue
@@ -266,8 +552,22 @@ def qonduit_logs():
 
             try:
                 assert proc.stdout is not None
-                for line in iter(proc.stdout.readline, ""):
-                    yield line
+                line_buf = ""
+                for chunk in iter(proc.stdout.read, ""):
+                    line_buf += chunk
+                    lines = line_buf.split("\n")
+                    # Yield all complete lines
+                    for line in lines[:-1]:
+                        yield line + "\n"
+                    # Keep the last partial line
+                    line_buf = lines[-1]
+
+                # Flush remaining buffer
+                if line_buf:
+                    yield line_buf
+                    if not line_buf.endswith("\n"):
+                        yield "\n"
+
             except GeneratorExit:
                 proc.kill()
                 raise
