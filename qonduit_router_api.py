@@ -1028,8 +1028,16 @@ def _cached_hf_call(cache_key: str, fetch_func, **kwargs) -> tuple[Any, bool, fl
     return result, False, 0.0
 
 
-def _hf_search_models(query: str, limit: int, sort: str) -> tuple[dict, bool, float]:
+def _hf_search_models(
+    query: str,
+    limit: int,
+    sort: str,
+    verify_gguf: bool = False,
+) -> tuple[dict, bool, float]:
     """Search Hugging Face models for repos matching the query.
+
+    Fast path (default): metadata-only search using HF API tags and repo names.
+    Slow path (verify_gguf=True): inspects each candidate repo for actual GGUF files.
 
     Returns (result_dict, was_cached, cache_age_seconds).
     """
@@ -1081,7 +1089,9 @@ def _hf_search_models(query: str, limit: int, sort: str) -> tuple[dict, bool, fl
     }
     sort_key = sort_map.get(sort, "downloads")
 
-    cache_key = f"search:{query}:{sort_key}:{limit}"
+    # Cache key includes verify flag so verified and unverified results
+    # are cached separately.
+    cache_key = f"search:{query}:{sort_key}:{limit}:verify={verify_gguf}"
     raw_results, was_cached, age = _cached_hf_call(
         cache_key, _fetch, sort_key=sort_key,
     )
@@ -1089,8 +1099,50 @@ def _hf_search_models(query: str, limit: int, sort: str) -> tuple[dict, bool, fl
     if raw_results is None:
         return None, was_cached, age
 
-    # Optionally verify GGUF files exist in each repo
-    if _QONDUIT_HF_REQUIRE_GGUF:
+    # ── Fast path: metadata-only GGUF filtering ──────────────────────────
+    has_gguf_meta = _QONDUIT_HF_REQUIRE_GGUF or verify_gguf
+    if has_gguf_meta:
+        filtered = []
+        for candidate in raw_results:
+            tags_lower = [t.lower() for t in candidate.get("tags", [])]
+            repo_lower = candidate["repo_id"].lower()
+            if "gguf" in tags_lower or "gguf" in repo_lower:
+                # Metadata indicates GGUF; do NOT inspect files here.
+                candidate["gguf_count"] = None  # unknown without inspection
+                candidate["sample_gguf_files"] = []
+                candidate["gguf_verified"] = False
+                filtered.append(candidate)
+            else:
+                # No GGUF in metadata — skip entirely when require_gguf
+                if _QONDUIT_HF_REQUIRE_GGUF:
+                    continue
+                # When only verify_gguf=True but require_gguf=False, keep
+                # the result but mark it as unverified.
+                candidate["gguf_count"] = 0
+                candidate["sample_gguf_files"] = []
+                candidate["gguf_verified"] = False
+                filtered.append(candidate)
+        raw_results = filtered
+
+    # Add parameter sizes from metadata only (fast, no API call to repo endpoint).
+    for item in raw_results:
+        if "gguf_count" not in item:
+            item["gguf_count"] = 0
+            item["sample_gguf_files"] = []
+        if "gguf_verified" not in item:
+            item["gguf_verified"] = False
+        if "parameter_size" not in item:
+            fp, fn, fu, fa, fan = _parse_total_and_active_params(
+                item.get("model_id", item.get("repo_id", "")),
+            )
+            item["parameter_size"] = fp
+            item["parameter_size_num"] = fn
+            item["parameter_size_unit"] = fu
+            item["parameter_size_active"] = fa
+            item["parameter_size_active_num"] = fan
+
+    # ── Slow path: inspect each candidate for actual GGUF files ──────────
+    if verify_gguf:
         verified = []
         max_inspect = limit * 3  # Inspect at most 3x requested limit
         inspected = 0
@@ -1102,32 +1154,16 @@ def _hf_search_models(query: str, limit: int, sort: str) -> tuple[dict, bool, fl
             if gguf_info and gguf_info.get("gguf_count", 0) > 0:
                 candidate["gguf_count"] = gguf_info["gguf_count"]
                 candidate["sample_gguf_files"] = gguf_info.get("sample_files", [])
+                candidate["gguf_verified"] = True
+                candidate["parameter_size"] = gguf_info.get("parameter_size")
+                candidate["parameter_size_num"] = gguf_info.get("parameter_size_num")
+                candidate["parameter_size_unit"] = gguf_info.get("parameter_size_unit")
+                candidate["parameter_size_active"] = gguf_info.get("parameter_size_active")
+                candidate["parameter_size_active_num"] = gguf_info.get("parameter_size_active_num")
                 verified.append(candidate)
             if len(verified) >= limit:
                 break
         raw_results = verified
-
-    # Add GGUF counts and parameter sizes if not already set
-    for item in raw_results:
-        if "gguf_count" not in item:
-            gguf_info = _hf_repo_gguf_files_internal(item["repo_id"])
-            if gguf_info:
-                item["gguf_count"] = gguf_info.get("gguf_count", 0)
-                item["sample_gguf_files"] = gguf_info.get("sample_files", [])
-                item["parameter_size"] = gguf_info.get("parameter_size")
-                item["parameter_size_num"] = gguf_info.get("parameter_size_num")
-                item["parameter_size_unit"] = gguf_info.get("parameter_size_unit")
-                item["parameter_size_active"] = gguf_info.get("parameter_size_active")
-                item["parameter_size_active_num"] = gguf_info.get("parameter_size_active_num")
-            else:
-                item["gguf_count"] = 0
-                item["sample_gguf_files"] = []
-                fp, fn, fu, fa, fan = _parse_total_and_active_params(item.get("model_id", item.get("repo_id", "")))
-                item["parameter_size"] = fp
-                item["parameter_size_num"] = fn
-                item["parameter_size_unit"] = fu
-                item["parameter_size_active"] = fa
-                item["parameter_size_active_num"] = fan
 
     return raw_results, was_cached, age
 
@@ -1232,39 +1268,92 @@ def _hf_repo_gguf_files_internal(repo_id: str) -> Optional[dict]:
 # ── Download Job Helpers ─────────────────────────────────────────────────────
 
 def _persist_download_jobs() -> None:
-    """Persist download job state to disk."""
+    """Persist download job state and queue to disk."""
     try:
         with _download_jobs_lock:
             jobs_snapshot = {
                 jid: dict(job) for jid, job in _download_jobs.items()
             }
+        with _download_queue_lock:
+            queue_snapshot = list(_download_queue)
+        snapshot = {
+            "jobs": jobs_snapshot,
+            "queue": queue_snapshot,
+        }
         with open(_DOWNLOAD_JOBS_FILE, "w") as f:
-            json.dump(jobs_snapshot, f, indent=2)
+            json.dump(snapshot, f, indent=2)
     except OSError:
         pass
 
 
 def _load_download_jobs() -> None:
-    """Load persisted download jobs from disk on startup."""
+    """Load persisted download jobs from disk on startup.
+
+    Supports both the new format ({"jobs": {...}, "queue": [...]}) and
+    the legacy format (raw dict of jobs) for backward compatibility.
+
+    - "downloading" jobs are marked "interrupted" (cannot resume mid-download).
+    - "queued" jobs are preserved as "queued" so the worker picks them up.
+    - The in-memory queue list is rebuilt from queued jobs.
+    - The worker thread is started automatically if queued jobs exist.
+    """
     global _download_active_count
     try:
         if not _DOWNLOAD_JOBS_FILE.exists():
             return
         with open(_DOWNLOAD_JOBS_FILE, "r") as f:
-            jobs_snapshot: dict[str, dict[str, Any]] = json.load(f)
+            raw: dict = json.load(f)
+
+        # Handle both new format and legacy format
+        if isinstance(raw, dict) and "jobs" in raw and "queue" in raw:
+            # New format
+            jobs_snapshot: dict[str, dict[str, Any]] = raw["jobs"]
+            queue_snapshot: list[str] = raw.get("queue", [])
+        elif isinstance(raw, dict):
+            # Legacy format: raw dict of jobs
+            jobs_snapshot = raw
+            queue_snapshot = []
+        else:
+            return
+
         with _download_jobs_lock:
             for jid, job in jobs_snapshot.items():
                 status = job.get("status", "failed")
-                if status in ("downloading", "queued"):
+                if status == "downloading":
+                    # Cannot resume an in-progress download; mark interrupted
                     job["status"] = "interrupted"
                     job["error"] = "Service restart; in-progress downloads not resumed."
                     job["completed_at"] = datetime.now(timezone.utc).isoformat()
+                elif status == "queued":
+                    # Queued jobs were never started; keep them as queued
+                    job["status"] = "queued"
+                    job["error"] = None
+                    job["completed_at"] = None
+                # All other statuses (complete, failed, cancelled, interrupted)
+                # are preserved as-is.
                 _download_jobs[jid] = job
+
             # Count currently active downloads (should be 0 after restart)
             _download_active_count = sum(
                 1 for j in _download_jobs.values()
                 if j.get("status") == "downloading"
             )
+
+        # Rebuild the in-memory queue from persisted queue list + queued jobs
+        with _download_queue_lock:
+            _download_queue.clear()
+            for jid in queue_snapshot:
+                if jid in _download_jobs and _download_jobs[jid].get("status") == "queued":
+                    _download_queue.append(jid)
+            # Also scan for any queued jobs not in the persisted queue
+            for jid, job in _download_jobs.items():
+                if job.get("status") == "queued" and jid not in _download_queue:
+                    _download_queue.append(jid)
+
+        # Start the worker if there are queued jobs
+        if _download_queue:
+            _ensure_download_worker_started()
+
     except (json.JSONDecodeError, OSError):
         pass
 
@@ -1800,6 +1889,9 @@ def qonduit_hf_downloads_list():
         if denied:
             return denied
 
+        # Check if worker thread is alive; restart if needed
+        _maybe_restart_download_worker()
+
         with _download_jobs_lock:
             jobs_snapshot = dict(_download_jobs)
 
@@ -1818,6 +1910,7 @@ def qonduit_hf_downloads_list():
             "jobs": jobs,
             "active_count": active_count,
             "queued_count": queued_count,
+            "worker_alive": _download_worker_thread is not None and _download_worker_thread.is_alive(),
             "total": len(jobs),
         })
 
@@ -1941,6 +2034,9 @@ def qonduit_hf_search():
         if sort not in valid_sorts:
             sort = "downloads"
 
+        # Optional: request full GGUF verification (slow)
+        verify_gguf = request.args.get("verify", "false").lower() == "true"
+
         # Rate-limit identical queries
         cooldown_key = f"cooldown:{query}:{sort}"
         now = time.time()
@@ -1952,7 +2048,7 @@ def qonduit_hf_search():
                 in_cooldown = True
 
         # Check result cache FIRST (before rate-limit blocks)
-        cache_key = f"search:{query}:{sort}:{limit}"
+        cache_key = f"search:{query}:{sort}:{limit}:verify={verify_gguf}"
         cached_results = None
         cached_age = 0
         if cache_key in _hf_cache:
@@ -2009,7 +2105,9 @@ def qonduit_hf_search():
                 del _hf_search_cooldown[key]
 
         # Fetch from HF
-        results, was_cached, cache_age = _hf_search_models(query, limit, sort)
+        results, was_cached, cache_age = _hf_search_models(
+            query, limit, sort, verify_gguf=verify_gguf,
+        )
 
         if results is None:
             return jsonify({
@@ -2447,6 +2545,108 @@ def qonduit_model_restore():
         }), 500
 
 
+# ── Endpoint: POST /models/trash/delete ─────────────────────────────────────
+
+@app.post("/api/v1/qonduit-router/models/trash/delete")
+def qonduit_model_trash_delete():
+    """Permanently delete (empty) a trashed model file.
+
+    This is the final destruction step after a model was moved to trash.
+    Only .gguf files in the trash directory are eligible.
+    """
+    try:
+        if not _QONDUIT_HF_ALLOW_DELETE:
+            return jsonify({
+                "ok": False,
+                "error": "delete_disabled",
+                "detail": "Model management is not enabled (HF_ALLOW_DELETE=false).",
+            }), 403
+
+        payload = request.get_json(silent=True) or {}
+        trash_name = (payload.get("trash_name") or "").strip()
+        confirm = payload.get("confirm", False)
+
+        if not trash_name:
+            return jsonify({
+                "ok": False,
+                "error": "trash_name_required",
+            }), 400
+
+        if not confirm:
+            return jsonify({
+                "ok": False,
+                "error": "confirmation_required",
+                "detail": "Set confirm=true to permanently delete a trashed file.",
+            }), 400
+
+        model_dir = _get_model_dir()
+        trash_dir = (model_dir / ".trash").resolve()
+
+        if not trash_dir.exists():
+            return jsonify({
+                "ok": False,
+                "error": "trash_dir_not_found",
+                "detail": "Trash directory does not exist.",
+            }), 404
+
+        trash_path = (trash_dir / trash_name).resolve()
+
+        # Safety: must be under trash dir (prevents path traversal)
+        try:
+            trash_path.relative_to(trash_dir)
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": "path_traversal_blocked",
+                "detail": "Path traversal attempt blocked.",
+            }), 403
+
+        if not trash_path.is_file():
+            return jsonify({
+                "ok": False,
+                "error": "trash_file_not_found",
+                "detail": f"Trash file not found: {trash_name}",
+            }), 404
+
+        # Only allow .gguf files for safety
+        if not trash_path.name.lower().endswith(".gguf"):
+            return jsonify({
+                "ok": False,
+                "error": "non_gguf_rejected",
+                "detail": f"Only .gguf files can be permanently deleted. Refused: {trash_name}",
+            }), 403
+
+        # Check if the trashed file belongs to the running model
+        parts = trash_name.split("-", 1)
+        original_name = parts[1] if len(parts) > 1 else trash_name
+        state = _read_state()
+        running_model = state.get("model", "")
+        if running_model and running_model == original_name:
+            return jsonify({
+                "ok": False,
+                "error": "model_running",
+                "detail": "Cannot permanently delete the currently running model.",
+                "running_model": running_model,
+            }), 409
+
+        trash_path.unlink()
+
+        return jsonify({
+            "ok": True,
+            "deleted": True,
+            "trash_name": trash_name,
+            "original_name": original_name,
+            "path": str(trash_path),
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "trash_delete_failed",
+            "detail": str(e),
+        }), 500
+
+
 # ── Startup initialization ──────────────────────────────────────────────────
 # Load persisted jobs at import time (fast, no threads).
 _load_download_jobs()
@@ -2454,6 +2654,25 @@ _load_download_jobs()
 # Start the download worker lazily (only when first used).
 # This prevents the worker thread from blocking during test imports.
 _download_worker_started = False
+
+
+def _maybe_restart_download_worker() -> None:
+    """Restart the download worker thread if it died but there are queued jobs.
+
+    This handles the case where the worker thread crashed or exited but
+    queued jobs remain in memory (e.g., after a transient error).
+    """
+    global _download_worker_started
+    worker_dead = (
+        _download_worker_thread is None
+        or not _download_worker_thread.is_alive()
+    )
+    if worker_dead:
+        with _download_queue_lock:
+            has_queued = bool(_download_queue)
+        if has_queued or _download_worker_started:
+            _download_worker_started = True
+            _start_download_worker()
 
 
 def _ensure_download_worker_started() -> None:

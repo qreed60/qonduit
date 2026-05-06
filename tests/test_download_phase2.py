@@ -43,6 +43,7 @@ from qonduit_router_api import (
     _download_queue_lock,
     _QONDUIT_HF_ALLOW_NON_GGUF,
     _QONDUIT_HF_ALLOW_DELETE,
+    _QONDUIT_HF_REQUIRE_GGUF,
     _DOWNLOAD_JOBS_DIR,
     _DOWNLOAD_JOBS_FILE,
     _stop_download_worker,
@@ -312,12 +313,14 @@ class TestPersistJobs:
 
         _persist_download_jobs()
 
-        # Verify file exists and contains valid JSON
+        # Verify file exists and contains valid JSON in new format
         assert _temp_jobs_file.exists()
         with open(_temp_jobs_file) as f:
             data = json.load(f)
-        assert "test-123" in data
-        assert data["test-123"]["status"] == "queued"
+        # New format: {"jobs": {...}, "queue": [...]}
+        assert "jobs" in data
+        assert "test-123" in data["jobs"]
+        assert data["jobs"]["test-123"]["status"] == "queued"
 
     def test_load_marks_downloading_as_interrupted(self, _temp_jobs_file):
         """Jobs with 'downloading' status should be marked 'interrupted' on load."""
@@ -352,8 +355,8 @@ class TestPersistJobs:
             assert job["status"] == "interrupted"
             assert "Service restart" in job.get("error", "")
 
-    def test_load_marks_queued_as_interrupted(self, _temp_jobs_file):
-        """Jobs with 'queued' status should be marked 'interrupted' on load."""
+    def test_load_preserves_queued_jobs(self, _temp_jobs_file):
+        """Jobs with 'queued' status should be preserved as 'queued' on load."""
         data = {
             "job-1": {
                 "status": "queued",
@@ -378,10 +381,26 @@ class TestPersistJobs:
 
         _load_download_jobs()
 
+        # The worker thread may have started and picked up the queued job,
+        # transitioning it to "downloading", then "failed" (no real URL),
+        # and _prune_completed_jobs() may have removed it. The key invariant
+        # we test is that queued jobs are NOT marked "interrupted" on load
+        # (the old buggy behavior). After worker processing the job should
+        # either still exist with a non-interrupted status or have been
+        # pruned entirely.
+        _stop_download_worker()
+
         with _download_jobs_lock:
             job = _download_jobs.get("job-1")
-            assert job is not None
-            assert job["status"] == "interrupted"
+            if job is not None:
+                # Job still exists: it should not be "interrupted"
+                assert job["status"] != "interrupted", (
+                    f"Queued job should not be marked interrupted on load; "
+                    f"got status={job['status']}"
+                )
+            # If job is None, it was pruned after failing — that's also
+            # acceptable. The important thing is it was never marked
+            # "interrupted" on load (the old bug).
 
 
 # ── Prune Jobs Tests ─────────────────────────────────────────────────────────
@@ -713,3 +732,140 @@ class TestDownloadEndpoints:
         )
         # Should not return 500
         assert resp.status_code in (200, 204)
+
+
+# ── Phase 2.1: Search-speed fix ────────────────────────────────────────────────
+
+class TestSearchSpeedFix:
+    """Tests for the Phase 2.1 search-speed correction.
+
+    Confirms that:
+    - HF_REQUIRE_GGUF=true only enables fast metadata filtering (no file inspection).
+    - verify=true still triggers slow per-repo GGUF file verification.
+    """
+
+    def test_require_gguf_does_not_call_repo_gguf_files(self):
+        """HF_REQUIRE_GGUF=true should NOT call _hf_repo_gguf_files_internal.
+
+        With the Phase 2.1 fix, _QONDUIT_HF_REQUIRE_GGUF only enables the
+        fast metadata filter (lines 1102-1125). The slow path (line 1145)
+        should only trigger when verify_gguf=True.
+        """
+        mock_search_results = [
+            {
+                "repo_id": "test/user/model-GGUF",
+                "model_id": "test/user/model-GGUF",
+                "author": "test",
+                "downloads": 100,
+                "likes": 10,
+                "lastModified": "2025-01-01",
+                "tags": ["gguf", "pytorch"],
+                "pipelineTag": "text-generation",
+                "private": False,
+                "gated": False,
+            }
+        ]
+        with patch(
+            "qonduit_router_api._hf_repo_gguf_files_internal",
+        ) as mock_internal:
+            # Force HF_REQUIRE_GGUF=True by patching the module variable
+            old_val = _QONDUIT_HF_REQUIRE_GGUF
+            try:
+                import qonduit_router_api as api
+                api._QONDUIT_HF_REQUIRE_GGUF = True
+                with patch.object(api, "_cached_hf_call", return_value=(mock_search_results, False, 0)):
+                    results, was_cached, age = api._hf_search_models(
+                        "test query", limit=5, sort="downloads", verify_gguf=False,
+                    )
+            finally:
+                import qonduit_router_api as api
+                api._QONDUIT_HF_REQUIRE_GGUF = old_val
+
+            # _hf_repo_gguf_files_internal must NOT be called (fast path only)
+            mock_internal.assert_not_called()
+            # Result should pass through metadata filter (has "gguf" in tags)
+            assert len(results) == 1
+            assert results[0]["gguf_verified"] is False
+
+    def test_verify_true_calls_repo_gguf_files(self):
+        """verify=true should call _hf_repo_gguf_files_internal for each candidate.
+
+        Even without HF_REQUIRE_GGUF, passing verify_gguf=True must trigger
+        the slow path that inspects each candidate repo for actual GGUF files.
+        """
+        mock_search_results = [
+            {
+                "repo_id": "test/user/model-GGUF",
+                "model_id": "test/user/model-GGUF",
+                "author": "test",
+                "downloads": 100,
+                "likes": 10,
+                "lastModified": "2025-01-01",
+                "tags": ["pytorch"],  # No GGUF in tags
+                "pipelineTag": "text-generation",
+                "private": False,
+                "gated": False,
+            }
+        ]
+        mock_repo_gguf = {
+            "repo_id": "test/user/model-GGUF",
+            "gguf_count": 3,
+            "files": [
+                {"filename": "model-Q4_K_M.gguf", "path": "model-Q4_K_M.gguf", "is_gguf": True, "quant": "Q4_K_M"},
+            ],
+            "sample_files": ["model-Q4_K_M.gguf"],
+            "url": "https://huggingface.co/test/user/model-GGUF",
+        }
+        with patch(
+            "qonduit_router_api._hf_repo_gguf_files_internal",
+            return_value=mock_repo_gguf,
+        ) as mock_internal:
+            import qonduit_router_api as api
+            with patch.object(api, "_cached_hf_call", return_value=(mock_search_results, False, 0)):
+                results, _, _ = api._hf_search_models(
+                    "test query", limit=5, sort="downloads", verify_gguf=True,
+                )
+
+            # _hf_repo_gguf_files_internal MUST be called for each candidate
+            mock_internal.assert_called_once_with("test/user/model-GGUF")
+            # Result should be verified with actual GGUF count
+            assert len(results) == 1
+            assert results[0]["gguf_verified"] is True
+            assert results[0]["gguf_count"] == 3
+
+    def test_verify_false_require_gguf_false_no_inspection(self):
+        """Both false should skip all GGUF logic entirely."""
+        mock_search_results = [
+            {
+                "repo_id": "test/user/model",
+                "model_id": "test/user/model",
+                "author": "test",
+                "downloads": 50,
+                "likes": 5,
+                "lastModified": "2025-01-01",
+                "tags": [],
+                "pipelineTag": "",
+                "private": False,
+                "gated": False,
+            }
+        ]
+        with patch(
+            "qonduit_router_api._hf_repo_gguf_files_internal",
+        ) as mock_internal:
+            old_val = _QONDUIT_HF_REQUIRE_GGUF
+            try:
+                import qonduit_router_api as api
+                api._QONDUIT_HF_REQUIRE_GGUF = False
+                with patch.object(api, "_cached_hf_call", return_value=(mock_search_results, False, 0)):
+                    results, was_cached, age = api._hf_search_models(
+                        "test query", limit=5, sort="downloads", verify_gguf=False,
+                    )
+            finally:
+                import qonduit_router_api as api
+                api._QONDUIT_HF_REQUIRE_GGUF = old_val
+
+            mock_internal.assert_not_called()
+            # Should pass through with gguf_count=0
+            assert len(results) == 1
+            assert results[0]["gguf_verified"] is False
+            assert results[0]["gguf_count"] == 0
