@@ -4,7 +4,9 @@ import json
 import math
 import os
 import re
+import threading
 import time
+import uuid
 import requests
 import subprocess
 from datetime import datetime, timezone
@@ -615,6 +617,31 @@ except ImportError:
 _hf_cache: dict[str, tuple[Any, float]] = {}
 _hf_search_cooldown: dict[str, float] = {}
 
+# ── Hugging Face Download Jobs (Phase 2) ─────────────────────────────────────
+_QONDUIT_HF_ALLOW_NON_GGUF = os.getenv("HF_ALLOW_NON_GGUF", "false").lower() == "true"
+_QONDUIT_HF_DOWNLOAD_MAX_CONCURRENT = int(os.getenv("HF_DOWNLOAD_MAX_CONCURRENT", "1"))
+
+# Download job persistence
+_DOWNLOAD_JOBS_DIR = Path("/var/lib/qonduit-router")
+_DOWNLOAD_JOBS_FILE = _DOWNLOAD_JOBS_DIR / "download_jobs.json"
+_DOWNLOAD_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+# In-memory download job state: job_id -> job dict
+_download_jobs: dict[str, dict[str, Any]] = {}
+_download_jobs_lock = threading.Lock()
+
+# Download queue: list of job_ids waiting to start
+_download_queue: list[str] = []
+_download_queue_lock = threading.Lock()
+
+# Active download count
+_download_active_count = 0
+_download_active_count_lock = threading.Lock()
+
+# Worker thread
+_download_worker_thread: Optional[threading.Thread] = None
+_download_shutdown_event = threading.Event()
+
 # ── Quantization order mapping ──────────────────────────────────────────────
 _QUANT_ORDER = [
     "Q2_K", "Q2_K_XL",
@@ -1202,6 +1229,689 @@ def _hf_repo_gguf_files_internal(repo_id: str) -> Optional[dict]:
     }
 
 
+# ── Download Job Helpers ─────────────────────────────────────────────────────
+
+def _persist_download_jobs() -> None:
+    """Persist download job state to disk."""
+    try:
+        with _download_jobs_lock:
+            jobs_snapshot = {
+                jid: dict(job) for jid, job in _download_jobs.items()
+            }
+        with open(_DOWNLOAD_JOBS_FILE, "w") as f:
+            json.dump(jobs_snapshot, f, indent=2)
+    except OSError:
+        pass
+
+
+def _load_download_jobs() -> None:
+    """Load persisted download jobs from disk on startup."""
+    global _download_active_count
+    try:
+        if not _DOWNLOAD_JOBS_FILE.exists():
+            return
+        with open(_DOWNLOAD_JOBS_FILE, "r") as f:
+            jobs_snapshot: dict[str, dict[str, Any]] = json.load(f)
+        with _download_jobs_lock:
+            for jid, job in jobs_snapshot.items():
+                status = job.get("status", "failed")
+                if status in ("downloading", "queued"):
+                    job["status"] = "interrupted"
+                    job["error"] = "Service restart; in-progress downloads not resumed."
+                    job["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _download_jobs[jid] = job
+            # Count currently active downloads (should be 0 after restart)
+            _download_active_count = sum(
+                1 for j in _download_jobs.values()
+                if j.get("status") == "downloading"
+            )
+    except (json.JSONDecodeError, OSError):
+        pass
+
+
+def _prune_completed_jobs(max_retained: int = 50) -> None:
+    """Remove old completed/failed/cancelled/interrupted jobs to prevent unbounded growth."""
+    with _download_jobs_lock:
+        keep = []
+        for jid, job in sorted(_download_jobs.items(), key=lambda x: x[1].get("completed_at", "") or ""):
+            status = job.get("status", "")
+            if status in ("downloading", "queued"):
+                keep.append(jid)
+        if len(keep) >= max_retained:
+            keep = keep[-max_retained:]
+        for jid in list(_download_jobs.keys()):
+            if jid not in keep:
+                del _download_jobs[jid]
+
+
+def _validate_repo_id(repo_id: str) -> Optional[str]:
+    """Validate a Hugging Face repo_id format."""
+    if not repo_id or not isinstance(repo_id, str):
+        return "repo_id_required"
+    repo_id = repo_id.strip()
+    if not repo_id:
+        return "repo_id_required"
+    # Must match owner/name pattern
+    if not re.match(r'^[a-zA-Z0-9_][a-zA-Z0-9_.-]*/[a-zA-Z0-9_][a-zA-Z0-9_.-]*$', repo_id):
+        return "invalid_repo_id_format"
+    return None
+
+
+def _validate_download_filename(filename: str) -> Optional[str]:
+    """Validate a download filename for safety.
+
+    Allows nested paths (like 'BF16/model-00001.gguf') but blocks traversal.
+    """
+    if not filename or not isinstance(filename, str):
+        return "filename_required"
+
+    filename = filename.strip()
+    if not filename:
+        return "filename_required"
+
+    # Reject absolute paths anywhere
+    if filename.startswith("/"):
+        return "absolute_path_rejected"
+
+    # Reject backslash paths
+    if "\\" in filename:
+        return "path_traversal_blocked"
+
+    # Reject path traversal sequences
+    parts = filename.replace("\\", "/").split("/")
+    for part in parts:
+        if part == "..":
+            return "path_traversal_blocked"
+
+    # Reject empty path components
+    parts_clean = [p for p in parts if p]
+    if not parts_clean:
+        return "invalid_filename"
+
+    # Validate each path component is a safe filename
+    for part in parts_clean:
+        if not part or part.startswith(".") and part not in (".", ".."):
+            # Allow hidden dirs but not hidden-only paths
+            pass
+        if len(part) > 255:
+            return "filename_too_long"
+
+    # GGUF-only enforcement
+    last_part = parts_clean[-1]
+    if not _QONDUIT_HF_ALLOW_NON_GGUF and not last_part.lower().endswith(".gguf"):
+        return "non_gguf_blocked"
+
+    return None
+
+
+def _validate_target_name(target_name: str) -> Optional[str]:
+    """Validate a target filename for the local filesystem."""
+    if not target_name or not isinstance(target_name, str):
+        return "target_name_required"
+
+    target_name = target_name.strip()
+    if not target_name:
+        return "target_name_required"
+
+    # Reject absolute paths
+    if target_name.startswith("/") or target_name.startswith("\\"):
+        return "absolute_path_rejected"
+
+    # Reject path traversal
+    if ".." in target_name or "/" in target_name or "\\" in target_name:
+        return "path_traversal_blocked"
+
+    # Only allow .gguf files by default
+    if not _QONDUIT_HF_ALLOW_NON_GGUF and not target_name.lower().endswith(".gguf"):
+        return "non_gguf_blocked"
+
+    # Reject empty basename
+    basename = Path(target_name).name
+    if not basename:
+        return "invalid_target_name"
+
+    return None
+
+
+def _resolve_target_path(target_name: str) -> Optional[Path]:
+    """Resolve target path safely within the model directory."""
+    model_dir = _get_model_dir()
+    if not model_dir.exists():
+        return None
+    resolved = (model_dir / target_name).resolve()
+    try:
+        resolved.relative_to(model_dir.resolve())
+    except ValueError:
+        return None
+    return resolved
+
+
+def _clean_partial_file(partial_path: Path) -> None:
+    """Remove a stale partial download file."""
+    try:
+        if partial_path.exists():
+            partial_path.unlink()
+    except OSError:
+        pass
+
+
+def _make_hf_resolve_url(repo_id: str, filename: str) -> str:
+    """Build a Hugging Face resolve URL for a file, safely encoding the path."""
+    from urllib.parse import quote
+    # Encode each path segment separately to preserve slashes
+    parts = filename.split("/")
+    encoded_parts = [quote(p, safe="") for p in parts]
+    encoded_path = "/".join(encoded_parts)
+    return f"https://huggingface.co/{repo_id}/resolve/main/{encoded_path}"
+
+
+def _format_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Format a job dict for API response (remove internal fields)."""
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "repo_id": job["repo_id"],
+        "filename": job["filename"],
+        "target_name": job["target_name"],
+        "target_path": job["target_path"],
+        "bytes_downloaded": job.get("bytes_downloaded", 0),
+        "total_bytes": job.get("total_bytes"),
+        "progress": job.get("progress"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "error": job.get("error"),
+        "cancel_requested": job.get("cancel_requested", False),
+    }
+
+
+def _download_worker() -> None:
+    """Background worker thread that processes download jobs from the queue.
+
+    Runs in a loop, picking up jobs when slots are available.
+    Exits when _download_shutdown_event is set.
+    """
+    global _download_active_count
+
+    chunk_size = 8 * 1024 * 1024  # 8 MiB chunks
+
+    while not _download_shutdown_event.is_set():
+        job_id = None
+
+        # Wait for a job from the queue
+        with _download_queue_lock:
+            if _download_queue:
+                job_id = _download_queue.pop(0)
+            else:
+                # No jobs available; wait briefly before checking again
+                # Use a short sleep with shutdown event check so we can exit promptly
+                import time as _time
+                _download_shutdown_event.wait(timeout=0.5)
+                continue
+
+        if job_id is None:
+            continue
+
+        # Acquire a download slot
+        with _download_active_count_lock:
+            if _download_active_count >= _QONDUIT_HF_DOWNLOAD_MAX_CONCURRENT:
+                # No slots available; re-queue
+                with _download_queue_lock:
+                    _download_queue.insert(0, job_id)
+                continue
+            _download_active_count += 1
+
+        # Process the job
+        job: Optional[dict[str, Any]] = None
+        with _download_jobs_lock:
+            if job_id in _download_jobs:
+                job = _download_jobs[job_id]
+
+        if job is None:
+            # Job was removed while we were waiting
+            with _download_active_count_lock:
+                _download_active_count -= 1
+            continue
+
+        # Mark as downloading
+        job["status"] = "downloading"
+        job["started_at"] = datetime.now(timezone.utc).isoformat()
+        job["error"] = None
+        job["bytes_downloaded"] = 0
+        job["progress"] = 0.0
+        _persist_download_jobs()
+
+        partial_path = Path(job.get("partial_path", ""))
+        target_path = Path(job.get("target_path", ""))
+        total_bytes = job.get("total_bytes")
+        cancel_requested = False
+
+        try:
+            download_url = job.get("download_url", "")
+            if not download_url:
+                raise ValueError("No download URL available")
+
+            headers = {}
+            if _QONDUIT_HF_TOKEN:
+                headers["Authorization"] = f"Bearer {_QONDUIT_HF_TOKEN}"
+
+            # Clean up stale partial file if it exists
+            if partial_path.exists():
+                _clean_partial_file(partial_path)
+
+            with requests.get(
+                download_url,
+                stream=True,
+                timeout=(_QONDUIT_HF_NETWORK_TIMEOUT * 30),
+                headers=headers,
+            ) as resp:
+                if resp.status_code == 401 or resp.status_code == 403:
+                    raise ValueError(
+                        f"Hugging Face authentication failed (status {resp.status_code}). "
+                        "Check HF_TOKEN for gated/private repos."
+                    )
+                if resp.status_code == 404:
+                    raise ValueError(f"File not found on Hugging Face (HTTP {resp.status_code})")
+                if resp.status_code != 200:
+                    raise ValueError(f"Download failed with HTTP {resp.status_code}")
+
+                # Get total size from Content-Length if available
+                resp_total = resp.headers.get("Content-Length")
+                if resp_total and total_bytes is None:
+                    try:
+                        total_bytes = int(resp_total)
+                        job["total_bytes"] = total_bytes
+                    except (ValueError, TypeError):
+                        pass
+
+                with open(partial_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if not chunk:
+                            continue
+
+                        # Check shutdown / cancellation between chunks
+                        if _download_shutdown_event.is_set():
+                            _clean_partial_file(partial_path)
+                            with _download_jobs_lock:
+                                job["status"] = "interrupted"
+                                job["error"] = "shutdown"
+                                job["completed_at"] = datetime.now(timezone.utc).isoformat()
+                            _persist_download_jobs()
+                            raise KeyboardInterrupt("Worker shutting down")
+
+                        with _download_jobs_lock:
+                            if job.get("cancel_requested", False):
+                                cancel_requested = True
+                                break
+
+                        f.write(chunk)
+                        job["bytes_downloaded"] = f.tell()
+
+                        if total_bytes and total_bytes > 0:
+                            job["progress"] = min(1.0, job["bytes_downloaded"] / total_bytes)
+                        else:
+                            job["progress"] = None
+
+                        _persist_download_jobs()
+
+                if cancel_requested:
+                    # Cancelled during download
+                    _clean_partial_file(partial_path)
+                    with _download_jobs_lock:
+                        job["status"] = "cancelled"
+                        job["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    _persist_download_jobs()
+                    continue
+
+            # Download completed successfully — atomically rename partial to final
+            if target_path.exists() and not job.get("overwrite", False):
+                with _download_jobs_lock:
+                    job["status"] = "failed"
+                    job["error"] = "target_file_exists"
+                    job["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _persist_download_jobs()
+                continue
+
+            # Atomic rename
+            try:
+                # If overwriting, write to temp then rename
+                if target_path.exists():
+                    # Overwrite: write to temp then rename
+                    temp_target = target_path.with_suffix(target_path.suffix + ".tmp")
+                    partial_path.rename(temp_target)
+                    temp_target.replace(target_path)
+                else:
+                    partial_path.rename(target_path)
+            except OSError as e:
+                raise OSError(f"Failed to finalize download: {e}")
+
+            # Mark complete
+            with _download_jobs_lock:
+                job["status"] = "complete"
+                job["progress"] = 1.0
+                job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            _persist_download_jobs()
+
+            # Invalidate model list cache if it exists
+            try:
+                if hasattr(app, "model_list_cache"):
+                    app.model_list_cache = None
+                    app.model_list_cache_time = 0
+            except Exception:
+                pass
+
+        except Exception as e:
+            # Clean up partial on failure
+            _clean_partial_file(partial_path)
+            with _download_jobs_lock:
+                job["status"] = "failed"
+                job["error"] = str(e)
+                job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            _persist_download_jobs()
+        finally:
+            with _download_active_count_lock:
+                _download_active_count -= 1
+            # Prune old jobs periodically
+            _prune_completed_jobs()
+
+
+def _start_download_worker() -> None:
+    """Start the background download worker thread if not already running."""
+    global _download_worker_thread
+    if _download_worker_thread is not None and _download_worker_thread.is_alive():
+        return
+    _download_worker_thread = threading.Thread(
+        target=_download_worker,
+        name="qonduit-hf-download-worker",
+        daemon=True,
+    )
+    _download_worker_thread.start()
+
+
+def _stop_download_worker() -> None:
+    """Stop the background download worker thread (for testing/teardown)."""
+    global _download_worker_thread
+    _download_shutdown_event.set()
+    if _download_worker_thread is not None and _download_worker_thread.is_alive():
+        _download_worker_thread.join(timeout=5)
+    _download_worker_thread = None
+
+
+# ── Endpoint: POST /hf/download ─────────────────────────────────────────────
+
+@app.post("/api/v1/qonduit-router/hf/download")
+def qonduit_hf_download():
+    """Start a Hugging Face GGUF download job."""
+    try:
+        denied = _require_local()
+        if denied:
+            return denied
+
+        payload = request.get_json(silent=True) or {}
+        repo_id = (payload.get("repo_id") or "").strip()
+        filename = (payload.get("filename") or "").strip()
+        target_name = (payload.get("target_name") or "").strip() or None
+        overwrite = bool(payload.get("overwrite", False))
+        dry_run = bool(payload.get("dry_run", False))
+
+        # Validate repo_id
+        error = _validate_repo_id(repo_id)
+        if error:
+            return jsonify({"ok": False, "error": "invalid_repo_id", "detail": error}), 400
+
+        # Validate filename
+        error = _validate_download_filename(filename)
+        if error:
+            return jsonify({"ok": False, "error": "invalid_filename", "detail": error}), 400
+
+        # Determine target_name
+        if not target_name:
+            target_name = Path(filename).name
+
+        # Validate target_name
+        error = _validate_target_name(target_name)
+        if error:
+            return jsonify({"ok": False, "error": "invalid_target_name", "detail": error}), 400
+
+        # Resolve target path
+        target_path = _resolve_target_path(target_name)
+        if target_path is None:
+            return jsonify({
+                "ok": False,
+                "error": "path_resolution_failed",
+                "detail": "Could not resolve target path within model directory.",
+            }), 500
+
+        # Build download URL
+        download_url = _make_hf_resolve_url(repo_id, filename)
+
+        if dry_run:
+            # Validate without creating a job
+            exists = target_path.exists()
+            # Try to get file size via HEAD
+            size_bytes = None
+            size_human = "unknown"
+            try:
+                head_resp = requests.head(
+                    download_url,
+                    timeout=_QONDUIT_HF_NETWORK_TIMEOUT,
+                    headers={"Authorization": f"Bearer {_QONDUIT_HF_TOKEN}"} if _QONDUIT_HF_TOKEN else {},
+                    allow_redirects=True,
+                )
+                if head_resp.status_code in (200, 206, 301, 302, 307, 308):
+                    cl = head_resp.headers.get("Content-Length")
+                    if cl:
+                        try:
+                            size_bytes = int(cl)
+                            size_human = _human_size(size_bytes)
+                        except (ValueError, TypeError):
+                            pass
+            except (requests.RequestException, OSError, ValueError):
+                pass
+
+            return jsonify({
+                "ok": True,
+                "dry_run": True,
+                "repo_id": repo_id,
+                "filename": filename,
+                "target_name": target_name,
+                "target_path": str(target_path),
+                "exists": exists,
+                "downloadable": True,
+                "size_bytes": size_bytes,
+                "size_human": size_human,
+            })
+
+        # Check if target already exists
+        if not overwrite and target_path.exists():
+            return jsonify({
+                "ok": False,
+                "error": "model_exists",
+                "detail": f"Target file already exists: {target_name}. Set overwrite=true to replace.",
+                "target_path": str(target_path),
+            }), 409
+
+        # Check for stale partial file
+        partial_path = Path(f"/mnt/models/llm/.partial.{target_name}.download")
+        if partial_path.exists():
+            return jsonify({
+                "ok": False,
+                "error": "partial_exists",
+                "detail": f"Stale partial download file exists: {partial_path}. Delete manually or wait.",
+                "partial_path": str(partial_path),
+            }), 409
+
+        # Create job
+        job_id = str(uuid.uuid4())
+        now_iso = datetime.now(timezone.utc).isoformat()
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "repo_id": repo_id,
+            "filename": filename,
+            "target_name": target_name,
+            "target_path": str(target_path),
+            "partial_path": str(partial_path),
+            "download_url": download_url,
+            "overwrite": overwrite,
+            "bytes_downloaded": 0,
+            "total_bytes": None,
+            "progress": 0.0,
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+            "cancel_requested": False,
+        }
+
+        with _download_jobs_lock:
+            _download_jobs[job_id] = job
+
+        with _download_queue_lock:
+            _download_queue.append(job_id)
+
+        _ensure_download_worker_started()
+        _persist_download_jobs()
+
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "status": "queued",
+            "repo_id": repo_id,
+            "filename": filename,
+            "target_name": target_name,
+            "target_path": str(target_path),
+            "dry_run": False,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "download_start_failed",
+            "detail": str(e),
+        }), 500
+
+
+# ── Endpoint: GET /hf/downloads ─────────────────────────────────────────────
+
+@app.get("/api/v1/qonduit-router/hf/downloads")
+def qonduit_hf_downloads_list():
+    """List all download jobs."""
+    try:
+        denied = _require_local()
+        if denied:
+            return denied
+
+        with _download_jobs_lock:
+            jobs_snapshot = dict(_download_jobs)
+
+        jobs = []
+        active_count = 0
+        queued_count = 0
+        for jid, job in sorted(jobs_snapshot.items(), key=lambda x: x[1].get("started_at", "") or "", reverse=True):
+            jobs.append(_format_job(job))
+            if job.get("status") == "downloading":
+                active_count += 1
+            elif job.get("status") == "queued":
+                queued_count += 1
+
+        return jsonify({
+            "ok": True,
+            "jobs": jobs,
+            "active_count": active_count,
+            "queued_count": queued_count,
+            "total": len(jobs),
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "downloads_list_failed",
+            "detail": str(e),
+        }), 500
+
+
+# ── Endpoint: GET /hf/downloads/<job_id> ────────────────────────────────────
+
+@app.get("/api/v1/qonduit-router/hf/downloads/<job_id>")
+def qonduit_hf_download_get(job_id: str):
+    """Get a specific download job."""
+    try:
+        denied = _require_local()
+        if denied:
+            return denied
+
+        with _download_jobs_lock:
+            job = _download_jobs.get(job_id)
+
+        if job is None:
+            return jsonify({
+                "ok": False,
+                "error": "job_not_found",
+                "detail": f"Job {job_id} not found.",
+            }), 404
+
+        return jsonify({
+            "ok": True,
+            "job": _format_job(job),
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "download_get_failed",
+            "detail": str(e),
+        }), 500
+
+
+# ── Endpoint: POST /hf/downloads/<job_id>/cancel ────────────────────────────
+
+@app.post("/api/v1/qonduit-router/hf/downloads/<job_id>/cancel")
+def qonduit_hf_download_cancel(job_id: str):
+    """Cancel a download job."""
+    try:
+        denied = _require_local()
+        if denied:
+            return denied
+
+        with _download_jobs_lock:
+            job = _download_jobs.get(job_id)
+
+            if job is None:
+                return jsonify({
+                    "ok": False,
+                    "error": "job_not_found",
+                    "detail": f"Job {job_id} not found.",
+                }), 404
+
+            status = job.get("status", "")
+
+            if status in ("complete", "failed", "cancelled", "interrupted"):
+                return jsonify({
+                    "ok": False,
+                    "error": f"already_{status}",
+                    "detail": f"Job is already {status}.",
+                }), 409
+
+            job["cancel_requested"] = True
+
+        # Persist outside the lock to avoid deadlock
+        # ( _persist_download_jobs acquires _download_jobs_lock )
+        _persist_download_jobs()
+
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "status": "cancelling",
+            "detail": "Cancellation requested. The job will stop after the current chunk.",
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "download_cancel_failed",
+            "detail": str(e),
+        }), 500
+
+
 # ── Endpoint: GET /hf/search ────────────────────────────────────────────────
 
 @app.get("/api/v1/qonduit-router/hf/search")
@@ -1735,6 +2445,23 @@ def qonduit_model_restore():
             "error": "restore_failed",
             "detail": str(e),
         }), 500
+
+
+# ── Startup initialization ──────────────────────────────────────────────────
+# Load persisted jobs at import time (fast, no threads).
+_load_download_jobs()
+
+# Start the download worker lazily (only when first used).
+# This prevents the worker thread from blocking during test imports.
+_download_worker_started = False
+
+
+def _ensure_download_worker_started() -> None:
+    """Start the download worker thread on first use (lazy initialization)."""
+    global _download_worker_started
+    if not _download_worker_started:
+        _download_worker_started = True
+        _start_download_worker()
 
 
 if __name__ == "__main__":
