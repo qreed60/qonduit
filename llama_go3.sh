@@ -30,8 +30,42 @@ if [ -z "$CONTEXT_SIZE" ]; then
     CONTEXT_SIZE=65536
 fi
 
+# ---- KV cache type (optional compression) ----
+# llama.cpp supports --cache-type-k and --cache-type-v for KV cache quantization.
+# Defaults to f16 (full precision) for maximum quality.
+# Uncomment to enable compression:
+#   LLAMA_CACHE_TYPE_K=q8_0  -- conservative compression, minimal quality loss
+#   LLAMA_CACHE_TYPE_K=q4_0  -- aggressive compression, quality-riskier
+#   LLAMA_CACHE_TYPE_V=q8_0  -- same options for value cache
+# These flags may not be supported by older llama-server builds.
+LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-f16}"
+LLAMA_CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-f16}"
+
+# ---- YaRN / RoPE scaling (disabled by default) ----
+# YaRN extends context beyond native/trained context. Do NOT enable blindly.
+# Only set these if the model's GGUF lacks RoPE scaling metadata and you need
+# to extend context beyond the model's native context length.
+# Incorrect YaRN settings can reduce output quality.
+#   LLAMA_ROPE_SCALING=yarn      -- scaling method: "none", "linear", "yarn"
+#   LLAMA_YARN_ORIG_CTX=4096     -- original context length the model was trained on
+#   LLAMA_ROPE_FREQ_BASE=10000   -- rope frequency base (default: 10000)
+#   LLAMA_ROPE_FREQ_SCALE=0.5    -- rope frequency scale factor (default: 1.0)
+LLAMA_ROPE_SCALING="${LLAMA_ROPE_SCALING:-}"
+LLAMA_YARN_ORIG_CTX="${LLAMA_YARN_ORIG_CTX:-}"
+LLAMA_ROPE_FREQ_BASE="${LLAMA_ROPE_FREQ_BASE:-}"
+LLAMA_ROPE_FREQ_SCALE="${LLAMA_ROPE_FREQ_SCALE:-}"
+
+# ---- Parallelism ----
+# Set to 1 so each request can use the full configured context window.
+# Parallel > 1 splits context across multiple slots, reducing per-request
+# context for large-context agentic workflows (Dyad/OpenHands).
+# This is intentional: prioritize one large-context request over multiple
+# parallel request slots.
+PARALLEL="${PARALLEL:-1}"
+
 echo "Model: $MODEL_PATH"
 echo "Context: $CONTEXT_SIZE"
+echo "Parallel: $PARALLEL (1 = full context per request)"
 
 # ---- Validate model exists ----
 if [ ! -f "$MODEL_PATH" ]; then
@@ -112,6 +146,31 @@ if [ "$(sudo docker ps -a -q -f name=^/${CONTAINER_NAME}$)" ]; then
     sudo docker rm "$CONTAINER_NAME" || true
 fi
 
+# ---- Build optional args ----
+EXTRA_ARGS=()
+
+# KV cache type (if supported by llama-server)
+if [ "$LLAMA_CACHE_TYPE_K" != "f16" ]; then
+    EXTRA_ARGS+=(--cache-type-k "$LLAMA_CACHE_TYPE_K")
+fi
+if [ "$LLAMA_CACHE_TYPE_V" != "f16" ]; then
+    EXTRA_ARGS+=(--cache-type-v "$LLAMA_CACHE_TYPE_V")
+fi
+
+# YaRN / RoPE scaling (only if explicitly set)
+if [ -n "$LLAMA_ROPE_SCALING" ]; then
+    EXTRA_ARGS+=(--rope-scaling "$LLAMA_ROPE_SCALING")
+fi
+if [ -n "$LLAMA_YARN_ORIG_CTX" ]; then
+    EXTRA_ARGS+=(--yarn-orig-context "$LLAMA_YARN_ORIG_CTX")
+fi
+if [ -n "$LLAMA_ROPE_FREQ_BASE" ]; then
+    EXTRA_ARGS+=(--rope-freq-base "$LLAMA_ROPE_FREQ_BASE")
+fi
+if [ -n "$LLAMA_ROPE_FREQ_SCALE" ]; then
+    EXTRA_ARGS+=(--rope-freq-scale "$LLAMA_ROPE_FREQ_SCALE")
+fi
+
 # ---- Launch ----
 echo "Launching llama-server..."
 
@@ -125,21 +184,26 @@ sudo docker run -d \
   --env PYTHONUNBUFFERED=1 \
   --env QONDUIT_MODEL_NAME="$MODEL_NAME" \
   --env QONDUIT_CONTEXT_SIZE="$CONTEXT_SIZE" \
+  --env LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K" \
+  --env LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V" \
+  --env PARALLEL="$PARALLEL" \
   --log-opt mode=non-blocking \
   --log-opt max-buffer-size=4m \
   --label qonduit.model="$MODEL_NAME" \
   --label qonduit.context_size="$CONTEXT_SIZE" \
+  --label qonduit.parallel="$PARALLEL" \
   "$IMAGE_NAME" \
   ./build/bin/llama-server \
   --model "$MODEL_PATH" \
   --n-gpu-layers -1 \
   --ctx-size "$CONTEXT_SIZE" \
-  --parallel 2 \
+  --parallel "$PARALLEL" \
   --batch-size "$BATCH_SIZE" \
   --ubatch-size "$UBATCH_SIZE" \
   --tensor-split "$TENSOR_SPLIT" \
   --host 0.0.0.0 \
   --port "$HOST_PORT" \
+  "${EXTRA_ARGS[@]}" \
 
 echo ""
 echo "✅ Server launch requested:"
@@ -147,6 +211,7 @@ echo "Model: $MODEL_PATH"
 echo "Context: $CONTEXT_SIZE"
 echo "Compute GPUs: $GPU_DEVICES"
 echo "Tensor split: $TENSOR_SPLIT"
+echo "Parallel: $PARALLEL (full context per request)"
 echo "Docker network: $DOCKER_NETWORK"
 echo "URL: http://localhost:$HOST_PORT"
 echo ""
