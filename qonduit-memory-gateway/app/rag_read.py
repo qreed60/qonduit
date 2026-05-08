@@ -127,9 +127,18 @@ async def rag_health() -> dict[str, Any]:
     try:
         url = QDRANT_URL.rstrip("/")
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{url}/health")
-            resp.raise_for_status()
-        qdrant_ok = True
+            # Try /readyz first, then /collections, then /
+            endpoints = ["/readyz", "/collections", "/"]
+            for ep in endpoints:
+                try:
+                    resp = await client.get(f"{url}{ep}")
+                    if resp.status_code == 200:
+                        qdrant_ok = True
+                        break
+                except Exception:
+                    continue
+            if not qdrant_ok:
+                raise Exception("All Qdrant health endpoints failed")
     except Exception as exc:
         qdrant_err = str(exc)
     try:
