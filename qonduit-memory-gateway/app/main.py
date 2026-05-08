@@ -41,11 +41,13 @@ from .rag import (
 )
 from .projects import project_alias_cache
 from .ingestion import IngestionManager
+from .rag_read import router as rag_read_router
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import glob
 import shutil
 
 app = FastAPI(title="Qonduit Memory Gateway")
+app.include_router(rag_read_router)
 logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
