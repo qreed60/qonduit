@@ -56,16 +56,15 @@ LLAMA_ROPE_FREQ_BASE="${LLAMA_ROPE_FREQ_BASE:-}"
 LLAMA_ROPE_FREQ_SCALE="${LLAMA_ROPE_FREQ_SCALE:-}"
 
 # ---- Parallelism ----
-# Set to 1 so each request can use the full configured context window.
-# Parallel > 1 splits context across multiple slots, reducing per-request
-# context for large-context agentic workflows (Dyad/OpenHands).
-# This is intentional: prioritize one large-context request over multiple
-# parallel request slots.
-PARALLEL="${PARALLEL:-1}"
+# Set to 2 to allow two concurrent request slots.
+# Parallel=1 dedicates the full context window to a single request (agentic
+# workflows), but limits throughput to one request at a time.
+# Parallel=2 allows two concurrent requests, each with half the context window.
+PARALLEL="${PARALLEL:-2}"
 
 echo "Model: $MODEL_PATH"
 echo "Context: $CONTEXT_SIZE"
-echo "Parallel: $PARALLEL (1 = full context per request)"
+echo "Parallel: $PARALLEL (2 = two concurrent request slots)"
 
 # ---- Validate model exists ----
 if [ ! -f "$MODEL_PATH" ]; then
@@ -211,7 +210,7 @@ echo "Model: $MODEL_PATH"
 echo "Context: $CONTEXT_SIZE"
 echo "Compute GPUs: $GPU_DEVICES"
 echo "Tensor split: $TENSOR_SPLIT"
-echo "Parallel: $PARALLEL (full context per request)"
+echo "Parallel: $PARALLEL (two concurrent request slots)"
 echo "Docker network: $DOCKER_NETWORK"
 echo "URL: http://localhost:$HOST_PORT"
 echo ""
