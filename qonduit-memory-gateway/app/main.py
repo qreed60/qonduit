@@ -42,12 +42,19 @@ from .rag import (
 from .projects import project_alias_cache
 from .ingestion import IngestionManager
 from .rag_read import router as rag_read_router
+from .settings import (
+    load_settings as _load_gateway_settings,
+    get_active_template as _get_active_template,
+    list_builtin_templates as _list_builtin_templates,
+)
+from .settings_router import router as settings_router
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import glob
 import shutil
 
 app = FastAPI(title="Qonduit Memory Gateway")
 app.include_router(rag_read_router)
+app.include_router(settings_router)
 logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
@@ -1897,6 +1904,53 @@ def system_prompt_for_mode(mode: str) -> str:
     return DEFAULT_SYSTEM_PROMPT
 
 
+def _has_explicit_system_message(messages: list[ChatMessage]) -> bool:
+    """Return True if any message in the request has role 'system' or 'developer'."""
+    for m in messages:
+        role = (m.role or "").lower().strip()
+        if role in ("system", "developer"):
+            return True
+    return False
+
+
+def _apply_prompt_template(
+    mode: str,
+    active_template: dict[str, Any] | None,
+    incoming_messages: list[ChatMessage],
+) -> str:
+    """Build the system prompt to use for this chat request.
+
+    Precedence (highest first):
+      1. Explicit request system/developer message → use existing behaviour
+         (the caller already handles this by not overriding).
+      2. Active prompt template from gateway settings → use template content.
+      3. mode-based fallback → system_prompt_for_mode(mode).
+      4. Hardcoded safe default → DEFAULT_SYSTEM_PROMPT.
+    """
+    # If the request already provides a system/developer message, do NOT
+    # inject a template system prompt — the caller's own message list
+    # provides the intent.  (The gateway still uses the returned string for
+    # budget/trim calculations, so we fall back to the mode prompt.)
+    if _has_explicit_system_message(incoming_messages):
+        return system_prompt_for_mode(mode)
+
+    # Use the active template if available
+    if active_template is not None:
+        template_system = active_template.get("system_prompt") or active_template.get(
+            "instruction_prompt", ""
+        )
+        if template_system.strip():
+            logger.info(
+                "chat_template_applied template_id=%s mode=%s",
+                active_template.get("id", ""),
+                mode,
+            )
+            return template_system.strip()
+
+    # Fall back to mode-based prompt
+    return system_prompt_for_mode(mode)
+
+
 def is_technical_message(message: dict[str, Any]) -> bool:
     content = str(message.get("content", ""))
     if not content.strip():
@@ -2956,7 +3010,19 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         state = load_conversation(conversation_id, project_id=project_id)
         context_size = resolve_context_size(req, state)
         mode = resolve_mode(req, request, project_id)
-        system_prompt = system_prompt_for_mode(mode)
+
+        # Apply active prompt template from gateway settings when no explicit
+        # system/developer message is provided in the request.  This allows the
+        # web console (and future clients) to configure model behaviour via
+        # /v1/gateway/prompt-templates without modifying the launcher.
+        gateway_settings = _load_gateway_settings()
+        active_template = _get_active_template(gateway_settings)
+        system_prompt = _apply_prompt_template(
+            mode,
+            active_template,
+            incoming_messages=req.messages,
+        )
+
         recent_window = (
             QONDUIT_MAX_RECENT_MESSAGES_CODING
             if mode == "coding"
