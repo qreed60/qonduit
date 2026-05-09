@@ -3212,22 +3212,17 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             section_messages.append(
                 ("recent_conversation_history", history_messages)
             )
-        if rag_context:
-            section_messages.append(
-                (
-                    "deterministic_rag_context",
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Relevant retrieved knowledge:\n"
-                                f"{rag_context}"
-                            ),
-                        }
-                    ],
-                )
-            )
         if current_user_message is not None:
+            # Merge RAG context into the user message so the model reliably
+            # sees the context alongside the question (LLMs heavily weight the
+            # last user message and often ignore separate system messages).
+            user_content = current_user_message.get("content", "")
+            if rag_context:
+                current_user_message = dict(current_user_message)
+                current_user_message["content"] = (
+                    f"Retrieved context:\n{rag_context}\n\n"
+                    f"Question: {user_content}"
+                )
             section_messages.append(
                 ("current_user_message", [current_user_message])
             )
@@ -3281,11 +3276,12 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
 
         if final_prompt_est_tokens > QONDUIT_TARGET_PROMPT_TOKENS:
             # Only trim conversation history, NEVER remove RAG context or user message.
-            # The dynamic_messages order is: [history, rag_context, user_message].
-            # We must preserve rag_context (index -2) and current_user_message (index -1).
-            _protected_suffix = 2  # rag_context + user_message
+            # RAG context is merged into the user message (not a separate section),
+            # so dynamic_messages order is: [history, user_message_with_rag].
+            # We must preserve only the last message (user + rag).
+            _protected_suffix = 1  # user_message_with_rag (rag merged in)
             if current_user_message is None:
-                _protected_suffix = 1  # only rag_context
+                _protected_suffix = 0  # no user message, nothing to protect
             while (
                 current_user_message is not None
                 and len(dynamic_messages) > _protected_suffix
@@ -3372,6 +3368,29 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "effective_model": effective_model,
     }
     save_conversation(conversation_id, state, project_id=project_id)
+
+    # ── Diagnostic: log final forwarded payload summary ──────────────────
+    _roles = [m.get("role", "?") for m in final_messages]
+    _chars = [len(coerce_model_content_to_text(m.get("content", ""))) for m in final_messages]
+    _preview_parts = []
+    for i, m in enumerate(final_messages):
+        _c = coerce_model_content_to_text(m.get("content", ""))
+        _preview_parts.append(f"{_roles[i]}:{len(_c)}:{_c[:300].replace(chr(10), ' ')}")
+    _all_text = " ".join(_preview_parts)
+    _diag = {
+        "event": "chat_forward_payload",
+        "request_id": perf.request_id,
+        "final_message_count": len(final_messages),
+        "roles": _roles,
+        "msg_chars": _chars,
+        "max_tokens": max_tokens,
+        "stream": req.stream,
+        "contains_lanmark_answer": "9782640200" in _all_text,
+        "contains_manual_note": "manual_note" in _all_text.lower(),
+        "contains_work": "work" in _all_text.lower(),
+    }
+    logger.info("PERF_EVENT %s", json.dumps(_diag, default=str))
+    # ── End diagnostic ──────────────────────────────────────────────────
 
     # Build payload for upstream - include tools if provided
     payload: dict[str, Any] = {

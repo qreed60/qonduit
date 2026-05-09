@@ -106,11 +106,11 @@ class TestPromptTrimming:
         )
 
     def test_protected_suffix_value(self):
-        """_protected_suffix should be 2 (rag_context + user_message)."""
+        """_protected_suffix should be 1 (RAG merged into user message)."""
         with open(MAIN_PY, "r") as f:
             source = f.read()
-        assert "_protected_suffix = 2" in source or "_protected_suffix=2" in source, (
-            "_protected_suffix should be 2 (rag_context + user_message)"
+        assert "_protected_suffix = 1" in source or "_protected_suffix=1" in source, (
+            "_protected_suffix should be 1 (RAG merged into user message, only last msg protected)"
         )
 
     def test_trim_uses_protected_suffix(self):
@@ -246,8 +246,8 @@ class TestAllFixesCoexist:
              'key="collection"' in rag_source or "key='collection'" in rag_source),
             ("Phase 5: RAG context preservation via _protected_suffix",
              "_protected_suffix" in main_source),
-            ("Phase 5: Protected suffix value is 2",
-             "_protected_suffix = 2" in main_source),
+            ("Phase 5: Protected suffix value is 1 (RAG merged into user)",
+             "_protected_suffix = 1" in main_source),
         ]
 
         all_passed = True
