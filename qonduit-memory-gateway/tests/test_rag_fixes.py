@@ -258,3 +258,60 @@ class TestAllFixesCoexist:
             print(f"  [{status}] {desc}")
 
         assert all_passed, "One or more fixes are missing from the codebase"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: RAG context merged into user message (not system)
+# ---------------------------------------------------------------------------
+
+
+class TestRagContextInUserMessage:
+    """Validate RAG context is merged into user message, not a system message."""
+
+    def test_no_system_rag_section(self):
+        """RAG context should NOT be a separate system message section."""
+        with open(MAIN_PY, "r") as f:
+            source = f.read()
+        assert '"role": "system"' not in source[
+            source.find("current_user_message is not None"):
+            source.find("first_dynamic_section_name", source.find("current_user_message is not None"))
+        ], (
+            "RAG context should not be injected as a 'system' role message. "
+            "It should be merged into the user message content."
+        )
+
+    def test_rag_merged_into_user_content(self):
+        """RAG context should be merged into user message with 'Retrieved context:' prefix."""
+        with open(MAIN_PY, "r") as f:
+            source = f.read()
+        assert "Retrieved context:" in source, (
+            "RAG context should be merged into user message with 'Retrieved context:' prefix"
+        )
+
+    def test_rag_merged_with_question(self):
+        """Merged RAG content should include the user question after 'Question:'."""
+        with open(MAIN_PY, "r") as f:
+            source = f.read()
+        assert "Question:" in source, (
+            "RAG-merged user message should include user question after 'Question:'"
+        )
+
+    def test_user_message_not_none_check(self):
+        """current_user_message should be checked before merging RAG."""
+        with open(MAIN_PY, "r") as f:
+            source = f.read()
+        assert "current_user_message is not None" in source, (
+            "Should check current_user_message is not None before merging RAG"
+        )
+
+    def test_protected_suffix_is_one(self):
+        """_protected_suffix should be 1 since RAG is merged into user message."""
+        with open(MAIN_PY, "r") as f:
+            source = f.read()
+        # Look for the specific line in the trim section
+        trim_section_start = source.find("if final_prompt_est_tokens > QONDUIT_TARGET_PROMPT_TOKENS")
+        assert trim_section_start > 0, "Could not find trim section"
+        trim_section = source[trim_section_start:trim_section_start + 500]
+        assert "_protected_suffix = 1" in trim_section, (
+            "In trim section, _protected_suffix should be 1 (rag merged into user)"
+        )
