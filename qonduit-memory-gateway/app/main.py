@@ -1919,7 +1919,14 @@ def should_enable_rag(
     mode: str,
     alias: dict[str, Any] | None = None,
     binding: dict[str, Any] | None = None,
+    request_rag_enabled: bool | None = None,
 ) -> bool:
+    # Request-level rag_enabled takes precedence if explicitly set
+    if request_rag_enabled is True:
+        return RAG_ENABLED
+    if request_rag_enabled is False:
+        return False
+
     if not RAG_ENABLED:
         return False
 
@@ -3022,28 +3029,56 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     rag_chunks = []
     rag_namespace = (req.rag_collection or "").strip() or None
 
-    rag_active = should_enable_rag(project_id, mode, alias=alias, binding=endpoint_binding)
+    # Resolve rag_enabled from request body (frontend toggle) before other checks
+    _req_rag_enabled = None
+    if hasattr(req, "rag_enabled") and req.rag_enabled is not None:
+        val = req.rag_enabled
+        if isinstance(val, bool):
+            _req_rag_enabled = val
+        elif isinstance(val, str):
+            _req_rag_enabled = val.strip().lower() in {"true", "1", "yes", "on"}
+        elif isinstance(val, (int, float)):
+            _req_rag_enabled = bool(val)
+    rag_active = should_enable_rag(
+        project_id, mode, alias=alias, binding=endpoint_binding,
+        request_rag_enabled=_req_rag_enabled,
+    )
     logger.info(
         "chat_rag_state conversation_id=%s project_id=%s rag_enabled=%s "
-        "namespace=%s request_model=%s effective_model=%s",
+        "namespace=%s request_rag_enabled=%s request_model=%s effective_model=%s",
         conversation_id,
         project_id,
         rag_active,
         rag_namespace or "(none)",
+        _req_rag_enabled,
         req.model,
         effective_model,
     )
     if latest_text.strip() and rag_active:
         try:
             used_user_fallback = False
-            rag_results = await search_documents(
-                latest_text,
-                limit=RAG_TOP_K,
-                collection=rag_namespace,
-                user_id=user_id,
-                project_id=project_id,
-                perf=perf,
-            )
+            perf.mark("chat_rag_selection", rag_active=True, namespace=rag_namespace or "(none)")
+            with perf.step("rag_search"):
+                rag_results = await search_documents(
+                    latest_text,
+                    limit=RAG_TOP_K,
+                    collection=rag_namespace,
+                    user_id=user_id,
+                    project_id=project_id,
+                    perf=perf,
+                )
+            # If namespace filter returned nothing, fall back to collection filter
+            # (the RAG Browser uses "collection" field, chat uses "namespace" field)
+            if not rag_results and rag_namespace:
+                rag_results = await search_documents(
+                    latest_text,
+                    limit=RAG_TOP_K,
+                    collection=None,
+                    user_id=user_id,
+                    project_id=project_id,
+                    perf=perf,
+                    collection_filter=rag_namespace,
+                )
             if not rag_results:
                 used_user_fallback = True
                 rag_results = await search_documents(
@@ -3054,6 +3089,17 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                     project_id=project_id,
                     perf=perf,
                 )
+                # Also try collection filter without user_id
+                if not rag_results and rag_namespace:
+                    rag_results = await search_documents(
+                        latest_text,
+                        limit=RAG_TOP_K,
+                        collection=None,
+                        user_id=None,
+                        project_id=project_id,
+                        perf=perf,
+                        collection_filter=rag_namespace,
+                    )
             with perf.step("rag_assembly"):
                 rag_chunks = [
                     item["text"].strip()
@@ -3062,11 +3108,20 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 ]
             logger.info(
                 "chat_rag_retrieval conversation_id=%s project_id=%s "
-                "hit_count=%s fallback_without_user=%s",
+                "hit_count=%s fallback_without_user=%s "
+                "collection=%s chunks=%s sources=%s",
                 conversation_id,
                 project_id,
                 len(rag_results),
                 "yes" if used_user_fallback else "no",
+                rag_namespace or "(none)",
+                len(rag_chunks),
+                "|".join(
+                    sorted({
+                        (r.get("payload") or {}).get("document_name", "")
+                        for r in rag_results
+                    })
+                ) or "(none)",
             )
         except Exception:
             logger.exception(
@@ -3225,9 +3280,15 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         )
 
         if final_prompt_est_tokens > QONDUIT_TARGET_PROMPT_TOKENS:
+            # Only trim conversation history, NEVER remove RAG context or user message.
+            # The dynamic_messages order is: [history, rag_context, user_message].
+            # We must preserve rag_context (index -2) and current_user_message (index -1).
+            _protected_suffix = 2  # rag_context + user_message
+            if current_user_message is None:
+                _protected_suffix = 1  # only rag_context
             while (
                 current_user_message is not None
-                and len(dynamic_messages) > 1
+                and len(dynamic_messages) > _protected_suffix
                 and final_prompt_est_tokens > QONDUIT_TARGET_PROMPT_TOKENS
             ):
                 dynamic_messages.pop(0)
@@ -3247,7 +3308,8 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             recent_history_est_tokens = estimate_tokens(
                 "".join(
                     coerce_model_content_to_text(m.get("content", ""))
-                    for m in dynamic_messages[:-1]
+                    for m in dynamic_messages[:-_protected_suffix]
+                    if dynamic_messages[:-_protected_suffix]
                 )
             )
     logger.info(
@@ -3280,6 +3342,17 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "prompt_section_order": prompt_section_order,
         "rag_chunk_ids_or_stable_keys": rag_chunk_keys,
     }
+
+    # Emit perf summary so operators can trace RAG pipeline stages
+    perf.mark(
+        "chat_rag_final",
+        rag_active=rag_active,
+        rag_chunks=len(rag_chunks),
+        rag_namespace=rag_namespace or "(none)",
+        trimmed_history=(len(dynamic_messages) < 3),
+        prompt_tokens=final_prompt_est_tokens,
+        target_tokens=QONDUIT_TARGET_PROMPT_TOKENS,
+    )
 
     state["summary"] = summary
     state["project_id"] = project_id

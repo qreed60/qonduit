@@ -153,6 +153,7 @@ class ProjectScopedRagService:
         user_id: str | None,
         namespace: str | None,
         perf: Any | None = None,
+        collection_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         if not RAG_ENABLED:
             return []
@@ -184,6 +185,14 @@ class ProjectScopedRagService:
                 FieldCondition(
                     key="namespace",
                     match=MatchValue(value=_normalize_identifier(namespace, "default")),
+                )
+            )
+
+        if collection_filter:
+            must_conditions.append(
+                FieldCondition(
+                    key="collection",
+                    match=MatchValue(value=_normalize_identifier(collection_filter, "default")),
                 )
             )
 
@@ -260,6 +269,7 @@ async def search_documents(
     user_id: str | None = None,
     project_id: str | None = None,
     perf: Any | None = None,
+    collection_filter: str | None = None,
 ) -> list[dict]:
     return await rag_service.search(
         project_id=project_id or "default",
@@ -268,6 +278,7 @@ async def search_documents(
         user_id=user_id,
         namespace=collection,
         perf=perf,
+        collection_filter=collection_filter,
     )
 
 
