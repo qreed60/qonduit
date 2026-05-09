@@ -110,7 +110,7 @@ def run() -> None:
             messages = payload.get("messages")
             assert isinstance(messages, list), "messages missing from payload"
             compiled_prompt = "\n".join(str(m.get("content", "")) for m in messages)
-            assert "Relevant retrieved knowledge:" in compiled_prompt
+            assert "Retrieved context:" in compiled_prompt
             assert "MainActivity.kt" in compiled_prompt
 
     print("MainActivity RAG validation passed.")

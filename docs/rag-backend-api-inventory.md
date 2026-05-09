@@ -110,7 +110,9 @@
   - `should_enable_rag(...)` returns true for the resolved project/mode/alias/binding,
   - the request has a latest non-empty user message.
 - The latest user text is embedded and searched in the project collection.
-- Results are bounded and inserted as a system message titled `Relevant retrieved knowledge:` before the current user message.
+- Results are bounded and merged directly into the current user message content as:
+  `Retrieved context:\n<rag_chunks>\n\nQuestion: <original_user_query>`.
+  This ensures the model sees context alongside the question (LLMs heavily weight the last user message).
 - Chat does not return a dedicated citations/sources array.
 
 ### How `project_id` maps to collections
@@ -368,7 +370,9 @@ Default project status fields:
 
 - Latest user message is used as retrieval query.
 - Results are sorted deterministically and bounded by chunk count/character count.
-- The final prompt includes a system section `Selected collection identities:` and, when results exist, `Relevant retrieved knowledge:`.
+- When results exist, RAG chunks are merged into the user message as:
+  `Retrieved context:\n<rag_chunks>\n\nQuestion: <original_user_query>`.
+  The `Selected collection identities:` section is used only when a binding/alias resolves to multiple collections.
 
 ## 6. Collection Operations
 
@@ -477,7 +481,8 @@ Upload document/spreadsheet extractors:
   - Chat mode tries upstream summarization and falls back to compact local summary on failure.
   - Summaries are inserted as `Conversation summary:` system messages when present.
 - Retrieval result insertion:
-  - Retrieved result `text` fields are stripped, bounded, joined with blank lines, and inserted as a system message beginning `Relevant retrieved knowledge:`.
+  - Retrieved result `text` fields are stripped, bounded, joined with blank lines, and merged into the user message as:
+    `Retrieved context:\n<rag_chunks>\n\nQuestion: <original_user_query>`.
 - Source citations:
   - Chat responses do not include a dedicated source/citation field.
   - Retrieval payloads are not surfaced in the OpenAI response shape.

@@ -152,7 +152,7 @@ def run() -> None:
             messages = sent_payload.get("messages")
             assert isinstance(messages, list)
             injected = "\n".join(str(m.get("content", "")) for m in messages)
-            assert "Relevant retrieved knowledge" in injected
+            assert "Retrieved context:" in injected
             assert "src/foo.py" in injected
 
     print("Phase 4 validation passed.")
