@@ -197,23 +197,23 @@ class ProjectScopedRagService:
             )
 
         if perf is None:
-            hits = self.client.search(
+            response = self.client.query_points(
                 collection_name=collection_name,
-                query_vector=vector,
+                query=vector,
                 query_filter=Filter(must=must_conditions),
                 limit=max(1, top_k),
             )
         else:
             with perf.step("qdrant_search"):
-                hits = self.client.search(
+                response = self.client.query_points(
                     collection_name=collection_name,
-                    query_vector=vector,
+                    query=vector,
                     query_filter=Filter(must=must_conditions),
                     limit=max(1, top_k),
                 )
 
         results: list[dict[str, Any]] = []
-        for hit in hits:
+        for hit in (response.points if hasattr(response, "points") else []):
             payload = hit.payload or {}
             results.append(
                 {

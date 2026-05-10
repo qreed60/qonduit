@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import httpx
+import base64
 import json
 import ast
 import csv
@@ -48,6 +49,13 @@ from .settings import (
     list_builtin_templates as _list_builtin_templates,
 )
 from .settings_router import router as settings_router
+from .parser import parse_document_bytes as _parse_document_bytes
+from .documents import (
+    ingest_text_document as _ingest_text_document,
+    RAG_UPLOAD_DIR as _RAG_UPLOAD_DIR,
+    CHAT_ATTACHMENT_MAX_CHARS as _CHAT_ATTACHMENT_MAX_CHARS,
+    router as documents_router,
+)
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import glob
 import shutil
@@ -55,6 +63,7 @@ import shutil
 app = FastAPI(title="Qonduit Memory Gateway")
 app.include_router(rag_read_router)
 app.include_router(settings_router)
+app.include_router(documents_router)  # documents router from .documents
 logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
@@ -1072,6 +1081,19 @@ class ChatMessage(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ChatAttachment(BaseModel):
+    name: str
+    mime_type: str
+    content_base64: str
+    collection: str | None = None
+    mode: str | None = None
+    metadata: dict[str, Any] | None = None
+    document_id: str | None = None
+    google_file_id: str | None = None
+
+    model_config = {"extra": "allow"}
+
+
 class GatewayChatRequest(BaseModel):
     conversation_id: str | None = None
     project_id: str | None = None
@@ -1086,6 +1108,7 @@ class GatewayChatRequest(BaseModel):
     mode: str | None = None
     tools: list[ToolDefinition] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    attachments: list[ChatAttachment] | None = None
 
     model_config = {"extra": "allow"}
 
@@ -3279,16 +3302,110 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
                 ("recent_conversation_history", history_messages)
             )
         if current_user_message is not None:
-            # Merge RAG context into the user message so the model reliably
-            # sees the context alongside the question (LLMs heavily weight the
-            # last user message and often ignore separate system messages).
+            # Merge RAG context and chat attachments into the user message
+            # so the model reliably sees context alongside the question
+            # (LLMs heavily weight the last user message and often ignore
+            # separate system messages).
             user_content = current_user_message.get("content", "")
+
+            # ── 1. Build merged user message ──────────────────────────
+            parts: list[str] = []
+            attachment_context_parts: list[str] = []
+            attachment_diagnostics: dict[str, Any] = {
+                "attachment_count": 0,
+                "attachment_modes": [],
+                "extracted_chars": 0,
+                "injected_attachment_chars": 0,
+                "saved_to_rag_count": 0,
+            }
+
+            if req.attachments:
+                attachment_diagnostics["attachment_count"] = len(req.attachments)
+                for att in req.attachments:
+                    try:
+                        att_data = base64.b64decode(att.content_base64)
+                        att_text = _parse_document_bytes(
+                            att_data, att.name, att.mime_type
+                        ).text
+                    except Exception as exc:
+                        logger.warning(
+                            "attachment_parse_failed name=%s error=%s",
+                            att.name,
+                            exc,
+                        )
+                        att_text = f"[Failed to parse attachment: {att.name}]"
+
+                    attachment_diagnostics["extracted_chars"] += len(att_text)
+
+                    # Trim attachment context to budget
+                    if len(att_text) > _CHAT_ATTACHMENT_MAX_CHARS:
+                        att_text = att_text[:_CHAT_ATTACHMENT_MAX_CHARS]
+                        attachment_diagnostics["injected_attachment_chars"] += _CHAT_ATTACHMENT_MAX_CHARS
+                    else:
+                        attachment_diagnostics["injected_attachment_chars"] += len(att_text)
+
+                    att_label = att.name.split("/")[-1] if "/" in att.name else att.name
+                    att_label = att.name.strip()
+
+                    mode = (att.mode or "chat_context_only").strip().lower()
+                    attachment_diagnostics["attachment_modes"].append(mode)
+
+                    if mode in ("save_to_rag", "save_to_rag_only"):
+                        try:
+                            norm_collection = (att.collection or "").strip() or "default"
+                            safe_project = project_id.strip().lower() or "default"
+                            extra_meta = dict(att.metadata) if att.metadata else {}
+                            if att.google_file_id:
+                                extra_meta["google_file_id"] = att.google_file_id
+                            extra_meta.update({
+                                "source": "chat_attachment",
+                                "file_type": att.mime_type.split("/")[-1] if "/" in att.mime_type else "unknown",
+                                "mime_type": att.mime_type,
+                            })
+                            ingest_result = await _ingest_text_document(
+                                project_id=safe_project,
+                                collection=norm_collection,
+                                document_name=att.name,
+                                text=att_text,
+                                metadata=extra_meta,
+                                source="chat_attachment",
+                                saved_path=f"chat_attachment://{att.name}",
+                                document_id=att.document_id,
+                                user_id=user_id,
+                                google_file_id=att.google_file_id,
+                            )
+                            attachment_diagnostics["saved_to_rag_count"] += 1
+                            logger.info(
+                                "attachment_saved_to_rag name=%s document_id=%s chunks=%s",
+                                att.name,
+                                ingest_result.get("document_id", "unknown"),
+                                ingest_result.get("chunks_written", 0),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "attachment_save_to_rag_failed name=%s", att.name
+                            )
+
+                    if mode in ("chat_context_only", "save_to_rag"):
+                        attachment_context_parts.append(
+                            f"Attached document context ({att.name}):\n{att_text}"
+                        )
+
+            # Merge RAG context + attachment context + question
+            merged_content = user_content
             if rag_context:
-                current_user_message = dict(current_user_message)
-                current_user_message["content"] = (
-                    f"Retrieved context:\n{rag_context}\n\n"
-                    f"Question: {user_content}"
-                )
+                parts.append(f"Retrieved context:\n{rag_context}")
+            if attachment_context_parts:
+                parts.append("\n\n".join(attachment_context_parts))
+            if parts:
+                merged_content = f"{'\n\n'.join(parts)}\n\nQuestion: {user_content}"
+
+            current_user_message = dict(current_user_message)
+            current_user_message["content"] = merged_content
+
+            # Store attachment diagnostics in request state for response
+            req._attachment_diagnostics = attachment_diagnostics  # type: ignore[attr-defined]
+
             section_messages.append(
                 ("current_user_message", [current_user_message])
             )
@@ -3425,7 +3542,7 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     state["last_mode"] = mode
     state["last_prompt_tokens"] = prompt_tokens
     state["last_reserved_output"] = budget.reserved_output
-    state["metadata"] = {
+    _metadata: dict[str, Any] = {
         "mode": mode,
         "project_id": project_id,
         "rag_collection": (req.rag_collection or "").strip() or project_id,
@@ -3433,6 +3550,10 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
         "request_model": req.model,
         "effective_model": effective_model,
     }
+    # Attach attachment diagnostics if present
+    if hasattr(req, "_attachment_diagnostics"):
+        _metadata["attachment_diagnostics"] = req._attachment_diagnostics  # type: ignore[attr-defined]
+    state["metadata"] = _metadata
     save_conversation(conversation_id, state, project_id=project_id)
 
     # ── Diagnostic: log final forwarded payload summary ──────────────────
@@ -4594,6 +4715,18 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
     if tool_calls:
         response_message["tool_calls"] = tool_calls
 
+    # Build metadata including attachment diagnostics if present
+    response_metadata: dict[str, Any] = {
+        "mode": mode,
+        "project_id": project_id,
+        "rag_collection": (req.rag_collection or "").strip() or project_id,
+        "rag_enabled": rag_active,
+        "request_model": req.model,
+        "effective_model": effective_model,
+    }
+    if hasattr(req, "_attachment_diagnostics"):
+        response_metadata["attachment_diagnostics"] = req._attachment_diagnostics  # type: ignore[attr-defined]
+
     return {
         "id": data.get("id", f"chatcmpl-qonduit-{uuid.uuid4().hex}"),
         "object": "chat.completion",
@@ -4609,4 +4742,5 @@ async def chat(req: GatewayChatRequest, request: Request) -> Any:
             }
         ],
         "usage": data.get("usage", {}),
+        "metadata": response_metadata,
     }
