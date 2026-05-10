@@ -650,6 +650,7 @@ class SourceResponse(BaseModel):
     metadata: dict[str, Any]
     text_preview: str
     full_text: str | None = None
+    warnings: list[str] | None = None
     error: str | None = None
 
 
@@ -810,6 +811,7 @@ async def get_document_source(
 
     text_preview = ""
     full_text: str | None = None
+    source_warnings: list[str] = []
 
     if include_text:
         src = _store.source_path(safe_project, document_id)
@@ -824,7 +826,71 @@ async def get_document_source(
                 logger.warning("read_source_failed document_id=%s error=%s", document_id, exc)
                 text_preview = f"Error reading source: {exc}"
         else:
-            text_preview = "Source file not found on disk"
+            # Source file not on disk — fall back to stored text in metadata
+            # or Qdrant chunk payloads.
+            fallback_text: str | None = None
+
+            # 1. Check _reingest_text (used by text_upload documents)
+            stored_text = meta.get("_reingest_text")
+            if stored_text and isinstance(stored_text, str) and stored_text.strip():
+                fallback_text = stored_text
+                source_warnings.append("source_file_missing_used_metadata_text")
+                logger.info(
+                    "read_source_fallback document_id=%s source=_reingest_text length=%d",
+                    document_id,
+                    len(stored_text),
+                )
+
+            # 2. Check raw "text" field in metadata
+            if not fallback_text:
+                meta_text = meta.get("text")
+                if meta_text and isinstance(meta_text, str) and meta_text.strip():
+                    fallback_text = meta_text
+                    source_warnings.append("source_file_missing_used_metadata_text")
+                    logger.info(
+                        "read_source_fallback document_id=%s source=metadata_text length=%d",
+                        document_id,
+                        len(meta_text),
+                    )
+
+            # 3. Try to reconstruct from first chunk in Qdrant
+            if not fallback_text:
+                try:
+                    from app.rag import search_documents
+                    chunks = await search_documents(
+                        query="",  # empty query — we filter by document_id
+                        limit=1,
+                        collection=None,
+                        project_id=safe_project,
+                    )
+                    for chunk in chunks:
+                        payload = chunk.get("payload") or {}
+                        if payload.get("document_id") == document_id:
+                            chunk_text = payload.get("text", "")
+                            if chunk_text and isinstance(chunk_text, str):
+                                fallback_text = chunk_text
+                                source_warnings.append(
+                                    "source_file_missing_used_qdrant_chunk_fallback"
+                                )
+                                logger.info(
+                                    "read_source_fallback document_id=%s source=qdrant_chunk length=%d",
+                                    document_id,
+                                    len(chunk_text),
+                                )
+                                break
+                except Exception:
+                    logger.debug(
+                        "read_source_qdrant_fallback_failed document_id=%s", document_id,
+                        exc_info=True,
+                    )
+
+            if fallback_text:
+                full_text = fallback_text
+                text_preview = full_text[:max_chars]
+                if len(full_text) > max_chars:
+                    text_preview += f"\n\n... (truncated, {len(full_text) - max_chars} more chars)"
+            else:
+                text_preview = "Source file not found on disk"
 
     return {
         "ok": True,
@@ -833,5 +899,6 @@ async def get_document_source(
         "metadata": response_meta,
         "text_preview": text_preview,
         "full_text": full_text if include_text else None,
+        "warnings": source_warnings if source_warnings else None,
         "error": None,
     }
