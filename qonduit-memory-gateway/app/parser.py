@@ -127,11 +127,11 @@ _EXTENSION_MAP.update(_DOCUMENT_EXTENSIONS)
 def _detect_parser_by_extension(
     filename: str,
     mime_type: str | None,
-) -> tuple[str, str]:
+) -> tuple[str | None, str | None]:
     """Return ``(parser_name, file_type)`` based on the filename extension.
 
-    Falls back to ``plain_text`` when the extension is unknown but the content
-    is likely text.
+    Returns ``(None, None)`` when the extension is not recognised.
+    Callers may choose to fall back to ``plain_text`` or reject the file.
     """
     if filename:
         ext = Path(filename).suffix.lower()
@@ -155,7 +155,7 @@ def _detect_parser_by_extension(
         if "csv" in mt:
             return "csv", ".csv".lstrip(".")
 
-    return "plain_text", "txt"
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +392,15 @@ def parse_document_bytes(
     """
     parser_name, file_type = _detect_parser_by_extension(filename, mime_type)
 
+    # Fallback for unknown extensions – treat as plain text
+    if parser_name is None:
+        parser_name = "plain_text"
+        file_type = "txt"
+        filename_hint = Path(filename).name if filename else "unnamed"
+        warnings_list = [f"unknown_extension={filename_hint}"]
+    else:
+        warnings_list = []
+
     metadata: dict[str, Any] = {
         "parser": parser_name,
         "file_type": file_type,
@@ -403,13 +412,13 @@ def parse_document_bytes(
     # Composed extractors return (text, warnings)
     if parser_name in _COMPOSED_EXTRACTORS:
         extractor = _COMPOSED_EXTRACTORS[parser_name]
-        text, warnings = extractor(data)
+        text, compose_warnings = extractor(data)
         return ParsedDocument(
             text=text,
             parser=parser_name,
             file_type=file_type,
             metadata=metadata,
-            warnings=warnings,
+            warnings=warnings_list + compose_warnings,
         )
 
     # Simple extractors return just text
@@ -430,7 +439,7 @@ def parse_document_bytes(
         parser=parser_name,
         file_type=file_type,
         metadata=metadata,
-        warnings=[],
+        warnings=warnings_list,
     )
 
 
@@ -454,12 +463,32 @@ def parse_document_file(
 # Sentinel to detect unsupported formats
 # ---------------------------------------------------------------------------
 
-UNSUPPORTED_FILE_TYPES: set[str] = set()  # Could be populated dynamically
+UNSUPPORTED_FILE_TYPES: set[str] = {"pptx"}  # Reserved but not yet implemented
 
 
 def is_supported_extension(filename: str) -> bool:
-    """Return ``True`` if the filename extension is supported for parsing."""
-    _, file_type = _detect_parser_by_extension(filename, None)
-    if file_type == "pptx":
-        return False  # Reserved but not yet implemented
-    return True
+    """Return ``True`` if the filename extension is supported for parsing.
+
+    Unknown extensions are rejected.  ``pptx`` is explicitly excluded
+    (reserved for future use).
+    """
+    if filename:
+        ext = Path(filename).suffix.lower()
+        if ext and ext in _EXTENSION_MAP:
+            file_type = _EXTENSION_MAP[ext]
+            if file_type in UNSUPPORTED_FILE_TYPES:
+                return False
+            return True
+
+        # Build-file check (filename only, no extension)
+        base = Path(filename).name.lower()
+        if base in _BUILD_FILES:
+            file_type = _BUILD_FILES[base]
+            if file_type in UNSUPPORTED_FILE_TYPES:
+                return False
+            return True
+
+    # MIME-type hint check (only for known types)
+    # Note: callers should pass mime_type explicitly; this function only
+    # checks the filename.
+    return False

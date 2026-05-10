@@ -56,11 +56,13 @@ from .documents import (
     CHAT_ATTACHMENT_MAX_CHARS as _CHAT_ATTACHMENT_MAX_CHARS,
     router as documents_router,
 )
+from .rag_registry_router import router as rag_registry_router
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import glob
 import shutil
 
 app = FastAPI(title="Qonduit Memory Gateway")
+app.include_router(rag_registry_router)  # project/collection registry CRUD
 app.include_router(rag_read_router)
 app.include_router(settings_router)
 app.include_router(documents_router)  # documents router from .documents
@@ -875,6 +877,18 @@ async def execute_tool(
 async def startup() -> None:
     ensure_collection()
     await ingestion_manager.start()
+    # Ensure default project exists in the persistent registry
+    # (with Qdrant physical collection + default logical collection)
+    try:
+        from .rag_registry import get_registry
+        reg = get_registry()
+        reg.ensure_project(
+            project_id="default",
+            display_name="Default",
+            ensure_qdrant=True,
+        )
+    except Exception as exc:
+        logger.warning("ensure_default_project_failed error=%s", exc)
     logger.info(
         "gateway_startup llama_base=%s effective_context_size=%s "
         "default_max_tokens=%s allow_client_context_size=%s "
@@ -2931,6 +2945,15 @@ async def rag_upload_document(
         raise HTTPException(status_code=400, detail="Uploaded file must have an extension")
 
     saved_path = build_saved_upload_path(user_id, collection_name, filename)
+
+    # Ensure project and collection exist in registry
+    try:
+        from .rag_registry import get_registry
+        reg = get_registry()
+        reg.ensure_project(project_id=project_id)
+        reg.ensure_collection_exists(project_id, collection_name)
+    except Exception as exc:
+        logger.warning("registry_update_on_upload_failed error=%s", exc)
 
     try:
         with open(saved_path, "wb") as f:

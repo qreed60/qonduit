@@ -18,7 +18,41 @@ This document describes the document ingestion system added to the Qonduit Memor
 |------|-------------|
 | `app/parser.py` | Document parser abstraction with text extraction |
 | `app/documents.py` | Document storage, metadata, chunk/embed/upsert helpers, and REST endpoints |
+| `app/rag_registry.py` | Persistent JSON-based registry for RAG projects and logical collections |
 | `scripts/validate_document_ingestion.py` | Validation script for all ingestion paths |
+
+## RagRegistry
+
+A persistent JSON-based registry for RAG projects and logical collections.
+
+| Method | Description |
+|--------|-------------|
+| `ensure_project(project_id, ...)` | Create or get a project; optionally create Qdrant collection |
+| `list_projects()` | List all projects with Qdrant stats |
+| `get_project(project_id)` | Get a single project with Qdrant stats |
+| `update_project(project_id, ...)` | Update project fields (display_name, description, metadata, etc.) |
+| `delete_project(project_id, force=False)` | Delete a project (default project requires force=True) |
+| `create_collection(project_id, name, ...)` | Create a logical collection within a project |
+| `list_collections(project_id)` | List all collections in a project |
+| `get_collection(project_id, collection)` | Get a single collection |
+| `update_collection(project_id, collection, ...)` | Update collection fields |
+| `delete_collection(project_id, collection)` | Delete a collection |
+| `ensure_collection_exists(project_id, collection)` | Ensure project and collection exist (used by ingestion) |
+
+### Registry Endpoints
+
+| Method | Path |
+|--------|------|
+| `GET` | `/v1/rag/projects` |
+| `POST` | `/v1/rag/projects` |
+| `GET` | `/v1/rag/projects/{project_id}` |
+| `PATCH` | `/v1/rag/projects/{project_id}` |
+| `DELETE` | `/v1/rag/projects/{project_id}` |
+| `GET` | `/v1/rag/projects/{project_id}/collections` |
+| `POST` | `/v1/rag/projects/{project_id}/collections` |
+| `GET` | `/v1/rag/projects/{project_id}/collections/{collection}` |
+| `PATCH` | `/v1/rag/projects/{project_id}/collections/{collection}` |
+| `DELETE` | `/v1/rag/projects/{project_id}/collections/{collection}` |
 
 ## New Endpoints Added
 

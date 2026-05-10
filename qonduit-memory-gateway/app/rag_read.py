@@ -493,6 +493,8 @@ async def rag_project_search(
                 "text": text,
                 "text_preview": text[:200] + ("..." if len(text) > 200 else ""),
                 "payload": payload,
+                "project_id": payload.get("project_id", safe),
+                "collection": payload.get("collection", body.collection),
                 "document_name": payload.get("document_name", ""),
                 "file_path": payload.get("file_path", payload.get("source_file", "")),
                 "chunk_index": payload.get("chunk_index", 0),

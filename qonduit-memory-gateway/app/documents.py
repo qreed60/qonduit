@@ -36,6 +36,7 @@ from .rag import (
     VECTOR_SIZE,
     RAG_ENABLED,
 )
+from .rag_registry import get_registry
 
 logger = logging.getLogger("qonduit.memory_gateway.documents")
 
@@ -249,11 +250,17 @@ async def ingest_text_document(
     document_id: str | None = None,
     user_id: str | None = None,
     google_file_id: str | None = None,
+    ensure_registry: bool = True,
 ) -> dict[str, Any]:
     """Chunk, embed, and upsert *text* into the project-scoped Qdrant collection.
 
     Returns a result dict with ``chunks_created``, ``chunks_written``,
     ``document_id``, and ``warnings``.
+
+    When ``ensure_registry=True`` (default), the function also calls
+    ``RagRegistry.ensure_collection_exists()`` so the project and logical
+    collection are registered in the persistent JSON registry before
+    ingesting into Qdrant.
     """
     if not text.strip():
         return {
@@ -267,6 +274,17 @@ async def ingest_text_document(
     norm_collection = collection.strip() or "default"
     norm_project = project_id.strip().lower() or "default"
 
+    # Ensure project + collection exist in the persistent registry
+    if ensure_registry:
+        try:
+            reg = get_registry()
+            reg.ensure_collection_exists(norm_project, norm_collection)
+        except Exception as exc:
+            logger.warning(
+                "ensure_registry_failed project=%s collection=%s error=%s",
+                norm_project, norm_collection, exc,
+            )
+
     # Chunk
     chunks = chunk_text(text, chunk_size=RAG_UPLOAD_CHUNK_SIZE, overlap=RAG_UPLOAD_CHUNK_OVERLAP)
     if not chunks:
@@ -277,7 +295,7 @@ async def ingest_text_document(
             "warnings": ["No chunks generated from document text"],
         }
 
-    # Ensure collection
+    # Ensure Qdrant physical collection
     coll_name = project_collection_name(norm_project)
     try:
         rag_service.ensure_collection(norm_project)

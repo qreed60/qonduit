@@ -218,6 +218,157 @@ startxref
 # ── API integration tests ──────────────────────────────────────────
 
 
+# ── Registry endpoint tests ────────────────────────────────────────
+
+
+async def test_registry_health(base_url: str) -> None:
+    """Test registry health endpoint."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{base_url}/v1/rag/registry/health")
+        assert resp.status_code == 200, f"registry health failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"registry not ok: {body}"
+        _print_ok(f"registry_health OK (projects={body.get('project_count', '?')})")
+
+
+async def test_list_projects(base_url: str) -> None:
+    """Test listing projects."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{base_url}/v1/rag/projects")
+        assert resp.status_code == 200, f"list projects failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"list projects not ok: {body}"
+        projects = body.get("projects", [])
+        pids = [p.get("project_id") for p in projects if isinstance(p, dict)]
+        assert "default" in pids, f"'default' not found in projects: {pids}"
+        _print_ok(f"list_projects OK (projects: {pids})")
+
+
+async def test_create_project(base_url: str) -> str:
+    """Test creating a new project."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{base_url}/v1/rag/projects",
+            json={
+                "project_id": "validation_test",
+                "display_name": "Validation Test Project",
+                "description": "Auto-created for validation",
+                "ensure_qdrant": False,
+            },
+        )
+        assert resp.status_code == 200, f"create project failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"create project not ok: {body}"
+        assert body.get("created") == True
+        _print_ok("create_project OK")
+        return "validation_test"
+
+
+async def test_get_project(base_url: str, project_id: str) -> None:
+    """Test getting a single project."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{base_url}/v1/rag/projects/{project_id}")
+        assert resp.status_code == 200, f"get project failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"get project not ok: {body}"
+        assert body["project"]["project_id"] == project_id
+        _print_ok(f"get_project OK ({project_id})")
+
+
+async def test_update_project(base_url: str, project_id: str) -> None:
+    """Test updating a project."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.patch(
+            f"{base_url}/v1/rag/projects/{project_id}",
+            json={"description": "Updated by validation"},
+        )
+        assert resp.status_code == 200, f"update project failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"update project not ok: {body}"
+        assert body["project"]["description"] == "Updated by validation"
+        _print_ok(f"update_project OK ({project_id})")
+
+
+async def test_list_collections(base_url: str, project_id: str) -> None:
+    """Test listing collections for a project."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{base_url}/v1/rag/projects/{project_id}/collections")
+        assert resp.status_code == 200, f"list collections failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"list collections not ok: {body}"
+        collections = body.get("collections", [])
+        names = [c.get("name") for c in collections if isinstance(c, dict)]
+        assert "default" in names, f"'default' not in collections: {names}"
+        _print_ok(f"list_collections OK ({project_id}: {names})")
+
+
+async def test_create_collection(base_url: str, project_id: str) -> str:
+    """Test creating a logical collection."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{base_url}/v1/rag/projects/{project_id}/collections",
+            json={
+                "name": "validation_coll",
+                "display_name": "Validation Collection",
+            },
+        )
+        assert resp.status_code == 200, f"create collection failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"create collection not ok: {body}"
+        assert body.get("created") == True
+        assert body["collection"]["name"] == "validation_coll"
+        _print_ok("create_collection OK")
+        return "validation_coll"
+
+
+async def test_get_collection(base_url: str, project_id: str, coll_name: str) -> None:
+    """Test getting a single collection."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{base_url}/v1/rag/projects/{project_id}/collections/{coll_name}")
+        assert resp.status_code == 200, f"get collection failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"get collection not ok: {body}"
+        assert body["collection"]["name"] == coll_name
+        _print_ok(f"get_collection OK ({project_id}/{coll_name})")
+
+
+async def test_update_collection(base_url: str, project_id: str, coll_name: str) -> None:
+    """Test updating a collection."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.patch(
+            f"{base_url}/v1/rag/projects/{project_id}/collections/{coll_name}",
+            json={"description": "Updated by validation"},
+        )
+        assert resp.status_code == 200, f"update collection failed: {resp.text}"
+        body = resp.json()
+        assert body.get("ok"), f"update collection not ok: {body}"
+        assert body["collection"]["description"] == "Updated by validation"
+        _print_ok(f"update_collection OK ({project_id}/{coll_name})")
+
+
+async def run_registry_tests(base_url: str) -> dict[str, str]:
+    """Run all registry endpoint tests. Returns created resources for cleanup."""
+    print("\n📋 Registry Endpoint Tests")
+    print("-" * 40)
+
+    await test_registry_health(base_url)
+    await test_list_projects(base_url)
+
+    project_id = await test_create_project(base_url)
+    await test_get_project(base_url, project_id)
+    await test_update_project(base_url, project_id)
+    await test_list_collections(base_url, project_id)
+
+    coll_name = await test_create_collection(base_url, project_id)
+    await test_get_collection(base_url, project_id, coll_name)
+    await test_update_collection(base_url, project_id, coll_name)
+
+    return {"project_id": project_id, "collection": coll_name}
+
+
+# ── Document endpoint tests ────────────────────────────────────────
+
+
 async def test_documents_text(base_url: str, project: str) -> dict[str, Any]:
     """Create a text document via /documents/text."""
     doc_name = f"validation_note_{int(time.time())}.txt"
@@ -380,37 +531,40 @@ async def test_upload_file(base_url: str, project: str) -> None:
 
 
 async def run_api_tests(base_url: str, project: str) -> None:
-    """Run all API integration tests."""
+    """Run all API integration tests (registry + documents + chat)."""
     print("\n📡 API Integration Tests")
     print("-" * 40)
 
-    # 1. Create text document
+    # Registry tests (first – they set up the environment)
+    registry_resources = await run_registry_tests(base_url)
+
+    # Document tests
     doc_result = await test_documents_text(base_url, project)
     doc_id = doc_result.get("document_id", "")
 
-    # 2. Search for unique phrase
+    # Search for unique phrase
     await test_search_unique(base_url, project)
 
-    # 3. List documents
+    # List documents
     await test_list_documents(base_url, project)
 
-    # 4. Fetch source
+    # Fetch source
     if doc_id:
         await test_fetch_source(base_url, project, doc_id)
 
-        # 5. Re-ingest
+        # Re-ingest
         await test_reingest(base_url, project, doc_id)
 
-        # 6. Delete document
+        # Delete document
         await test_delete_document(base_url, project, doc_id)
 
-        # 7. Confirm deleted
+        # Confirm deleted
         await test_search_after_delete(base_url, project)
 
-    # 8. Chat attachment
+    # Chat attachment
     await test_chat_attachment(base_url, project)
 
-    # 9. Upload file
+    # Upload file
     await test_upload_file(base_url, project)
 
 
