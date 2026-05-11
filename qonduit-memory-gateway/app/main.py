@@ -57,6 +57,7 @@ from .documents import (
     router as documents_router,
 )
 from .rag_registry_router import router as rag_registry_router
+from .tools_router import router as tools_router
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import glob
 import shutil
@@ -66,6 +67,7 @@ app.include_router(rag_registry_router)  # project/collection registry CRUD
 app.include_router(rag_read_router)
 app.include_router(settings_router)
 app.include_router(documents_router)  # documents router from .documents
+app.include_router(tools_router)  # model tools registry, settings, execute
 logger = logging.getLogger("qonduit.memory_gateway")
 ingestion_logger = logging.getLogger("qonduit.memory_gateway.ingestion")
 
@@ -1007,7 +1009,12 @@ UPLOAD_DIR = "/mnt/models/qonduit_uploads"
 
 def _configure_ingestion_logger() -> None:
     log_path = Path(GATEWAY_DATA_DIR) / "ingestion.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Permission denied – fall back to relative path
+        log_path = Path(__file__).resolve().parent.parent / "data" / "ingestion.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
     if any(
         isinstance(handler, logging.FileHandler)
         and getattr(handler, "baseFilename", "") == str(log_path)
