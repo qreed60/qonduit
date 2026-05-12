@@ -88,6 +88,7 @@ PYTHONDONTWRITEBYTECODE=1
 QONDUIT_GPU_MIN_TOTAL_MIB=8192
 QONDUIT_GPU_EXCLUDE_NAME_REGEX=K620|Quadro K620
 QONDUIT_DEFAULT_GPU_DEVICES=auto
+QONDUIT_ROUTER_ALLOW_LAN=true
 ENVEOF
         echo "  [OK] Created $ENV_FILE"
     else
@@ -99,6 +100,7 @@ ENVEOF
             "QONDUIT_GPU_MIN_TOTAL_MIB=8192"
             "QONDUIT_GPU_EXCLUDE_NAME_REGEX=K620|Quadro K620"
             "QONDUIT_DEFAULT_GPU_DEVICES=auto"
+            "QONDUIT_ROUTER_ALLOW_LAN=true"
         )
         local added=0
         for kv in "${keys[@]}"; do

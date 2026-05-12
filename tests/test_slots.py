@@ -2044,3 +2044,180 @@ class TestSelfConflictExclusion:
                     assert "exclude_slot_id" in line, (
                         f"Line in preflight missing exclude_slot_id: {line.strip()}"
                     )
+
+
+# ── Router Access Control Tests ──────────────────────────────────────────────
+
+class TestRouterAccessControl:
+    """Tests for the _require_router_access / _router_access_allowed helpers."""
+
+    def _request_with_ip(self, client, method, path, ip, **kwargs):
+        """Make a request with a specific remote_addr via test_request_context."""
+        # Import app to access test_request_context
+        import qonduit_router_api
+        app = qonduit_router_api.app
+
+        with app.test_request_context(path, method=method, **kwargs):
+            # Set the remote_addr on the current request context
+            from flask import request as flask_request
+            flask_request.remote_addr = ip
+            # Now make the request through the test client with environ_base
+            pass
+
+        # Use the test client with environ_base to set REMOTE_ADDR
+        environ_base = kwargs.get("environ_base", {})
+        environ_base["REMOTE_ADDR"] = ip
+        if method == "GET":
+            return client.get(path, environ_base=environ_base)
+        elif method == "POST":
+            return client.post(path, environ_base=environ_base, **kwargs.get("json_kwargs", {}))
+        elif method == "DELETE":
+            return client.delete(path, environ_base=environ_base)
+        elif method == "OPTIONS":
+            return client.options(path, environ_base=environ_base)
+        else:
+            return client.get(path, environ_base=environ_base)
+
+    def _get_with_ip(self, client, path, ip):
+        """GET request with specific remote_addr."""
+        return client.get(path, environ_base={"REMOTE_ADDR": ip})
+
+    def _post_with_ip(self, client, path, ip, json_data=None):
+        """POST request with specific remote_addr."""
+        return client.post(path,
+                           environ_base={"REMOTE_ADDR": ip},
+                           json=json_data)
+
+    def _delete_with_ip(self, client, path, ip):
+        """DELETE request with specific remote_addr."""
+        return client.delete(path, environ_base={"REMOTE_ADDR": ip})
+
+    def _options_with_ip(self, client, path, ip):
+        """OPTIONS request with specific remote_addr."""
+        return client.options(path, environ_base={"REMOTE_ADDR": ip})
+
+    def test_loopback_allowed(self, app_client, monkeypatch):
+        """Loopback clients (127.0.0.1) are allowed regardless of env."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "127.0.0.1")
+        assert resp.status_code == 200
+
+    def test_loopback_allowed_ipv6(self, app_client, monkeypatch):
+        """Loopback clients (::1) are allowed regardless of env."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "::1")
+        assert resp.status_code == 200
+
+    def test_lan_allowed_when_QONDUIT_ROUTER_ALLOW_LAN_true(self, app_client, monkeypatch):
+        """LAN/private clients are allowed when QONDUIT_ROUTER_ALLOW_LAN=true (default)."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "192.168.5.5")
+        assert resp.status_code == 200
+
+    def test_lan_allowed_10_x_x_x(self, app_client, monkeypatch):
+        """10.x.x.x private range clients are allowed when QONDUIT_ROUTER_ALLOW_LAN=true."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "10.0.0.1")
+        assert resp.status_code == 200
+
+    def test_lan_allowed_172_x_x_x_private(self, app_client, monkeypatch):
+        """172.16-31.x.x private range clients are allowed when QONDUIT_ROUTER_ALLOW_LAN=true."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "172.16.0.1")
+        assert resp.status_code == 200
+
+    def test_lan_rejected_when_QONDUIT_ROUTER_ALLOW_LAN_false(self, app_client, monkeypatch):
+        """LAN/private clients are rejected when QONDUIT_ROUTER_ALLOW_LAN=false."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "192.168.5.5")
+        assert resp.status_code == 403
+
+    def test_public_client_rejected(self, app_client, monkeypatch):
+        """Public/non-private clients are always rejected."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "8.8.8.8")
+        assert resp.status_code == 403
+        data = resp.get_json()
+        assert data["error"] == "router_access_denied"
+
+    def test_options_not_blocked(self, app_client, monkeypatch):
+        """OPTIONS requests are never blocked (CORS/PNA preflight)."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
+        resp = self._options_with_ip(app_client, "/api/v1/qonduit-router/slots", "8.8.8.8")
+        assert resp.status_code == 200
+
+    def test_options_not_blocked_loopback(self, app_client, monkeypatch):
+        """OPTIONS requests are allowed from any client."""
+        resp = self._options_with_ip(app_client, "/api/v1/qonduit-router/slots", "127.0.0.1")
+        assert resp.status_code == 200
+
+    def test_slots_no_local_only_for_allowed_lan(self, app_client, monkeypatch):
+        """/slots returns 200 for allowed LAN clients (no local_only error)."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slots", "192.168.1.100")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data.get("ok") is True
+        assert "local_only" not in data.get("error", "")
+
+    def test_endpoints_no_local_only_for_allowed_lan(self, app_client, monkeypatch):
+        """/endpoints returns 200 for allowed LAN clients."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/endpoints", "192.168.1.100")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data.get("ok") is True
+
+    def test_gpu_no_local_only_for_allowed_lan(self, app_client, monkeypatch):
+        """/gpu returns 200 for allowed LAN clients."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/gpu", "192.168.1.100")
+        assert resp.status_code == 200
+
+    def test_slot_templates_no_local_only_for_allowed_lan(self, app_client, monkeypatch):
+        """/slot-templates returns 200 for allowed LAN clients."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "true")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/slot-templates", "192.168.1.100")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data.get("ok") is True
+        assert "templates" in data
+
+    def test_legacy_models_unchanged(self, app_client, monkeypatch):
+        """/models behavior remains unchanged (it uses different guard logic in the main API)."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
+        resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/models", "127.0.0.1")
+        # Should not return local_only error
+        assert resp.status_code == 200 or resp.status_code == 401 or resp.status_code == 403
+        data = resp.get_json()
+        if data and data.get("error") == "local_only":
+            pytest.fail("/models returned local_only error for loopback client")
+
+    def test_lan_env_var_variants(self, app_client, monkeypatch):
+        """Test various string values for QONDUIT_ROUTER_ALLOW_LAN env var."""
+        for true_val in ("1", "true", "yes", "on"):
+            monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", true_val)
+            resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/gpu", "192.168.1.1")
+            assert resp.status_code == 200, f"ALLOW_LAN={true_val} should allow LAN"
+
+        for false_val in ("0", "false", "no", "off"):
+            monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", false_val)
+            resp = self._get_with_ip(app_client, "/api/v1/qonduit-router/gpu", "192.168.1.1")
+            assert resp.status_code == 403, f"ALLOW_LAN={false_val} should deny LAN"
+
+    def test_post_slots_restricted_by_access(self, app_client, monkeypatch):
+        """POST /slots is also restricted by router access control."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
+        resp = self._post_with_ip(app_client, "/api/v1/qonduit-router/slots", "192.168.1.1",
+                                   json_data={"slot_id": "test-restricted", "host_port": 9000})
+        assert resp.status_code == 403
+        data = resp.get_json()
+        assert data["error"] == "router_access_denied"
+
+    def test_delete_slots_restricted_by_access(self, app_client, monkeypatch):
+        """DELETE /slots/<slot_id> is also restricted by router access control."""
+        monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
+        resp = self._delete_with_ip(app_client, "/api/v1/qonduit-router/slots/primary", "192.168.1.1")
+        assert resp.status_code == 403
+        data = resp.get_json()
+        assert data["error"] == "router_access_denied"

@@ -6,6 +6,7 @@ Registers all new slot-aware endpoints on the existing Flask app.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import subprocess
@@ -61,12 +62,62 @@ def _json_error(
     return jsonify({"ok": False, "error": code, "detail": detail}), status
 
 
-def _check_local() -> Optional[tuple[dict[str, Any], int]]:
-    """Check request is from local. Returns error response if not, else None."""
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read an environment variable as a boolean."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_loopback_or_localhost(client_ip: str | None) -> bool:
+    """Return True if *client_ip* is a loopback or localhost address."""
+    if not client_ip:
+        return False
+    if client_ip in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        return ipaddress.ip_address(client_ip).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_private_lan(client_ip: str | None) -> bool:
+    """Return True if *client_ip* is an RFC-1918 private or link-local address."""
+    if not client_ip:
+        return False
+    try:
+        ip = ipaddress.ip_address(client_ip)
+        return ip.is_private or ip.is_link_local
+    except ValueError:
+        return False
+
+
+def _router_access_allowed() -> bool:
+    """Return True when the current request should be allowed router access."""
     client_ip = request.remote_addr
-    if client_ip not in ("127.0.0.1", "::1", "localhost"):
-        return jsonify({"ok": False, "error": "local_only"}), 403
-    return None
+    if _is_loopback_or_localhost(client_ip):
+        return True
+    if _env_bool("QONDUIT_ROUTER_ALLOW_LAN", True) and _is_private_lan(client_ip):
+        return True
+    return False
+
+
+def _require_router_access() -> Optional[tuple[dict[str, Any], int]]:
+    """Return *None* if access is allowed, else a JSON error response.
+
+    OPTIONS requests are never blocked (CORS/PNA preflight support).
+    """
+    if request.method == "OPTIONS":
+        return None
+    if _router_access_allowed():
+        return None
+    return jsonify({
+        "ok": False,
+        "error": "router_access_denied",
+        "client_ip": request.remote_addr,
+        "allow_lan": _env_bool("QONDUIT_ROUTER_ALLOW_LAN", True),
+    }), 403
 
 
 def _get_primary_slot() -> dict[str, Any]:
@@ -121,7 +172,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/slots ---
     @app.get("/api/v1/qonduit-router/slots")
     def slots_list():
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
         slots = load_slots()
@@ -133,7 +184,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- POST /api/v1/qonduit-router/slots ---
     @app.post("/api/v1/qonduit-router/slots")
     def slots_create():
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -156,7 +207,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/slots/<slot_id> ---
     @app.get("/api/v1/qonduit-router/slots/<slot_id>")
     def slot_get(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -168,7 +219,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- PATCH /api/v1/qonduit-router/slots/<slot_id> ---
     @app.patch("/api/v1/qonduit-router/slots/<slot_id>")
     def slot_update(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -204,7 +255,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- DELETE /api/v1/qonduit-router/slots/<slot_id> ---
     @app.delete("/api/v1/qonduit-router/slots/<slot_id>")
     def slot_delete(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -246,7 +297,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- POST /api/v1/qonduit-router/slots/<slot_id>/launch ---
     @app.post("/api/v1/qonduit-router/slots/<slot_id>/launch")
     def slot_launch(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -301,7 +352,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- POST /api/v1/qonduit-router/slots/<slot_id>/stop ---
     @app.post("/api/v1/qonduit-router/slots/<slot_id>/stop")
     def slot_stop(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -326,7 +377,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- POST /api/v1/qonduit-router/slots/<slot_id>/restart ---
     @app.post("/api/v1/qonduit-router/slots/<slot_id>/restart")
     def slot_restart(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -357,7 +408,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/slots/<slot_id>/ready ---
     @app.get("/api/v1/qonduit-router/slots/<slot_id>/ready")
     def slot_ready(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -371,7 +422,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/slots/<slot_id>/models ---
     @app.get("/api/v1/qonduit-router/slots/<slot_id>/models")
     def slot_models(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -387,7 +438,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/slots/<slot_id>/logs ---
     @app.get("/api/v1/qonduit-router/slots/<slot_id>/logs")
     def slot_logs(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -403,7 +454,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/slots/<slot_id>/preflight ---
     @app.post("/api/v1/qonduit-router/slots/<slot_id>/preflight")
     def slot_preflight(slot_id: str):
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -559,7 +610,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/endpoints ---
     @app.get("/api/v1/qonduit-router/endpoints")
     def endpoints_list():
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
@@ -583,7 +634,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/gpu ---
     @app.get("/api/v1/qonduit-router/gpu")
     def gpu_info():
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
         return jsonify(collect_gpu_summary())
@@ -591,7 +642,7 @@ def register_slot_routes(app: Flask) -> None:
     # --- GET /api/v1/qonduit-router/slot-templates ---
     @app.get("/api/v1/qonduit-router/slot-templates")
     def slot_templates():
-        denied = _check_local()
+        denied = _require_router_access()
         if denied:
             return denied
 
