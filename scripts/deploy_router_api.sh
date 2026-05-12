@@ -9,12 +9,8 @@
 
 set -euo pipefail
 
-ROUTER_FILES=(
-    "qonduit_router_api.py"
-    "qonduit_slots.py"
-    "qonduit_docker_helpers.py"
-    "qonduit_router_api_slots.py"
-)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MANIFEST_FILE="${SCRIPT_DIR}/router_api_files.txt"
 
 DEST_DIR="/opt"
 ENV_FILE="/opt/qonduit-router-api/.env"
@@ -31,7 +27,20 @@ deploy_files() {
     local deployed=0
     local failed=0
 
-    for f in "${ROUTER_FILES[@]}"; do
+    # Load file list from manifest
+    local router_files=()
+    if [[ -f "$MANIFEST_FILE" ]]; then
+        while IFS= read -r f || [[ -n "$f" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$f" || "$f" == \#* ]] && continue
+            router_files+=("$f")
+        done < "$MANIFEST_FILE"
+    else
+        echo "  [ERROR] Manifest file not found: $MANIFEST_FILE"
+        return 1
+    fi
+
+    for f in "${router_files[@]}"; do
         local src="${repo_dir}/${f}"
         local dst="${DEST_DIR}/${f}"
 
