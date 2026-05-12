@@ -44,8 +44,6 @@ from qonduit_docker_helpers import (
     stream_slot_logs,
     port_is_available,
     docker_name_is_available,
-    find_port_conflict,
-    find_container_name_conflict,
     collect_gpu_summary,
     compute_auto_tensor_split,
     resolve_gpu_devices,
@@ -532,28 +530,14 @@ def register_slot_routes(app: Flask) -> None:
         # Port availability
         host_port = payload.get("host_port") or slot_data.get("host_port", 8080)
         port_available = port_is_available(int(host_port), exclude_slot_id=slot_id)
-        port_conflict = find_port_conflict(int(host_port), exclude_slot_id=slot_id)
         if not port_available:
-            if port_conflict:
-                warnings.append(
-                    f"Port {host_port} is already in use by slot "
-                    f"'{port_conflict['slot_id']}'."
-                )
-            else:
-                warnings.append(f"Port {host_port} is already in use on this host.")
+            warnings.append(f"Port {host_port} is already in use by another slot.")
 
         # Container name availability
         container_name = payload.get("container_name") or slot_data.get("container_name", "")
         name_available = docker_name_is_available(container_name, exclude_slot_id=slot_id)
-        name_conflict = find_container_name_conflict(container_name, exclude_slot_id=slot_id)
         if not name_available:
-            if name_conflict:
-                warnings.append(
-                    f"Container name '{container_name}' is already in use by slot "
-                    f"'{name_conflict['slot_id']}'."
-                )
-            else:
-                warnings.append(f"Container name '{container_name}' is already in use.")
+            warnings.append(f"Container name '{container_name}' is already in use.")
 
         return jsonify({
             "ok": True,
@@ -569,8 +553,6 @@ def register_slot_routes(app: Flask) -> None:
             "gpu_summary": gpu_summary.get("gpus", []) if gpu_summary.get("ok") else [],
             "port_available": port_available,
             "container_name_available": name_available,
-            "port_conflict": port_conflict,
-            "container_name_conflict": name_conflict,
             "warnings": warnings,
         })
 
