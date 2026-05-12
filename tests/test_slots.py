@@ -515,6 +515,33 @@ class TestDockerHelpers:
             mock_run.return_value = MagicMock(returncode=1)
             assert docker_available() is False
 
+    def test_find_port_conflict_with_exclude_slot_id(self, _fresh_slots):
+        """find_port_conflict excludes the given slot_id from results."""
+        from qonduit_docker_helpers import find_port_conflict
+        # primary uses port 8080
+        # Without exclude, should find primary
+        conflict = find_port_conflict(8080)
+        assert conflict is not None
+        assert conflict["slot_id"] == "primary"
+
+        # With exclude_slot_id="primary", should return None (no other slot uses 8080)
+        conflict = find_port_conflict(8080, exclude_slot_id="primary")
+        assert conflict is None
+
+    def test_find_container_name_conflict_with_exclude_slot_id(self, _fresh_slots):
+        """find_container_name_conflict excludes the given slot_id from results."""
+        from qonduit_docker_helpers import find_container_name_conflict
+        # primary uses container name "llama_server"
+        conflict = find_container_name_conflict("llama_server")
+        assert conflict is not None
+        assert conflict["slot_id"] == "primary"
+
+        # With exclude_slot_id="primary", should return None
+        conflict = find_container_name_conflict(
+            "llama_server", exclude_slot_id="primary"
+        )
+        assert conflict is None
+
 
 # ── Phase 4: Multi-Slot API Endpoint Tests ──────────────────────────────────
 
@@ -828,6 +855,155 @@ class TestMultiSlotEndpoints:
             assert data["container_name_available"] is False
             assert any("llama_server_zombie" in w for w in data["warnings"])
             assert data.get("container_name_conflict") is None
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_openhands_port_no_self_collision(self, app_client):
+        """Preflight for the 'openhands' slot does NOT flag its own port as a conflict.
+
+        This is the specific regression test for the false-positive bug where
+        preflighting slot_id=openhands with host_port=8081 incorrectly returned
+        port_available=false and a warning about port 8081 being in use by
+        'another slot' — even though it was its own configured port.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Register the openhands slot with its real port/container
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots",
+                json={
+                    "slot_id": "openhands",
+                    "host_port": 8081,
+                    "container_name": "llama_server_openhands",
+                },
+            )
+            assert resp.status_code == 201
+
+            # Preflight openhands with its own port — should be available
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/openhands/preflight",
+                json={
+                    "model": "test.gguf",
+                    "host_port": 8081,  # openhands' own port
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["port_available"] is True
+            # No port conflict warning should appear for own port
+            assert not any("8081" in w for w in data["warnings"])
+            assert data.get("port_conflict") is None
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_openhands_container_name_no_self_collision(self, app_client):
+        """Preflight for the 'openhands' slot does NOT flag its own container name.
+
+        Regression test: preflighting slot_id=openhands with
+        container_name=llama_server_openhands incorrectly returned
+        container_name_available=false because the slot's own name was counted
+        as a conflict.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Register the openhands slot with its real port/container
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots",
+                json={
+                    "slot_id": "openhands",
+                    "host_port": 8081,
+                    "container_name": "llama_server_openhands",
+                },
+            )
+            assert resp.status_code == 201
+
+            # Preflight openhands with its own container name — should be available
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/openhands/preflight",
+                json={
+                    "model": "test.gguf",
+                    "container_name": "llama_server_openhands",  # openhands' own name
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["container_name_available"] is True
+            assert not any("llama_server_openhands" in w for w in data["warnings"])
+            assert data.get("container_name_conflict") is None
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_openhands_cross_slot_port_conflict(self, app_client):
+        """Preflight detects port conflict when openhands slot uses another slot's port.
+
+        Ensures that when openhands preflights with a DIFFERENT slot's port,
+        the conflict is correctly reported.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Register the openhands slot with its real port/container
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots",
+                json={
+                    "slot_id": "openhands",
+                    "host_port": 8081,
+                    "container_name": "llama_server_openhands",
+                },
+            )
+            assert resp.status_code == 201
+
+            # Preflight openhands with primary's port (8080) — should conflict
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/openhands/preflight",
+                json={
+                    "model": "test.gguf",
+                    "host_port": 8080,  # primary's port — collision!
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["port_available"] is False
+            assert any("8080" in w and "primary" in w for w in data["warnings"])
+            assert data["port_conflict"]["slot_id"] == "primary"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_openhands_cross_slot_container_name_conflict(self, app_client):
+        """Preflight detects container name conflict with a different slot.
+
+        Ensures that when openhands preflights with another slot's container name,
+        the conflict is correctly reported.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Register the openhands slot with its real port/container
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots",
+                json={
+                    "slot_id": "openhands",
+                    "host_port": 8081,
+                    "container_name": "llama_server_openhands",
+                },
+            )
+            assert resp.status_code == 201
+
+            # Preflight openhands with primary's container name — should conflict
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/openhands/preflight",
+                json={
+                    "model": "test.gguf",
+                    "container_name": "llama_server",  # primary's name — collision!
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["container_name_available"] is False
+            assert any("llama_server" in w and "primary" in w for w in data["warnings"])
+            assert data["container_name_conflict"]["slot_id"] == "primary"
         finally:
             _known_models.discard("/mnt/models/llm/test.gguf")
 

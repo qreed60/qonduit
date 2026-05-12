@@ -532,12 +532,9 @@ def register_slot_routes(app: Flask) -> None:
         # Port availability
         host_port = payload.get("host_port") or slot_data.get("host_port", 8080)
         port_available = port_is_available(int(host_port), exclude_slot_id=slot_id)
-        port_conflict = find_port_conflict(int(host_port))
-        # Exclude the current slot from conflict details
-        if port_conflict and port_conflict.get("slot_id") == slot_id:
-            port_conflict = None
+        port_conflict = find_port_conflict(int(host_port), exclude_slot_id=slot_id)
         if not port_available:
-            if port_conflict and port_conflict.get("slot_id") != slot_id:
+            if port_conflict:
                 warnings.append(
                     f"Port {host_port} is already in use by slot "
                     f"'{port_conflict['slot_id']}'."
@@ -548,12 +545,9 @@ def register_slot_routes(app: Flask) -> None:
         # Container name availability
         container_name = payload.get("container_name") or slot_data.get("container_name", "")
         name_available = docker_name_is_available(container_name, exclude_slot_id=slot_id)
-        name_conflict = find_container_name_conflict(container_name)
-        # Exclude the current slot from conflict details
-        if name_conflict and name_conflict.get("slot_id") == slot_id:
-            name_conflict = None
+        name_conflict = find_container_name_conflict(container_name, exclude_slot_id=slot_id)
         if not name_available:
-            if name_conflict and name_conflict.get("slot_id") != slot_id:
+            if name_conflict:
                 warnings.append(
                     f"Container name '{container_name}' is already in use by slot "
                     f"'{name_conflict['slot_id']}'."

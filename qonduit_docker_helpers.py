@@ -491,13 +491,21 @@ def docker_name_is_available(name: str, exclude_slot_id: str | None = None) -> b
     return True
 
 
-def find_port_conflict(port: int) -> dict[str, Any] | None:
-    """Find which slot owns a conflicting port. Returns conflict info or None."""
+def find_port_conflict(
+    port: int,
+    exclude_slot_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Find which slot owns a conflicting port. Returns conflict info or None.
+
+    If *exclude_slot_id* is given, that slot is ignored — useful when the
+    caller is preflighting its own slot and wants to know about *other*
+    slots only.
+    """
     from qonduit_slots import load_slots
 
     slots = load_slots()
     for s in slots:
-        if s.get("host_port") == port:
+        if s.get("host_port") == port and s.get("slot_id") != exclude_slot_id:
             return {
                 "slot_id": s.get("slot_id"),
                 "container_name": s.get("container_name"),
@@ -506,13 +514,21 @@ def find_port_conflict(port: int) -> dict[str, Any] | None:
     return None
 
 
-def find_container_name_conflict(name: str) -> dict[str, Any] | None:
-    """Find which slot owns a conflicting container name. Returns conflict info or None."""
+def find_container_name_conflict(
+    name: str,
+    exclude_slot_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Find which slot owns a conflicting container name. Returns conflict info or None.
+
+    If *exclude_slot_id* is given, that slot is ignored — useful when the
+    caller is preflighting its own slot and wants to know about *other*
+    slots only.
+    """
     from qonduit_slots import load_slots
 
     slots = load_slots()
     for s in slots:
-        if s.get("container_name") == name:
+        if s.get("container_name") == name and s.get("slot_id") != exclude_slot_id:
             return {
                 "slot_id": s.get("slot_id"),
                 "container_name": name,
