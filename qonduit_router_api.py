@@ -12,13 +12,45 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from qonduit_slots import (
+    load_slots,
+    save_slots,
+    get_slot,
+    create_slot,
+    update_slot,
+    delete_slot,
+    validate_slot,
+    slot_to_live_status,
+    collect_slot_errors,
+    _QONDUIT_DEFAULT_HOST,
+    _format_bytes_human,
+)
+from qonduit_docker_helpers import (
+    container_exists,
+    container_running,
+    container_status,
+    get_container_id,
+    get_container_labels,
+    stop_slot_container,
+    remove_slot_container,
+    stream_slot_logs,
+    launch_slot_container,
+    check_slot_ready,
+    fetch_slot_models,
+    port_is_available,
+    docker_name_is_available,
+    collect_gpu_summary,
+    compute_auto_tensor_split,
+    docker_available,
+)
+from qonduit_router_api_slots import register_slot_routes
 
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
 # ── State file path ─────────────────────────────────────────────────────────
-_STATE_DIR = Path("/var/lib/qonduit-router")
+_STATE_DIR = Path(__file__).parent / "data"
 _STATE_FILE = _STATE_DIR / "state.json"
 _STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -452,70 +484,6 @@ def qonduit_restart():
     )
 
 
-@app.get("/api/v1/qonduit-router/gpu")
-def qonduit_gpu():
-    denied = _require_local()
-    if denied:
-        return denied
-
-    try:
-        result = subprocess.run(
-            [
-                "sudo", "nvidia-smi",
-                "--query-gpu=index,name,memory.total,memory.used,memory.free",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "nvidia-smi failed")
-
-        gpus: list[dict[str, Any]] = []
-        total_mib = 0
-        used_mib = 0
-        free_mib = 0
-
-        for line in result.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 5:
-                continue
-            idx = int(parts[0])
-            name = parts[1]
-            mem_total = int(parts[2])
-            mem_used = int(parts[3])
-            mem_free = int(parts[4])
-
-            gpus.append({
-                "index": idx,
-                "name": name,
-                "memory_total_mib": mem_total,
-                "memory_used_mib": mem_used,
-                "memory_free_mib": mem_free,
-            })
-            total_mib += mem_total
-            used_mib += mem_used
-            free_mib += mem_free
-
-        return jsonify({
-            "ok": True,
-            "gpus": gpus,
-            "memory_total_mib": total_mib,
-            "memory_used_mib": used_mib,
-            "memory_free_mib": free_mib,
-            "memory_total_human": _format_bytes_human(total_mib * 1024 * 1024),
-            "memory_used_human": _format_bytes_human(used_mib * 1024 * 1024),
-            "memory_free_human": _format_bytes_human(free_mib * 1024 * 1024),
-        })
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "gpu_query_failed",
-            "detail": str(e),
-        }), 503
-
 @app.get("/api/v1/qonduit-router/logs")
 def qonduit_logs():
     denied = _require_local()
@@ -622,7 +590,7 @@ _QONDUIT_HF_ALLOW_NON_GGUF = os.getenv("HF_ALLOW_NON_GGUF", "false").lower() == 
 _QONDUIT_HF_DOWNLOAD_MAX_CONCURRENT = int(os.getenv("HF_DOWNLOAD_MAX_CONCURRENT", "1"))
 
 # Download job persistence
-_DOWNLOAD_JOBS_DIR = Path("/var/lib/qonduit-router")
+_DOWNLOAD_JOBS_DIR = Path(__file__).parent / "data"
 _DOWNLOAD_JOBS_FILE = _DOWNLOAD_JOBS_DIR / "download_jobs.json"
 _DOWNLOAD_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2681,6 +2649,11 @@ def _ensure_download_worker_started() -> None:
     if not _download_worker_started:
         _download_worker_started = True
         _start_download_worker()
+
+
+# ── Register multi-slot endpoints (Phases 3-7) ──────────────────────────────
+
+register_slot_routes(app)
 
 
 if __name__ == "__main__":
