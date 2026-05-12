@@ -1809,3 +1809,238 @@ class TestPreflightGpuWarnings:
                 assert data.get("effective_gpu_devices") == "0,2"
         finally:
             _known_models.discard("/mnt/models/llm/test.gguf")
+
+
+# ── Phase 6: Self-Conflict Exclusion (Endpoint-Level Regression) ──────────────
+
+class TestSelfConflictExclusion:
+    """Endpoint-level regression tests ensuring a slot's preflight does not
+    report its own port/container as in use.  These tests hit the actual Flask
+    route (not just the helper functions) to verify the full integration."""
+
+    def test_openhands_slot_no_self_conflict_port(self, app_client):
+        """The openhands slot (port 8081) must report port_available=True for
+        its own port — the slot must be excluded from its own collision check."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Create the openhands slot with port 8081
+            resp = app_client.post("/api/v1/qonduit-router/slots", json={
+                "slot_id": "openhands",
+                "display_name": "OpenHands",
+                "purpose": "openhands",
+                "host_port": 8081,
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            assert resp.status_code == 201, f"Failed to create openhands slot: {resp.data}"
+
+            # Preflight must not report its own port as in use
+            resp = app_client.post("/api/v1/qonduit-router/slots/openhands/preflight", json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            data = resp.get_json()
+            assert resp.status_code == 200
+            assert data["ok"] is True
+            assert data["port_available"] is True, \
+                "openhands slot should not see its own port 8081 as in use"
+            # Verify no self-conflict warning
+            for w in data.get("warnings", []):
+                assert "8081" not in w or "another slot" not in w, \
+                    f"Self-conflict warning should not appear: {w}"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_openhands_slot_no_self_conflict_container_name(self, app_client):
+        """The openhands slot (container_name llama_server_openhands) must
+        report container_name_available=True for its own name."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Create the openhands slot with specific container_name
+            resp = app_client.post("/api/v1/qonduit-router/slots", json={
+                "slot_id": "openhands",
+                "display_name": "OpenHands",
+                "purpose": "openhands",
+                "host_port": 8081,
+                "container_name": "llama_server_openhands",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            assert resp.status_code == 201, f"Failed to create openhands slot: {resp.data}"
+
+            # Preflight must not report its own container name as in use
+            resp = app_client.post("/api/v1/qonduit-router/slots/openhands/preflight", json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            data = resp.get_json()
+            assert resp.status_code == 200
+            assert data["ok"] is True
+            assert data["container_name_available"] is True, \
+                "openhands slot should not see its own container name as in use"
+            # Verify no self-conflict warning
+            for w in data.get("warnings", []):
+                assert "llama_server_openhands" not in w or "another slot" not in w, \
+                    f"Self-conflict warning should not appear: {w}"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_different_slot_conflicts_on_port(self, app_client):
+        """A different slot using the same port as openhands must report
+        port_available=False."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Create the openhands slot first
+            resp = app_client.post("/api/v1/qonduit-router/slots", json={
+                "slot_id": "openhands",
+                "display_name": "OpenHands",
+                "purpose": "openhands",
+                "host_port": 8081,
+                "container_name": "llama_server_openhands",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            assert resp.status_code == 201
+
+            # Create a different slot with the same port
+            resp = app_client.post("/api/v1/qonduit-router/slots", json={
+                "slot_id": "other",
+                "display_name": "Other",
+                "purpose": "custom",
+                "host_port": 8081,  # same as openhands
+                "container_name": "llama_server_other",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            # Slot creation should fail due to duplicate port
+            assert resp.status_code in (201, 409), f"Unexpected response: {resp.data}"
+            # If it succeeded (force?), preflight should still detect the conflict
+            if resp.status_code == 201:
+                resp = app_client.post("/api/v1/qonduit-router/slots/other/preflight", json={
+                    "model": "test.gguf",
+                    "context_size": 65536,
+                    "gpu_devices": "all",
+                    "tensor_split": "auto",
+                })
+                data = resp.get_json()
+                assert data["port_available"] is False, \
+                    "other slot should see port 8081 as in use by openhands"
+                port_warnings = [w for w in data.get("warnings", []) if "8081" in w]
+                assert len(port_warnings) > 0, \
+                    f"Should have port conflict warning: {data.get('warnings')}"
+                assert "openhands" in port_warnings[0].lower(), \
+                    f"Warning should mention openhands slot: {port_warnings[0]}"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_different_slot_conflicts_on_container_name(self, app_client):
+        """A different slot using the same container_name as openhands must
+        report container_name_available=False."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Create the openhands slot first
+            resp = app_client.post("/api/v1/qonduit-router/slots", json={
+                "slot_id": "openhands",
+                "display_name": "OpenHands",
+                "purpose": "openhands",
+                "host_port": 8081,
+                "container_name": "llama_server_openhands",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            assert resp.status_code == 201
+
+            # Create a different slot with the same container name
+            resp = app_client.post("/api/v1/qonduit-router/slots", json={
+                "slot_id": "other",
+                "display_name": "Other",
+                "purpose": "custom",
+                "host_port": 8082,
+                "container_name": "llama_server_openhands",  # same as openhands
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+            })
+            # Slot creation should fail due to duplicate container name
+            assert resp.status_code in (201, 409), f"Unexpected response: {resp.data}"
+            if resp.status_code == 201:
+                resp = app_client.post("/api/v1/qonduit-router/slots/other/preflight", json={
+                    "model": "test.gguf",
+                    "context_size": 65536,
+                    "gpu_devices": "all",
+                    "tensor_split": "auto",
+                })
+                data = resp.get_json()
+                assert data["container_name_available"] is False, \
+                    "other slot should see llama_server_openhands as in use"
+                name_warnings = [w for w in data.get("warnings", [])
+                                 if "llama_server_openhands" in w]
+                assert len(name_warnings) > 0, \
+                    f"Should have container name conflict warning: {data.get('warnings')}"
+                assert "openhands" in name_warnings[0].lower(), \
+                    f"Warning should mention openhands slot: {name_warnings[0]}"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_no_stale_port_is_available_calls_without_exclude_slot_id(self):
+        """Static check: the preflight route in qonduit_router_api_slots.py must
+        NOT contain any call to port_is_available(), docker_name_is_available(),
+        find_port_conflict(), or find_container_name_conflict() that is missing
+        the exclude_slot_id parameter."""
+        import qonduit_router_api_slots
+        source_path = qonduit_router_api_slots.__file__
+        with open(source_path, "r") as f:
+            source = f.read()
+
+        # Find the slot_preflight function body via line-based extraction.
+        # We collect lines until we hit the next route decorator, function, or class.
+        lines = source.split("\n")
+        preflight_lines: list[str] = []
+        in_preflight = False
+        for line in lines:
+            if "def slot_preflight(slot_id: str):" in line:
+                in_preflight = True
+                continue
+            if in_preflight:
+                stripped = line.lstrip()
+                if (
+                    (line and line[0] not in (" ", "\t"))
+                    or stripped.startswith("@app.")
+                    or stripped.startswith("def ")
+                    or stripped.startswith("class ")
+                ):
+                    break
+                preflight_lines.append(line)
+
+        assert preflight_lines, "Could not find slot_preflight function body"
+
+        # For each line containing a conflict-check helper, verify exclude_slot_id is present.
+        helper_patterns = [
+            "port_is_available(",
+            "docker_name_is_available(",
+            "find_port_conflict(",
+            "find_container_name_conflict(",
+        ]
+        for line in preflight_lines:
+            for pattern in helper_patterns:
+                if pattern in line:
+                    assert "exclude_slot_id" in line, (
+                        f"Line in preflight missing exclude_slot_id: {line.strip()}"
+                    )
