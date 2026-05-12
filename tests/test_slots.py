@@ -675,22 +675,159 @@ class TestMultiSlotEndpoints:
         data = resp.get_json()
         assert data["error"] == "model_not_found"
 
-    def test_preflight_port_collision(self, app_client):
-        """Preflight detects port collision."""
+    def test_preflight_port_no_self_collision(self, app_client):
+        """Preflight for a slot does NOT flag its own port as a conflict."""
         _known_models.add("/mnt/models/llm/test.gguf")
         try:
             resp = app_client.post(
                 "/api/v1/qonduit-router/slots/primary/preflight",
                 json={
                     "model": "test.gguf",
-                    "host_port": 8080,  # primary's port
+                    "host_port": 8080,  # primary's own port
                 },
             )
             assert resp.status_code == 200
             data = resp.get_json()
             assert data["ok"] is True
-            # Port 8080 is in use by primary, should show warning
-            assert any("8080" in w for w in data["warnings"])
+            assert data["port_available"] is True
+            # No port conflict warning should appear for own port
+            assert not any("8080" in w for w in data["warnings"])
+            assert data.get("port_conflict") is None
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_port_collision_with_different_slot(self, app_client):
+        """Preflight detects port collision with a DIFFERENT slot."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Register model
+            # Create a second slot on a different port first
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots",
+                json={
+                    "slot_id": "colleague",
+                    "host_port": 8082,
+                },
+            )
+            assert resp.status_code == 201
+
+            # Now preflight "colleague" with primary's port (8080) — should conflict
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/colleague/preflight",
+                json={
+                    "model": "test.gguf",
+                    "host_port": 8080,  # primary's port — collision!
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["port_available"] is False
+            assert any("8080" in w and "primary" in w for w in data["warnings"])
+            assert data["port_conflict"]["slot_id"] == "primary"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_port_collision_os_listener(self, app_client):
+        """Preflight detects real OS-level port listener as unavailable."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Mock ss to show port 9999 in use
+            ss_output = "LISTEN  0  511  0.0.0.0:9999  *:*  users:((\"python\",pid=1234,fd=3))\n"
+            with patch("qonduit_docker_helpers.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout=ss_output, stderr="")
+                resp = app_client.post(
+                    "/api/v1/qonduit-router/slots/primary/preflight",
+                    json={
+                        "model": "test.gguf",
+                        "host_port": 9999,  # OS listener, not a slot
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["port_available"] is False
+            assert any("9999" in w for w in data["warnings"])
+            # Should NOT reference another slot since it's an OS listener
+            assert data.get("port_conflict") is None
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_container_name_no_self_collision(self, app_client):
+        """Preflight for a slot does NOT flag its own container name as a conflict."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={
+                    "model": "test.gguf",
+                    "container_name": "llama_server",  # primary's own name
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["container_name_available"] is True
+            assert not any("llama_server" in w for w in data["warnings"])
+            assert data.get("container_name_conflict") is None
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_container_name_collision_with_different_slot(self, app_client):
+        """Preflight detects container-name collision with a DIFFERENT slot."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Create a second slot with a unique container name
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots",
+                json={
+                    "slot_id": "test_slot",
+                    "container_name": "llama_server_test",
+                },
+            )
+            assert resp.status_code == 201
+
+            # Preflight test_slot with primary's container name — should conflict
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/test_slot/preflight",
+                json={
+                    "model": "test.gguf",
+                    "container_name": "llama_server",  # primary's name — collision!
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["container_name_available"] is False
+            assert any("llama_server" in w and "primary" in w for w in data["warnings"])
+            assert data["container_name_conflict"]["slot_id"] == "primary"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_container_name_collision_docker(self, app_client):
+        """Preflight detects real Docker container as unavailable."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            with patch("qonduit_docker_helpers.subprocess.run") as mock_run:
+                # Docker reports a running container with this name
+                mock_run.return_value = MagicMock(
+                    returncode=0,
+                    stdout="llama_server_zombie",
+                    stderr="",
+                )
+                resp = app_client.post(
+                    "/api/v1/qonduit-router/slots/primary/preflight",
+                    json={
+                        "model": "test.gguf",
+                        "container_name": "llama_server_zombie",
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["container_name_available"] is False
+            assert any("llama_server_zombie" in w for w in data["warnings"])
+            assert data.get("container_name_conflict") is None
         finally:
             _known_models.discard("/mnt/models/llm/test.gguf")
 

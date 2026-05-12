@@ -424,23 +424,101 @@ def stream_slot_logs(slot: dict[str, Any]) -> tuple[str, int]:
 # ── Resource availability checks ─────────────────────────────────────────────
 
 def port_is_available(port: int, exclude_slot_id: str | None = None) -> bool:
-    """Check if a host port is not in use by any known slot (except the given one)."""
+    """Check if a host port is not in use by any known slot (except the given one).
+
+    Also checks OS-level TCP listeners so we don't collide with real processes.
+    """
     from qonduit_slots import load_slots
+
+    # Check slot registry
     slots = load_slots()
-    return not any(
+    if any(
         s.get("host_port") == port and s.get("slot_id") != exclude_slot_id
         for s in slots
-    )
+    ):
+        return False
+
+    # Check OS-level TCP listeners
+    try:
+        result = subprocess.run(
+            ["ss", "-tlnp"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                for part in parts:
+                    if part.endswith(f":{port}") or part.split(":")[-1] == str(port):
+                        return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return True
 
 
 def docker_name_is_available(name: str, exclude_slot_id: str | None = None) -> bool:
-    """Check if a Docker container name is not in use by any known slot (except the given one)."""
+    """Check if a Docker container name is not in use by any known slot (except the given one).
+
+    Also checks Docker directly so we don't collide with real containers.
+    """
     from qonduit_slots import load_slots
+
+    # Check slot registry
     slots = load_slots()
-    return not any(
+    if any(
         s.get("container_name") == name and s.get("slot_id") != exclude_slot_id
         for s in slots
-    )
+    ):
+        return False
+
+    # Check Docker directly
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return True
+
+
+def find_port_conflict(port: int) -> dict[str, Any] | None:
+    """Find which slot owns a conflicting port. Returns conflict info or None."""
+    from qonduit_slots import load_slots
+
+    slots = load_slots()
+    for s in slots:
+        if s.get("host_port") == port:
+            return {
+                "slot_id": s.get("slot_id"),
+                "container_name": s.get("container_name"),
+                "host_port": port,
+            }
+    return None
+
+
+def find_container_name_conflict(name: str) -> dict[str, Any] | None:
+    """Find which slot owns a conflicting container name. Returns conflict info or None."""
+    from qonduit_slots import load_slots
+
+    slots = load_slots()
+    for s in slots:
+        if s.get("container_name") == name:
+            return {
+                "slot_id": s.get("slot_id"),
+                "container_name": name,
+                "host_port": s.get("host_port"),
+            }
+    return None
 
 
 def collect_gpu_summary() -> dict[str, Any]:
