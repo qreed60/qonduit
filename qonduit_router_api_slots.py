@@ -46,6 +46,7 @@ from qonduit_docker_helpers import (
     docker_name_is_available,
     collect_gpu_summary,
     compute_auto_tensor_split,
+    resolve_gpu_devices,
     docker_available,
 )
 
@@ -90,7 +91,7 @@ def _get_primary_slot() -> dict[str, Any]:
         "tensor_split": "auto",
         "embeddings_enabled": True,
         "extra_args": [],
-        "container_name": "llama_server_primary",
+        "container_name": "llama_server",
     }
 
 
@@ -499,6 +500,17 @@ def register_slot_routes(app: Flask) -> None:
                         "Insufficient VRAM may cause launch failure."
                     )
 
+        # GPU exclusion warnings
+        excluded = gpu_summary.get("excluded_gpus", [])
+        if excluded:
+            for ex in excluded:
+                warnings.append(
+                    f"GPU {ex['index']} ({ex['name']}) excluded: {ex['reason']}"
+                )
+
+        # Resolve effective GPU devices
+        effective_gpu = resolve_gpu_devices(gpu_str)
+
         # Embeddings on non-primary
         if embeddings and slot_data.get("purpose") != "primary":
             warnings.append(
@@ -533,6 +545,8 @@ def register_slot_routes(app: Flask) -> None:
             "model": model,
             "context_size": context_size,
             "gpu_devices": gpu_devices,
+            "requested_gpu_devices": gpu_str,
+            "effective_gpu_devices": effective_gpu,
             "model_size_bytes": model_size,
             "model_size_human": _format_bytes_human(model_size) if model_size > 0 else "N/A",
             "free_vram_mb": free_vram,

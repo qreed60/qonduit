@@ -18,16 +18,18 @@ from typing import Any, Optional
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-_QONDUIT_ROUTER_DATA_DIR = Path(
-    os.getenv("QONDUIT_ROUTER_DATA_DIR", str(Path(__file__).parent / "data")),
-)
-_QONDUIT_SLOTS_FILE = _QONDUIT_ROUTER_DATA_DIR / "router_slots.json"
-_QONDUIT_SLOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+# Default data directory for host deployment
+_DEFAULT_DATA_DIR = Path("/opt/qonduit-router-api/data")
+
+# Lazy-initialized data dir (resolved at first use, not at import time)
+_QONDUIT_ROUTER_DATA_DIR: Path | None = None
+_QONDUIT_SLOTS_FILE: Path | None = None
 
 # Default host that slots connect to by default
 _QONDUIT_DEFAULT_HOST = os.getenv("QONDUIT_DEFAULT_HOST", "192.168.5.5")
 
-# Thread lock for slot file operations
+# Legacy container name for primary slot
+_PRIMARY_CONTAINER_NAME = "llama_server"
 
 def _format_bytes_human(nbytes: int) -> str:
     if nbytes < 0:
@@ -40,6 +42,25 @@ def _format_bytes_human(nbytes: int) -> str:
                 return f'{value:.1f} {unit}'
             return f'{int(value)} {unit}'
     return f'{nbytes} B'
+
+
+# ── Lazy data dir initialization ─────────────────────────────────────────────
+
+def _ensure_data_dir() -> Path:
+    """Resolve and return the data directory path (lazy init)."""
+    global _QONDUIT_ROUTER_DATA_DIR, _QONDUIT_SLOTS_FILE
+    if _QONDUIT_ROUTER_DATA_DIR is not None and _QONDUIT_SLOTS_FILE is not None:
+        return _QONDUIT_ROUTER_DATA_DIR
+
+    env_dir = os.getenv("QONDUIT_ROUTER_DATA_DIR")
+    if env_dir:
+        _QONDUIT_ROUTER_DATA_DIR = Path(env_dir)
+    else:
+        _QONDUIT_ROUTER_DATA_DIR = _DEFAULT_DATA_DIR
+
+    _QONDUIT_SLOTS_FILE = _QONDUIT_ROUTER_DATA_DIR / "router_slots.json"
+    return _QONDUIT_ROUTER_DATA_DIR
+
 
 _slots_lock = threading.Lock()
 
@@ -233,13 +254,13 @@ def validate_slot(slot: dict[str, Any]) -> list[dict[str, str]]:
 # ── Default slot ─────────────────────────────────────────────────────────────
 
 def _build_default_slot() -> dict[str, Any]:
-    """Build the default primary slot."""
+    """Build the default primary slot with legacy container name."""
     now = datetime.now(timezone.utc).isoformat()
     return {
         "slot_id": "primary",
         "display_name": "Primary",
         "purpose": "primary",
-        "container_name": "llama_server_primary",
+        "container_name": _PRIMARY_CONTAINER_NAME,
         "host": _QONDUIT_DEFAULT_HOST,
         "host_port": 8080,
         "internal_port": 8080,
@@ -266,9 +287,12 @@ def _build_default_slot() -> dict[str, Any]:
 
 def _write_slots_file(slots: list[dict[str, Any]]) -> None:
     """Atomically write slots list to disk."""
+    data_dir = _ensure_data_dir()
+    slots_file = data_dir / "router_slots.json"
     try:
+        data_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
-            dir=str(_QONDUIT_SLOTS_FILE.parent),
+            dir=str(data_dir),
             prefix=".router_slots_",
             suffix=".json",
         )
@@ -280,7 +304,7 @@ def _write_slots_file(slots: list[dict[str, Any]]) -> None:
                     os.fsync(f.fileno())
                 except OSError:
                     pass
-            os.replace(tmp_path, str(_QONDUIT_SLOTS_FILE))
+            os.replace(tmp_path, str(slots_file))
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -291,16 +315,49 @@ def _write_slots_file(slots: list[dict[str, Any]]) -> None:
         pass
 
 
+def _migrate_primary_container_name(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Migrate primary slot from llama_server_primary to llama_server.
+
+    If the primary slot has container_name 'llama_server_primary',
+    migrate it to the legacy-compatible name 'llama_server'.
+    Only migrates if no other non-primary slot uses 'llama_server'.
+
+    NOTE: This is called from within load_slots() which holds _slots_lock,
+    so we call _write_slots_file() directly to avoid deadlock via save_slots().
+    """
+    migrated = False
+    for i, s in enumerate(slots):
+        if s.get("slot_id") == "primary":
+            if s.get("container_name") == "llama_server_primary":
+                # Check no other non-primary slot uses 'llama_server'
+                conflict = any(
+                    s2.get("container_name") == _PRIMARY_CONTAINER_NAME
+                    and s2.get("slot_id") != "primary"
+                    for s2 in slots
+                )
+                if not conflict:
+                    slots[i]["container_name"] = _PRIMARY_CONTAINER_NAME
+                    migrated = True
+
+    if migrated:
+        _write_slots_file(slots)
+
+    return slots
+
+
 def load_slots() -> list[dict[str, Any]]:
     """Load slots from disk. Creates default primary if none exist."""
+    data_dir = _ensure_data_dir()
+    slots_file = data_dir / "router_slots.json"
+
     with _slots_lock:
-        if not _QONDUIT_SLOTS_FILE.exists():
+        if not slots_file.exists():
             default = [_build_default_slot()]
             _write_slots_file(default)
             return default
 
         try:
-            with open(_QONDUIT_SLOTS_FILE, "r") as f:
+            with open(slots_file, "r") as f:
                 data = json.load(f)
             if isinstance(data, list) and all(
                 isinstance(s, dict) and "slot_id" in s for s in data
@@ -318,6 +375,10 @@ def load_slots() -> list[dict[str, Any]]:
                         f"http://{merged.get('host', _QONDUIT_DEFAULT_HOST)}:{merged.get('host_port', 8080)}/v1"
                     )
                     result.append(merged)
+
+                # Apply container name migration
+                result = _migrate_primary_container_name(result)
+
                 if result:
                     return result
                 # Empty list — recreate with default
@@ -582,7 +643,8 @@ def delete_slot(
 def slot_to_live_status(slot: dict[str, Any]) -> dict[str, Any]:
     """
     Merge persisted slot config with live Docker/status information.
-    Returns a new dict with updated running/exists/ready fields.
+    Returns a new dict with updated running/exists/ready fields
+    and effective_gpu_devices resolved from gpu_devices.
     """
     result = dict(slot)
     try:
@@ -590,15 +652,20 @@ def slot_to_live_status(slot: dict[str, Any]) -> dict[str, Any]:
             container_exists,
             container_running,
             check_slot_ready,
+            resolve_gpu_devices,
         )
         result["exists"] = container_exists(result)
         result["running"] = container_running(result)
         if result["running"]:
             result["ready"] = check_slot_ready(result)
+        # Resolve effective GPU devices
+        original_gpu = result.get("gpu_devices", "all")
+        result["effective_gpu_devices"] = resolve_gpu_devices(original_gpu)
     except ImportError:
-        pass
+        # GPU resolution not available; use raw value
+        result["effective_gpu_devices"] = result.get("gpu_devices", "all")
     except Exception:
-        pass
+        result["effective_gpu_devices"] = result.get("gpu_devices", "all")
     return result
 
 

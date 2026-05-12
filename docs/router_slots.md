@@ -98,7 +98,7 @@ The web console continues to work without frontend changes.
   "slot_id": "primary",
   "display_name": "Primary",
   "purpose": "primary",
-  "container_name": "llama_server_primary",
+  "container_name": "llama_server",
   "host": "192.168.5.5",
   "host_port": 8080,
   "internal_port": 8080,
@@ -117,6 +117,38 @@ The web console continues to work without frontend changes.
   "last_error": null
 }
 ```
+
+The primary slot uses the legacy container name `llama_server` for backward
+compatibility with existing Qonduit Android/web console logs and legacy router
+behavior. Additional slots use generated names like `llama_server_openhands`.
+
+### GPU Auto-Detection
+
+When `gpu_devices` is `"all"`, the router auto-detects **usable** GPUs by:
+1. Running `nvidia-smi` to collect GPU info
+2. Excluding GPUs with `memory_total_mib` below the threshold (default: 8192 MiB / 8 GiB)
+3. Excluding GPUs whose names match the exclude regex (default: `K620|Quadro K620`)
+
+With current hardware (Tesla P100s + Quadro K620):
+- **Usable GPUs**: `0,2,3,4,5,6,7` (Tesla P100 16GB)
+- **Excluded**: GPU 1 (Quadro K620 2GB — low memory)
+
+**Environment variables**:
+
+| Variable | Default | Description |
+|---|---|---|
+| `QONDUIT_GPU_MIN_TOTAL_MIB` | `8192` | Min GPU memory (MiB) to be considered usable |
+| `QONDUIT_GPU_EXCLUDE_NAME_REGEX` | `K620\|Quadro K620` | Regex to exclude GPUs by name |
+| `QONDUIT_DEFAULT_GPU_DEVICES` | `auto` | `"auto"` for detection, or explicit list like `"0,2,3"` |
+
+### Data Directory
+
+The slot config file (`router_slots.json`) is stored at:
+
+1. `$QONDUIT_ROUTER_DATA_DIR/router_slots.json` (env-configurable)
+2. `/opt/qonduit-router-api/data/router_slots.json` (default for host deployment)
+
+The directory is created lazily on first use — **not** at module import time.
 
 **Atomic writes**: Config is written to a temporary file, synced, then atomically renamed to prevent corruption.
 
@@ -201,9 +233,21 @@ The web console continues to work without frontend changes.
 
 ## Validation Commands
 
+### Full update cycle
+
+```bash
+cd /opt/qonduit-repo
+./update.sh
+```
+
+### GPU detection
+
 ```bash
 BASE=http://127.0.0.1:5001
+curl -s $BASE/api/v1/qonduit-router/gpu | python3 -m json.tool
 ```
+
+**Expected**: `usable_gpu_devices` excludes K620, `excluded_gpus` includes index 1 / Quadro K620, `default_gpu_devices` is the usable P100 set.
 
 ### List slots
 
@@ -211,7 +255,9 @@ BASE=http://127.0.0.1:5001
 curl -s $BASE/api/v1/qonduit-router/slots | python3 -m json.tool
 ```
 
-### Create a new slot
+**Expected**: Primary slot exists with `container_name: "llama_server"`, slot status includes `effective_gpu_devices`.
+
+### Create OpenHands slot (without hardcoding P100s)
 
 ```bash
 curl -s -X POST $BASE/api/v1/qonduit-router/slots \
@@ -228,36 +274,21 @@ curl -s -X POST $BASE/api/v1/qonduit-router/slots \
   }' | python3 -m json.tool
 ```
 
-### Create 7B utility slot
+### Preflight check
 
 ```bash
-curl -s -X POST $BASE/api/v1/qonduit-router/slots \
+curl -s -X POST $BASE/api/v1/qonduit-router/slots/openhands/preflight \
   -H "Content-Type: application/json" \
   -d '{
-    "slot_id": "utility-7b",
-    "display_name": "Utility 7B",
-    "purpose": "utility",
-    "host_port": 8082,
+    "model": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
     "context_size": 65536,
-    "gpu_devices": "0,1",
+    "gpu_devices": "all",
     "tensor_split": "auto",
     "embeddings_enabled": false
   }' | python3 -m json.tool
 ```
 
-### Preflight check for 262k context model
-
-```bash
-curl -s -X POST $BASE/api/v1/qonduit-router/slots/primary/preflight \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "YOUR_MODEL.gguf",
-    "context_size": 262144,
-    "gpu_devices": "all",
-    "tensor_split": "auto",
-    "embeddings_enabled": true
-  }' | python3 -m json.tool
-```
+**Expected**: `requested_gpu_devices = "all"`, `effective_gpu_devices = "0,2,3,4,5,6,7"` on current hardware, K620 excluded, primary container remains `llama_server`.
 
 ### Launch a slot
 
@@ -303,11 +334,14 @@ curl -s -X POST $BASE/api/v1/qonduit-router/slots/openhands/stop | python3 -m js
 curl -s $BASE/api/v1/qonduit-router/slots/primary | python3 -m json.tool
 ```
 
-### Backward compatibility — old status endpoint
+### Backward compatibility — legacy endpoints
 
 ```bash
 curl -s $BASE/api/v1/qonduit-router/status | python3 -m json.tool
+curl -i $BASE/api/v1/qonduit-router/logs
 ```
+
+**Expected**: Legacy endpoints map to primary slot, primary uses `container_name: "llama_server"`.
 
 ---
 

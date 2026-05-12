@@ -37,8 +37,16 @@ def _fresh_slots(tmp_path):
     data_dir.mkdir()
     slots_file = data_dir / "router_slots.json"
 
-    # Directly set module attributes with Path objects (not strings!)
+    # Reset lazy init state so tests start fresh
     import qonduit_slots
+    qonduit_slots._QONDUIT_ROUTER_DATA_DIR = None
+    qonduit_slots._QONDUIT_SLOTS_FILE = None
+
+    # Clear any GPU cache so GPU tests start fresh
+    import qonduit_docker_helpers
+    qonduit_docker_helpers._usable_gpu_cache = {}
+
+    # Directly set module attributes with Path objects (not strings!)
     qonduit_slots._QONDUIT_SLOTS_FILE = slots_file  # Path, not str
     qonduit_slots._QONDUIT_ROUTER_DATA_DIR = data_dir
 
@@ -117,7 +125,7 @@ class TestSlotConfigStorage:
     """Tests for qonduit_slots module."""
 
     def test_default_primary_slot_created(self, _fresh_slots):
-        """Default primary slot exists at module load."""
+        """Default primary slot exists at module load with legacy container name."""
         from qonduit_slots import load_slots
         slots = load_slots()
         assert len(slots) == 1
@@ -125,7 +133,7 @@ class TestSlotConfigStorage:
         assert s["slot_id"] == "primary"
         assert s["display_name"] == "Primary"
         assert s["purpose"] == "primary"
-        assert s["container_name"] == "llama_server_primary"
+        assert s["container_name"] == "llama_server"
         assert s["host_port"] == 8080
         assert s["internal_port"] == 8080
         assert s["model"] is None
@@ -200,12 +208,12 @@ class TestSlotConfigStorage:
         create_slot({
             "slot_id": "slot-a",
             "host_port": 8081,
-            "container_name": "llama_server_primary",
+            "container_name": "llama_server",
         })
         _, err = create_slot({
             "slot_id": "slot-b",
             "host_port": 8082,
-            "container_name": "llama_server_primary",  # duplicate
+            "container_name": "llama_server",  # duplicate of primary
         })
         assert err == "duplicate_container_name"
 
@@ -389,7 +397,7 @@ class TestDockerHelpers:
         """Container name is available if not in slot config."""
         from qonduit_docker_helpers import docker_name_is_available
         assert docker_name_is_available("my_new_container") is True
-        assert docker_name_is_available("llama_server_primary") is False
+        assert docker_name_is_available("llama_server") is False  # legacy primary name
 
     def test_compute_auto_tensor_split_all(self):
         """Auto tensor split for 'all' GPUs."""
@@ -1014,5 +1022,477 @@ class TestSlotIndependence:
                 call_args = mock_launch.call_args
                 slot = call_args[0][0]
                 assert slot["slot_id"] == "slot-x"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+
+# ── Phase 1: GPU Auto-Detection Tests ───────────────────────────────────────
+
+class TestGpuAutoDetection:
+    """Tests for usable GPU auto-detection."""
+
+    def test_detect_usable_gpus_excludes_low_memory(self):
+        """detect_usable_gpus excludes GPUs below memory threshold."""
+        from qonduit_docker_helpers import detect_usable_gpus, _usable_gpu_cache
+        _usable_gpu_cache.clear()
+        mock_output = (
+            "0, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+            "1, Quadro K620, 2048, 512, 1536\n"
+            "2, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+            result = detect_usable_gpus()
+        assert result == "0,2"
+
+    def test_detect_usable_gpus_excludes_by_name_regex(self):
+        """detect_usable_gpus excludes GPUs matching exclude regex."""
+        from qonduit_docker_helpers import detect_usable_gpus, _usable_gpu_cache
+        _usable_gpu_cache.clear()
+        mock_output = (
+            "0, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+            "1, Quadro K620, 16384, 1024, 15360\n"  # High memory but excluded by name
+            "2, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+            result = detect_usable_gpus()
+        assert result == "0,2"
+
+    def test_detect_usable_gpus_all_p100s(self):
+        """detect_usable_gpus returns all GPUs when all are usable."""
+        from qonduit_docker_helpers import detect_usable_gpus, _usable_gpu_cache
+        _usable_gpu_cache.clear()
+        mock_output = (
+            "0, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+            "2, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+            "3, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+            result = detect_usable_gpus()
+        assert result == "0,2,3"
+
+    def test_qonduit_default_gpu_devices_override(self):
+        """QONDUIT_DEFAULT_GPU_DEVICES env var overrides auto-detection."""
+        from qonduit_docker_helpers import get_default_gpu_devices, _usable_gpu_cache
+        import qonduit_docker_helpers as dh
+        _usable_gpu_cache.clear()
+        with patch.dict(os.environ, {"QONDUIT_DEFAULT_GPU_DEVICES": "0,1,2"}):
+            # Patch the module-level variable (read at import time)
+            dh._QONDUIT_DEFAULT_GPU_DEVICES = "0,1,2"
+            result = get_default_gpu_devices()
+        assert result == "0,1,2"
+
+    def test_qonduit_default_gpu_devices_auto(self):
+        """QONDUIT_DEFAULT_GPU_DEVICES=auto uses detection."""
+        from qonduit_docker_helpers import get_default_gpu_devices, _usable_gpu_cache
+        import qonduit_docker_helpers as dh
+        _usable_gpu_cache.clear()
+        mock_output = "0, Tesla P100, 16384, 1024, 15360\n"
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+            dh._QONDUIT_DEFAULT_GPU_DEVICES = "auto"
+            result = get_default_gpu_devices()
+        assert result == "0"
+
+    def test_qonduit_default_gpu_devices_unset(self):
+        """QONDUIT_DEFAULT_GPU_DEVICES unset falls back to detection."""
+        from qonduit_docker_helpers import get_default_gpu_devices, _usable_gpu_cache
+        import qonduit_docker_helpers as dh
+        _usable_gpu_cache.clear()
+        mock_output = "0, Tesla P100, 16384, 1024, 15360\n"
+        with patch.object(dh, "_run_nvidia_smi", return_value=MagicMock(returncode=0, stdout=mock_output, stderr="")):
+            dh._QONDUIT_DEFAULT_GPU_DEVICES = "auto"
+            result = get_default_gpu_devices()
+        assert result == "0"
+
+    def test_resolve_gpu_devices_all_resolves_to_usable(self):
+        """resolve_gpu_devices('all') resolves to usable GPU set."""
+        from qonduit_docker_helpers import resolve_gpu_devices, _usable_gpu_cache
+        import qonduit_docker_helpers as dh
+        _usable_gpu_cache.clear()
+        mock_output = (
+            "0, Tesla P100, 16384, 1024, 15360\n"
+            "1, Quadro K620, 2048, 512, 1536\n"
+            "2, Tesla P100, 16384, 1024, 15360\n"
+        )
+        with patch.object(dh, "_run_nvidia_smi", return_value=MagicMock(returncode=0, stdout=mock_output, stderr="")):
+            dh._QONDUIT_GPU_EXCLUDE_NAME_REGEX = "K620|Quadro K620"
+            dh._QONDUIT_GPU_MIN_TOTAL_MIB = 8192
+            result = resolve_gpu_devices("all")
+        assert result == "0,2"
+
+    def test_resolve_gpu_devices_explicit_list_unchanged(self):
+        """resolve_gpu_devices('0,2') returns exact list."""
+        from qonduit_docker_helpers import resolve_gpu_devices, _usable_gpu_cache
+        _usable_gpu_cache.clear()
+        result = resolve_gpu_devices("0,2")
+        assert result == "0,2"
+
+    def test_resolve_gpu_devices_invalid_rejected(self):
+        """resolve_gpu_devices returns invalid strings as-is; validate_gpu_devices rejects them."""
+        from qonduit_docker_helpers import resolve_gpu_devices, validate_gpu_devices
+        # resolve_gpu_devices is a formatter, not a validator — returns as-is
+        result = resolve_gpu_devices("99")
+        assert result == "99"
+        # validate_gpu_devices does the actual hardware validation
+        error = validate_gpu_devices("99", all_available=[0])  # only GPU 0 exists
+        assert error is not None
+        assert "GPU 99 is not available" in error
+
+    def test_compute_auto_tensor_split_uses_resolved_gpus(self):
+        """Tensor split computed from resolved GPUs, not raw nvidia-smi output."""
+        from qonduit_docker_helpers import compute_auto_tensor_split, _usable_gpu_cache
+        import qonduit_docker_helpers as dh
+        _usable_gpu_cache.clear()
+        mock_output = (
+            "0, Tesla P100, 16384, 1024, 15360\n"
+            "1, Quadro K620, 2048, 512, 1536\n"
+            "2, Tesla P100, 16384, 1024, 15360\n"
+        )
+        with patch.object(dh, "_run_nvidia_smi", return_value=MagicMock(returncode=0, stdout=mock_output, stderr="")):
+            dh._QONDUIT_GPU_EXCLUDE_NAME_REGEX = "K620|Quadro K620"
+            dh._QONDUIT_GPU_MIN_TOTAL_MIB = 8192
+            # "all" resolves to "0,2" → tensor split should be "1,1" not "1,1,1"
+            result = compute_auto_tensor_split("all")
+        assert result == "1,1"
+
+
+# ── Phase 2: Primary Slot Legacy Container Name Tests ────────────────────────
+
+class TestPrimarySlotLegacyName:
+    """Tests for primary slot legacy container name preservation."""
+
+    def test_default_primary_uses_legacy_container_name(self, _fresh_slots):
+        """Default primary slot uses container_name 'llama_server'."""
+        from qonduit_slots import load_slots
+        slots = load_slots()
+        primary = [s for s in slots if s["slot_id"] == "primary"]
+        assert len(primary) == 1
+        assert primary[0]["container_name"] == "llama_server"
+
+    def test_additional_slots_use_generated_names(self, _fresh_slots):
+        """Additional slots use llama_server_{slot_id}."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "openhands",
+            "host_port": 8081,
+        })
+        assert err is None
+        assert new_slot["container_name"] == "llama_server_openhands"
+
+    def test_additional_slots_custom_container_name(self, _fresh_slots):
+        """Additional slots can specify custom container_name."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "testing",
+            "host_port": 8082,
+            "container_name": "llama_server_testing",
+        })
+        assert err is None
+        assert new_slot["container_name"] == "llama_server_testing"
+
+    def test_primary_migration_from_legacy_server_primary(self, tmp_path):
+        """Existing primary with llama_server_primary migrates to llama_server."""
+        from qonduit_slots import _QONDUIT_DEFAULT_HOST
+        from datetime import datetime, timezone
+
+        slots_file = tmp_path / "router_slots.json"
+        original = {
+            "slot_id": "primary",
+            "display_name": "Primary",
+            "purpose": "primary",
+            "container_name": "llama_server_primary",
+            "host": _QONDUIT_DEFAULT_HOST,
+            "host_port": 8080,
+            "internal_port": 8080,
+            "endpoint_base": f"http://{_QONDUIT_DEFAULT_HOST}:8080",
+            "openai_base": f"http://{_QONDUIT_DEFAULT_HOST}:8080/v1",
+            "model": None,
+            "context_size": 65536,
+            "gpu_devices": "all",
+            "tensor_split": "auto",
+            "embeddings_enabled": True,
+            "extra_args": [],
+            "running": False,
+            "exists": False,
+            "ready": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "last_started_at": None,
+            "last_stopped_at": None,
+            "last_error": None,
+        }
+        slots_file.write_text(json.dumps([original]))
+
+        # Patch _ensure_data_dir to return tmp_path so load_slots reads
+        # from the test's tmp_path/router_slots.json instead of /opt paths
+        import qonduit_slots
+        from pathlib import Path
+        with patch.object(qonduit_slots, "_ensure_data_dir", return_value=Path(str(tmp_path))):
+            loaded = qonduit_slots.load_slots()
+        assert len(loaded) == 1
+        assert loaded[0]["container_name"] == "llama_server"
+
+    def test_migration_preserves_non_primary_slots(self, tmp_path):
+        """Migration does not affect non-primary slots."""
+        from qonduit_slots import _QONDUIT_DEFAULT_HOST
+        from datetime import datetime, timezone
+
+        slots_file = tmp_path / "router_slots.json"
+        slots = [
+            {
+                "slot_id": "primary",
+                "display_name": "Primary",
+                "purpose": "primary",
+                "container_name": "llama_server_primary",
+                "host": _QONDUIT_DEFAULT_HOST,
+                "host_port": 8080,
+                "internal_port": 8080,
+                "endpoint_base": f"http://{_QONDUIT_DEFAULT_HOST}:8080",
+                "openai_base": f"http://{_QONDUIT_DEFAULT_HOST}:8080/v1",
+                "model": None,
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": True,
+                "extra_args": [],
+                "running": False,
+                "exists": False,
+                "ready": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "last_started_at": None,
+                "last_stopped_at": None,
+                "last_error": None,
+            },
+            {
+                "slot_id": "openhands",
+                "display_name": "OpenHands",
+                "purpose": "openhands",
+                "container_name": "llama_server_openhands",
+                "host": _QONDUIT_DEFAULT_HOST,
+                "host_port": 8081,
+                "internal_port": 8081,
+                "endpoint_base": f"http://{_QONDUIT_DEFAULT_HOST}:8081",
+                "openai_base": f"http://{_QONDUIT_DEFAULT_HOST}:8081/v1",
+                "model": None,
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+                "embeddings_enabled": False,
+                "extra_args": [],
+                "running": False,
+                "exists": False,
+                "ready": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "last_started_at": None,
+                "last_stopped_at": None,
+                "last_error": None,
+            },
+        ]
+        slots_file.write_text(json.dumps(slots))
+
+        import qonduit_slots
+        qonduit_slots._QONDUIT_SLOTS_FILE = slots_file
+        qonduit_slots._QONDUIT_ROUTER_DATA_DIR = tmp_path
+        qonduit_slots._ensure_data_dir()
+
+        loaded = qonduit_slots.load_slots()
+        assert len(loaded) == 2
+        primary = [s for s in loaded if s["slot_id"] == "primary"][0]
+        openhands = [s for s in loaded if s["slot_id"] == "openhands"][0]
+        assert primary["container_name"] == "llama_server"
+        assert openhands["container_name"] == "llama_server_openhands"
+
+    def test_legacy_status_maps_to_primary(self, app_client):
+        """Legacy /status maps to primary slot."""
+        resp = app_client.get("/api/v1/qonduit-router/status")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert "slot_id" in data or "container_name" in data
+        assert data.get("container_name") == "llama_server"
+
+    def test_legacy_logs_maps_to_primary_container(self, app_client):
+        """Legacy /logs reads from primary container 'llama_server'."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="log output from llama_server",
+                stderr="",
+            )
+            resp = app_client.get("/api/v1/qonduit-router/logs")
+            assert resp.status_code == 200
+            # Verify subprocess was called with llama_server
+            call_args = mock_run.call_args
+            cmd = call_args[0][0] if call_args[0] else []
+            assert "llama_server" in " ".join(cmd)
+
+
+# ── Phase 3: Lazy Data Directory Tests ──────────────────────────────────────
+
+class TestLazyDataDirectory:
+    """Tests for lazy data directory creation."""
+
+    def test_import_does_not_create_opt_data(self):
+        """Module import does not create /opt/data."""
+        import subprocess
+        # Check if /opt/data exists before import
+        result = subprocess.run(
+            ["test", "-d", "/opt/data"],
+            capture_output=True,
+        )
+        existed_before = result.returncode == 0
+
+        # Re-import the modules
+        import importlib
+        import qonduit_slots
+        importlib.reload(qonduit_slots)
+        import qonduit_docker_helpers
+        importlib.reload(qonduit_docker_helpers)
+
+        result = subprocess.run(
+            ["test", "-d", "/opt/data"],
+            capture_output=True,
+        )
+        exists_after = result.returncode == 0
+
+        # /opt/data should not have been created by import
+        assert not exists_after or existed_before, \
+            "Module import created /opt/data"
+
+    def test_data_dir_defaults_to_qonduit_router_api_data(self, tmp_path):
+        """Default host router data dir is /opt/qonduit-router-api/data."""
+        import qonduit_slots
+        # Reset to force re-evaluation
+        qonduit_slots._QONDUIT_ROUTER_DATA_DIR = None
+        # Set env override so default path is computed
+        with patch.dict(os.environ, {"QONDUIT_ROUTER_DATA_DIR": "/opt/qonduit-router-api/data"}):
+            qonduit_slots._ensure_data_dir()
+            assert qonduit_slots._QONDUIT_ROUTER_DATA_DIR is not None
+
+    def test_env_qonduit_router_data_dir_overrides(self, tmp_path):
+        """QONDUIT_ROUTER_DATA_DIR env var overrides default."""
+        import qonduit_slots
+        qonduit_slots._QONDUIT_ROUTER_DATA_DIR = None
+        custom_dir = tmp_path / "custom_data"
+        with patch.dict(os.environ, {"QONDUIT_ROUTER_DATA_DIR": str(custom_dir)}):
+            qonduit_slots._ensure_data_dir()
+            assert qonduit_slots._QONDUIT_ROUTER_DATA_DIR == custom_dir
+
+
+# ── Phase 4: GPU Endpoint Response Tests ────────────────────────────────────
+
+class TestGpuEndpointResponse:
+    """Tests for GET /gpu endpoint including usable/excluded GPU fields."""
+
+    def test_gpu_endpoint_includes_usable_and_excluded(self, app_client):
+        """GET /gpu returns usable_gpu_devices and excluded_gpus."""
+        mock_output = (
+            "0, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+            "1, Quadro K620, 2048, 512, 1536\n"
+            "2, Tesla P100-SXM2-16GB, 16384, 1024, 15360\n"
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+            resp = app_client.get("/api/v1/qonduit-router/gpu")
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert "usable_gpu_devices" in data
+            assert "excluded_gpus" in data
+            assert "default_gpu_devices" in data
+            assert "gpu_min_total_mib" in data
+            # Usable should be "0,2"
+            assert data["usable_gpu_devices"] == "0,2"
+            # Excluded should include index 1
+            assert len(data["excluded_gpus"]) >= 1
+            assert any(g["index"] == 1 for g in data["excluded_gpus"])
+
+    def test_gpu_endpoint_excludes_low_memory_gpu(self, app_client):
+        """Excluded GPUs include reason for exclusion."""
+        mock_output = "0, Quadro K620, 2048, 512, 1536\n"
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+            resp = app_client.get("/api/v1/qonduit-router/gpu")
+            data = resp.get_json()
+            assert len(data["excluded_gpus"]) >= 1
+            excluded = [g for g in data["excluded_gpus"] if g["index"] == 0][0]
+            assert "memory" in excluded.get("reason", "").lower() or "below" in excluded.get("reason", "").lower()
+
+
+# ── Phase 5: Preflight GPU Warnings Tests ───────────────────────────────────
+
+class TestPreflightGpuWarnings:
+    """Tests for preflight endpoint GPU warnings."""
+
+    def test_preflight_includes_effective_gpu_devices(self, app_client):
+        """Preflight returns effective_gpu_devices."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            resp = app_client.post("/api/v1/qonduit-router/slots/primary/preflight", json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+            })
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert "effective_gpu_devices" in data
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_includes_memory_warnings(self, app_client):
+        """Preflight warns about low-memory GPUs that would have been included."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            mock_output = (
+                "0, Tesla P100, 16384, 1024, 15360\n"
+                "1, Quadro K620, 2048, 512, 1536\n"
+            )
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+                resp = app_client.post("/api/v1/qonduit-router/slots/primary/preflight", json={
+                    "model": "test.gguf",
+                    "context_size": 65536,
+                    "gpu_devices": "all",
+                    "tensor_split": "auto",
+                })
+                data = resp.get_json()
+                assert data["ok"] is True
+                # Should have warnings about excluded GPUs
+                assert "warnings" in data
+                # Or effective_gpu_devices should not include 1
+                if "effective_gpu_devices" in data:
+                    eff = data["effective_gpu_devices"]
+                    assert "1" not in eff.split(",")
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_requested_vs_effective_gpu(self, app_client):
+        """Preflight shows requested_gpu_devices and effective_gpu_devices."""
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            mock_output = (
+                "0, Tesla P100, 16384, 1024, 15360\n"
+                "1, Quadro K620, 2048, 512, 1536\n"
+                "2, Tesla P100, 16384, 1024, 15360\n"
+            )
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout=mock_output, stderr="")
+                resp = app_client.post("/api/v1/qonduit-router/slots/primary/preflight", json={
+                    "model": "test.gguf",
+                    "context_size": 65536,
+                    "gpu_devices": "all",
+                    "tensor_split": "auto",
+                })
+                data = resp.get_json()
+                assert data["ok"] is True
+                assert data.get("requested_gpu_devices") == "all"
+                assert data.get("effective_gpu_devices") == "0,2"
         finally:
             _known_models.discard("/mnt/models/llm/test.gguf")

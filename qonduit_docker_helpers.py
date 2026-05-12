@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from typing import Any, Optional
 
@@ -26,6 +27,23 @@ _QONDUIT_LLAMA_SERVER_BIN = os.getenv(
 )
 _QONDUIT_MODEL_MOUNT = "/mnt/models"
 _QONDUIT_DOCKER_NETWORK = os.getenv("QONDUIT_DOCKER_NETWORK", "host")
+
+# ── GPU detection configuration ─────────────────────────────────────────────
+
+_QONDUIT_GPU_MIN_TOTAL_MIB = int(
+    os.getenv("QONDUIT_GPU_MIN_TOTAL_MIB", "8192"),
+)
+_QONDUIT_GPU_EXCLUDE_NAME_REGEX = os.getenv(
+    "QONDUIT_GPU_EXCLUDE_NAME_REGEX",
+    "K620|Quadro K620",
+)
+_QONDUIT_DEFAULT_GPU_DEVICES = os.getenv(
+    "QONDUIT_DEFAULT_GPU_DEVICES",
+    "auto",
+)
+
+# Cached results for repeated calls
+_usable_gpu_cache: dict[str, Any] = {}
 
 # ── Docker subprocess helpers ────────────────────────────────────────────────
 
@@ -189,6 +207,9 @@ def launch_slot_container(
     """
     Launch a Docker container for a slot.
 
+    Resolves gpu_devices to usable GPUs (excludes low-memory/display GPUs)
+    when gpu_devices is "all".
+
     Returns:
         (success, message, error_string)
     """
@@ -208,26 +229,27 @@ def launch_slot_container(
         or slot.get("context_size", 65536),
     )
 
-    # Determine GPU settings
+    # Determine GPU settings — resolve "all" to usable GPUs
     gpu_devices = launch_payload.get("gpu_devices") or slot.get("gpu_devices", "all")
+    resolved_gpu_devices = resolve_gpu_devices(gpu_devices)
     tensor_split = launch_payload.get("tensor_split") or slot.get("tensor_split", "auto")
     embeddings = launch_payload.get("embeddings_enabled") or slot.get("embeddings_enabled", False)
     extra_args = launch_payload.get("extra_args") or slot.get("extra_args", [])
 
-    # Compute tensor split value
+    # Compute tensor split value from resolved GPUs
     if str(tensor_split).lower() == "auto":
-        split_val = compute_auto_tensor_split(gpu_devices)
+        split_val = compute_auto_tensor_split(resolved_gpu_devices)
     else:
         split_val = str(tensor_split)
 
-    # Build GPU args
-    if str(gpu_devices).lower() == "all":
-        gpu_args = ["--gpus", "all"]
-    else:
-        gpu_args = [
-            "--gpus",
-            f'"device={str(gpu_devices).strip()}"',
-        ]
+    # Build GPU args from resolved devices
+    if not resolved_gpu_devices:
+        return False, "", "no_usable_gpus"
+
+    gpu_args = [
+        "--gpus",
+        f'"device={resolved_gpu_devices}"',
+    ]
 
     # Build command
     cmd = [
@@ -422,7 +444,7 @@ def docker_name_is_available(name: str, exclude_slot_id: str | None = None) -> b
 
 
 def collect_gpu_summary() -> dict[str, Any]:
-    """Run nvidia-smi and return GPU summary."""
+    """Run nvidia-smi and return GPU summary with usable/excluded info."""
     try:
         result = subprocess.run(
             [
@@ -444,6 +466,7 @@ def collect_gpu_summary() -> dict[str, Any]:
         total_mib = 0
         used_mib = 0
         free_mib = 0
+        all_indices: list[int] = []
 
         for line in result.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
@@ -462,9 +485,15 @@ def collect_gpu_summary() -> dict[str, Any]:
                 "memory_used_mib": mem_used,
                 "memory_free_mib": mem_free,
             })
+            all_indices.append(idx)
             total_mib += mem_total
             used_mib += mem_used
             free_mib += mem_free
+
+        usable_indices = [i for i in all_indices if not any(
+            e["index"] == i for e in detect_excluded_gpus()
+        )]
+        usable_gpu_devices = ",".join(str(i) for i in usable_indices)
 
         return {
             "ok": True,
@@ -475,6 +504,11 @@ def collect_gpu_summary() -> dict[str, Any]:
             "memory_total_human": _format_bytes_human(total_mib * 1024 * 1024),
             "memory_used_human": _format_bytes_human(used_mib * 1024 * 1024),
             "memory_free_human": _format_bytes_human(free_mib * 1024 * 1024),
+            "usable_gpu_indices": usable_indices,
+            "usable_gpu_devices": usable_gpu_devices,
+            "excluded_gpus": detect_excluded_gpus(),
+            "default_gpu_devices": get_default_gpu_devices(),
+            "gpu_min_total_mib": _QONDUIT_GPU_MIN_TOTAL_MIB,
         }
     except Exception as e:
         return {
@@ -487,14 +521,203 @@ def collect_gpu_summary() -> dict[str, Any]:
 def compute_auto_tensor_split(gpu_devices: Any) -> str:
     """Compute tensor_split from GPU device list.
 
-    If gpu_devices is 'all', returns '1' (single device).
+    If gpu_devices is 'all', resolves to usable GPUs and returns '1,1,...'.
     If gpu_devices is '0,1,2', returns '1,1,1' (equal split).
     """
     gpu_str = str(gpu_devices).strip()
-    if gpu_str.lower() == "all":
-        return "1"
+    if gpu_str.lower() in ("all", "all_raw"):
+        resolved = resolve_gpu_devices(gpu_str)
+        devices = [d.strip() for d in resolved.split(",")]
+        return ",".join(["1"] * len(devices))
     devices = [d.strip() for d in gpu_str.split(",")]
     return ",".join(["1"] * len(devices))
+
+
+# ── GPU detection helpers ────────────────────────────────────────────────────
+
+
+def _run_nvidia_smi() -> Optional[subprocess.CompletedProcess]:
+    """Run nvidia-smi and return the completed process, or None on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "sudo", "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        return result if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def detect_usable_gpus() -> str:
+    """Detect GPUs usable for inference.
+
+    Excludes GPUs below the memory threshold or matching the exclude regex.
+    Returns comma-separated GPU indices, e.g. '0,2,3,4,5,6,7'.
+
+    Results are cached after the first successful call.
+    """
+    global _usable_gpu_cache
+
+    if "usable_indices" in _usable_gpu_cache:
+        return _usable_gpu_cache["usable_indices"]
+
+    default_devices = _QONDUIT_DEFAULT_GPU_DEVICES.strip()
+    if default_devices.lower() != "auto":
+        # Explicit override — validate and return as-is
+        if re.match(r"^[0-9]+(,[0-9]+)*$", default_devices):
+            _usable_gpu_cache["usable_indices"] = default_devices
+            return default_devices
+        # If invalid format, fall through to auto-detection
+        _usable_gpu_cache["usable_indices"] = ""
+        return ""
+
+    result = _run_nvidia_smi()
+    if result is None:
+        _usable_gpu_cache["usable_indices"] = ""
+        return ""
+
+    try:
+        exclude_re = re.compile(_QONDUIT_GPU_EXCLUDE_NAME_REGEX)
+        usable: list[int] = []
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5:
+                continue
+            idx = int(parts[0])
+            name = parts[1]
+            mem_total = int(parts[2])
+
+            if mem_total < _QONDUIT_GPU_MIN_TOTAL_MIB:
+                continue
+            if exclude_re.search(name):
+                continue
+
+            usable.append(idx)
+
+        gpu_str = ",".join(str(i) for i in usable)
+        _usable_gpu_cache["usable_indices"] = gpu_str
+        return gpu_str
+    except (ValueError, OSError):
+        _usable_gpu_cache["usable_indices"] = ""
+        return ""
+
+
+def detect_excluded_gpus() -> list[dict[str, Any]]:
+    """Return list of GPUs excluded from inference.
+
+    Each entry has: index, name, reason
+    """
+    result = _run_nvidia_smi()
+    if result is None:
+        return []
+
+    try:
+        exclude_re = re.compile(_QONDUIT_GPU_EXCLUDE_NAME_REGEX)
+        excluded: list[dict[str, Any]] = []
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5:
+                continue
+            idx = int(parts[0])
+            name = parts[1]
+            mem_total = int(parts[2])
+
+            reasons: list[str] = []
+            if mem_total < _QONDUIT_GPU_MIN_TOTAL_MIB:
+                reasons.append(
+                    f"memory_total_mib ({mem_total}) below threshold {_QONDUIT_GPU_MIN_TOTAL_MIB}"
+                )
+            if exclude_re.search(name):
+                reasons.append(f"name matches exclude regex '{_QONDUIT_GPU_EXCLUDE_NAME_REGEX}'")
+
+            for reason in reasons:
+                excluded.append({
+                    "index": idx,
+                    "name": name,
+                    "reason": reason,
+                })
+        return excluded
+    except (ValueError, OSError):
+        return []
+
+
+def get_default_gpu_devices() -> str:
+    """Return the default GPU device string for new slots.
+
+    If QONDUIT_DEFAULT_GPU_DEVICES is set to an explicit list, returns it.
+    Otherwise, returns the auto-detected usable GPU list.
+    """
+    default_devices = _QONDUIT_DEFAULT_GPU_DEVICES.strip()
+    if default_devices.lower() != "auto":
+        return default_devices
+    return detect_usable_gpus()
+
+
+def resolve_gpu_devices(gpu_devices: Any) -> str:
+    """Resolve a gpu_devices value to an actual GPU list.
+
+    - "all" → auto-detected usable GPUs
+    - "all_raw" → all GPUs from nvidia-smi (raw)
+    - "0,2,3" → validated explicit list
+    """
+    gpu_str = str(gpu_devices).strip()
+
+    if gpu_str.lower() == "all":
+        return detect_usable_gpus()
+
+    if gpu_str.lower() == "all_raw":
+        result = _run_nvidia_smi()
+        if result is None:
+            return ""
+        try:
+            indices = []
+            for line in result.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 1:
+                    indices.append(parts[0])
+            return ",".join(indices)
+        except (ValueError, OSError):
+            return ""
+
+    # Explicit GPU list — validate
+    if re.match(r"^[0-9]+(,[0-9]+)*$", gpu_str):
+        return gpu_str
+
+    # Invalid — return as-is (caller should handle error)
+    return gpu_str
+
+
+def validate_gpu_devices(gpu_devices: Any, all_available: Optional[list[int]] = None) -> Optional[str]:
+    """Validate an explicit GPU device list.
+
+    Returns an error string if invalid, None if valid.
+    """
+    gpu_str = str(gpu_devices).strip()
+    if gpu_str.lower() in ("all", "all_raw"):
+        return None
+
+    if not re.match(r"^[0-9]+(,[0-9]+)*$", gpu_str):
+        return 'gpu_devices must be "all", "all_raw", or comma-separated GPU IDs like "0,1,2"'
+
+    try:
+        requested = [int(d.strip()) for d in gpu_str.split(",")]
+    except ValueError:
+        return f"Invalid GPU ID in: {gpu_str}"
+
+    if all_available is not None:
+        available_set = set(all_available)
+        for gid in requested:
+            if gid not in available_set:
+                return f"GPU {gid} is not available (available: {available_set})"
+
+    return None
 
 
 # ── Docker availability ──────────────────────────────────────────────────────
