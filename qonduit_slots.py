@@ -129,12 +129,18 @@ def _validate_gpu_devices(gpu_devices: Any) -> Optional[str]:
 
 
 def _validate_tensor_split(tensor_split: Any) -> Optional[str]:
-    """Return error string if tensor_split is invalid, else None."""
+    """Return error string if tensor_split is invalid, else None.
+
+    None, empty string, and "auto" are all valid — they mean
+    "clear the tensor_split field" (use llama.cpp defaults).
+    """
     if tensor_split is None:
-        return "tensor_split is required"
+        return None  # cleared / not set — valid
     ts_str = str(tensor_split).strip()
     if ts_str == "auto":
         return None
+    if ts_str == "":
+        return None  # empty string also means cleared
     # Must be comma-separated numeric values
     parts = ts_str.split(",")
     for part in parts:
@@ -581,7 +587,11 @@ def update_slot(
 
     for field in updatable:
         if field in payload:
-            slot[field] = payload[field]
+            value = payload[field]
+            # Normalize None/empty tensor_split to "auto" for consistency
+            if field == "tensor_split" and (value is None or str(value).strip() == ""):
+                value = "auto"
+            slot[field] = value
 
     # Re-derive derived fields if host or host_port changed
     if "host" in payload or "host_port" in payload:

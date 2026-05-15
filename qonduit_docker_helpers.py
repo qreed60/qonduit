@@ -232,12 +232,23 @@ def launch_slot_container(
     # Determine GPU settings — resolve "all" to usable GPUs
     gpu_devices = launch_payload.get("gpu_devices") or slot.get("gpu_devices", "all")
     resolved_gpu_devices = resolve_gpu_devices(gpu_devices)
-    tensor_split = launch_payload.get("tensor_split") or slot.get("tensor_split", "auto")
+    # Determine tensor_split — distinguish cleared / auto / explicit / inherited
+    if "tensor_split" in launch_payload:
+        tensor_split = launch_payload["tensor_split"]
+        tensor_split_cleared = tensor_split is None or str(tensor_split).strip() == ""
+    elif "tensor_split" in slot:
+        tensor_split = slot["tensor_split"]
+        tensor_split_cleared = tensor_split is None or str(tensor_split).strip() == ""
+    else:
+        tensor_split = "auto"
+        tensor_split_cleared = False
     embeddings = launch_payload.get("embeddings_enabled") or slot.get("embeddings_enabled", False)
     extra_args = launch_payload.get("extra_args") or slot.get("extra_args", [])
 
     # Compute tensor split value from resolved GPUs
-    if str(tensor_split).lower() == "auto":
+    if tensor_split_cleared:
+        split_val = None
+    elif str(tensor_split).lower() == "auto":
         split_val = compute_auto_tensor_split(resolved_gpu_devices)
     else:
         split_val = str(tensor_split)
@@ -252,12 +263,15 @@ def launch_slot_container(
     ]
 
     # ── Extra args conflict handling ───────────────────────────────────────
-    # When tensor_split is explicitly set (not "auto"), filter out conflicting
-    # --tensor-split or -ts from extra_args to prevent duplicate args.
+    # When tensor_split is explicitly set (not "auto" and not cleared), filter out
+    # conflicting --tensor-split or -ts from extra_args to prevent duplicate args.
     filtered_extra_args: list[str] = []
     extra_args_warning: str | None = None
-    if split_val != "1,1" or str(tensor_split).lower() != "auto":
-        # tensor_split is explicitly set
+    if tensor_split_cleared or str(tensor_split).lower() == "auto":
+        # tensor_split cleared or auto — pass through extra_args unchanged
+        filtered_extra_args = list(extra_args)
+    else:
+        # tensor_split is explicitly set — filter conflicting --tensor-split
         for arg in extra_args:
             arg_str = str(arg).strip()
             if arg_str in ("--tensor-split", "-ts"):
@@ -273,8 +287,6 @@ def launch_slot_container(
                 )
                 continue
             filtered_extra_args.append(arg)
-    else:
-        filtered_extra_args = list(extra_args)
 
     # Build command
     cmd = [
@@ -284,8 +296,9 @@ def launch_slot_container(
         "--ctx-size", str(context_size),
         "--host", "0.0.0.0",
         "--port", str(slot.get("internal_port", 8080)),
-        "--tensor-split", split_val,
     ]
+    if split_val is not None:
+        cmd.extend(["--tensor-split", split_val])
 
     if embeddings:
         cmd.append("--embeddings")

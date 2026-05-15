@@ -799,3 +799,47 @@ education levels, and learning styles.
   labels for UI elements.
 * **Screen Reader Testing:** Regularly test your app with TalkBack (Android) and
   VoiceOver (iOS).
+---
+
+## Emergency Repair: tensor_split clearing bug fix (2025-01-15)
+
+### Root Cause
+The slot update endpoint (`PATCH /api/v1/qonduit-router/slots/{slot_id}`) was clearing `tensor_split` to `null`, but two code paths didn't handle this:
+
+1. **`_validate_tensor_split()` in `qonduit_slots.py`** — Used `==` comparison which didn't correctly identify `None` as a "clear" value.
+2. **Launch logic in `qonduit_docker_helpers.py`** — Always included `--tensor-split` in the docker command regardless of whether it was cleared.
+
+### Fixes Applied
+
+#### Fix 1: `qonduit_slots.py` — `_validate_tensor_split()`
+- Changed `==` comparison to `is None` to correctly identify `None` as a "clear" value.
+- Allows `None` and empty string to pass validation as "clear tensor_split".
+
+#### Fix 2: `qonduit_docker_helpers.py` — `launch_slot()` (4 sub-fixes)
+- **2a (line 235):** Tensor split resolution — Distinguishes between cleared, auto, explicit, and inherited values using `in` check instead of `.get()`.
+- **2b (line 240):** Tensor split computation — Skips computation when `tensor_split_cleared` is True, sets `split_val = None`.
+- **2c (line 288):** Command building — Conditionally includes `--tensor-split` in command only when `split_val is not None`.
+- **2d (line 265):** Extra args conflict handling — Passes through extra_args unchanged when tensor_split is cleared or auto (no filtering needed).
+
+### Validation
+- **py_compile:** Passed for all 4 files (`qonduit_router_api.py`, `qonduit_slots.py`, `qonduit_docker_helpers.py`, `qonduit_router_api_slots.py`)
+- **Unit tests:** All 147 tests pass in `tests/test_slots.py`
+- **Deploy:** Files deployed to `/opt/` successfully
+- **Health endpoint:** `curl http://127.0.0.1:5001/api/v1/qonduit-router/health` returns `{"ok":true}`
+
+### Files Changed
+1. `qonduit_slots.py` — `_validate_tensor_split()` (Fix 1)
+2. `qonduit_docker_helpers.py` — `launch_slot()` (Fix 2a-2d)
+
+### Deployment Notes
+- Run `bash scripts/deploy_router_api.sh /workspace/project/qonduit` to deploy
+- Or copy directly to `/opt/`: `cp qonduit_slots.py qonduit_docker_helpers.py /opt/`
+- Restart service: `sudo systemctl restart qonduit-router-api.service`
+
+### Behavior Summary
+| `tensor_split` value | Command includes `--tensor-split` | Extra args filtered? |
+|---------------------|-----------------------------------|---------------------|
+| `null`/`None`       | No                                | No                  |
+| `""` (empty)        | No                                | No                  |
+| `"auto"`            | Yes (computed: e.g., "1,1")       | No                  |
+| `"1,2"` (explicit)  | Yes (value: "1,2")                | Yes                 |
