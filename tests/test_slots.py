@@ -309,6 +309,67 @@ class TestSlotConfigStorage:
         slot = get_slot("primary")
         assert slot["display_name"] == "My Primary"
 
+    def test_update_tensor_split_clear_null(self, _fresh_slots):
+        """Updating tensor_split to None clears the saved value."""
+        from qonduit_slots import get_slot, update_slot
+
+        updated, err = update_slot("primary", {"tensor_split": "1,1,1"})
+        assert err is None
+        assert updated["tensor_split"] == "1,1,1"
+
+        updated, err = update_slot("primary", {"tensor_split": None})
+        assert err is None
+        assert updated["tensor_split"] is None
+        assert get_slot("primary")["tensor_split"] is None
+
+    def test_update_tensor_split_clear_empty_string(self, _fresh_slots):
+        """Updating tensor_split to an empty string clears the saved value."""
+        from qonduit_slots import get_slot, update_slot
+
+        updated, err = update_slot("primary", {"tensor_split": "1,1,1"})
+        assert err is None
+        assert updated["tensor_split"] == "1,1,1"
+
+        updated, err = update_slot("primary", {"tensor_split": ""})
+        assert err is None
+        assert updated["tensor_split"] is None
+        assert get_slot("primary")["tensor_split"] is None
+
+    def test_update_omitted_tensor_split_keeps_existing_value(self, _fresh_slots):
+        """Omitting tensor_split during update leaves the prior value intact."""
+        from qonduit_slots import get_slot, update_slot
+
+        updated, err = update_slot("primary", {"tensor_split": "1,1,1"})
+        assert err is None
+        assert updated["tensor_split"] == "1,1,1"
+
+        updated, err = update_slot("primary", {"display_name": "Renamed"})
+        assert err is None
+        assert updated["tensor_split"] == "1,1,1"
+        assert get_slot("primary")["tensor_split"] == "1,1,1"
+
+    def test_update_tensor_split_valid_non_empty_persists(self, _fresh_slots):
+        """A valid non-empty tensor_split is persisted."""
+        from qonduit_slots import get_slot, update_slot
+
+        updated, err = update_slot("primary", {"tensor_split": "1,1,1,1,1,1,1"})
+        assert err is None
+        assert updated["tensor_split"] == "1,1,1,1,1,1,1"
+        assert get_slot("primary")["tensor_split"] == "1,1,1,1,1,1,1"
+
+    def test_update_tensor_split_malformed_non_empty_errors(self, _fresh_slots):
+        """Malformed non-empty tensor_split values are rejected."""
+        from qonduit_slots import get_slot, update_slot
+
+        updated, err = update_slot("primary", {"tensor_split": "1,1,1"})
+        assert err is None
+
+        updated, err = update_slot("primary", {"tensor_split": "1,,bad"})
+        assert updated == {}
+        assert err is not None
+        assert "tensor_split must" in err
+        assert get_slot("primary")["tensor_split"] == "1,1,1"
+
     def test_reject_immutable_update_while_running(self, _fresh_slots):
         """Cannot change model/context/gpu while running without force."""
         from qonduit_slots import update_slot, load_slots
@@ -409,6 +470,31 @@ class TestDockerHelpers:
         from qonduit_docker_helpers import compute_auto_tensor_split
         assert compute_auto_tensor_split("0,1,2") == "1,1,1"
         assert compute_auto_tensor_split("0") == "1"
+
+    def test_launch_args_omit_tensor_split_after_clear(self, _fresh_slots):
+        """Launching a slot with cleared tensor_split omits --tensor-split."""
+        from qonduit_docker_helpers import launch_slot_container
+        from qonduit_slots import load_slots, update_slot
+
+        updated, err = update_slot("primary", {
+            "model": "test.gguf",
+            "gpu_devices": "0,1",
+            "tensor_split": None,
+        })
+        assert err is None
+        assert updated["tensor_split"] is None
+        slot = load_slots()[0]
+
+        with patch("qonduit_docker_helpers.os.path.exists", return_value=True), \
+                patch("qonduit_docker_helpers.container_exists", return_value=False), \
+                patch("qonduit_docker_helpers.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="abc123\n", stderr="")
+            ok, _, err = launch_slot_container(slot, {})
+
+        assert ok is True
+        assert err is None
+        run_cmd = mock_run.call_args[0][0]
+        assert "--tensor-split" not in run_cmd
 
     def test_container_exists_returns_bool(self, _fresh_slots):
         """container_exists returns a boolean."""
@@ -577,6 +663,95 @@ class TestMultiSlotEndpoints:
         assert data["ok"] is True
         assert data["slot"]["slot_id"] == "api-test"
         assert data["slot"]["display_name"] == "API Test"
+
+    def test_patch_tensor_split_null_clears_previous_value(self, app_client):
+        """PATCH tensor_split:null clears a previously saved split."""
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": "1,1,1"},
+        )
+        assert resp.status_code == 200
+
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["tensor_split"] is None
+
+        resp = app_client.get("/api/v1/qonduit-router/slots")
+        slots = resp.get_json()["slots"]
+        primary = next(s for s in slots if s["slot_id"] == "primary")
+        assert primary["tensor_split"] is None
+
+    def test_patch_tensor_split_empty_string_clears_previous_value(self, app_client):
+        """PATCH tensor_split:"" clears a previously saved split."""
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": "1,1,1"},
+        )
+        assert resp.status_code == 200
+
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": ""},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["tensor_split"] is None
+
+        resp = app_client.get("/api/v1/qonduit-router/slots")
+        slots = resp.get_json()["slots"]
+        primary = next(s for s in slots if s["slot_id"] == "primary")
+        assert primary["tensor_split"] is None
+
+    def test_patch_omitted_tensor_split_keeps_previous_value(self, app_client):
+        """PATCH without tensor_split leaves the saved split unchanged."""
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": "1,1,1"},
+        )
+        assert resp.status_code == 200
+
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"display_name": "Primary Renamed"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["tensor_split"] == "1,1,1"
+
+    def test_patch_valid_tensor_split_persists(self, app_client):
+        """PATCH with a valid non-empty tensor_split persists it."""
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": "1,1,1,1,1,1,1"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["tensor_split"] == "1,1,1,1,1,1,1"
+
+    def test_patch_malformed_non_empty_tensor_split_errors(self, app_client):
+        """PATCH rejects malformed non-empty tensor_split values."""
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": "1,1,1"},
+        )
+        assert resp.status_code == 200
+
+        resp = app_client.patch(
+            "/api/v1/qonduit-router/slots/primary",
+            json={"tensor_split": "1,,bad"},
+        )
+        assert resp.status_code == 400
+        data = resp.get_json()
+        assert data["error"] == "update_failed"
+        assert "tensor_split must" in data["detail"]
+
+        resp = app_client.get("/api/v1/qonduit-router/slots/primary")
+        data = resp.get_json()
+        assert data["slot"]["tensor_split"] == "1,1,1"
 
     def test_reject_duplicate_slot_via_api(self, app_client):
         """POST /slots rejects duplicate slot_id."""
