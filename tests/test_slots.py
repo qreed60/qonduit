@@ -2221,3 +2221,525 @@ class TestRouterAccessControl:
         assert resp.status_code == 403
         data = resp.get_json()
         assert data["error"] == "router_access_denied"
+
+
+# ── Tensor Split Preflight Tests ─────────────────────────────────────────────
+# Comprehensive tests for tensor_split acceptance, echoing, validation,
+# suggested splits, launch args preview, and extra_args conflict handling.
+
+
+class TestTensorSplitPreflight:
+    """Tests for tensor_split handling in the preflight endpoint."""
+
+    def test_preflight_without_tensor_split_still_works(self, app_client):
+        """Test 1: Preflight without tensor_split still works.
+
+        When no tensor_split is sent, the response should include
+        requested_tensor_split: null, tensor_split: null,
+        tensor_split_valid: true, and tensor_split_entry_count: null.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf"},
+            )
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["requested_tensor_split"] is None
+        assert data["tensor_split"] is None
+        assert data["tensor_split_valid"] is True
+        assert data["tensor_split_entry_count"] is None
+        # Should still have effective_gpu_count
+        assert "effective_gpu_count" in data
+        # Should still have suggested_tensor_splits
+        assert "suggested_tensor_splits" in data
+        # launch_args_preview should be empty (no explicit tensor_split)
+        assert data["launch_args_preview"] == []
+
+    def test_preflight_with_matching_tensor_split(self, app_client, monkeypatch):
+        """Test 2: Preflight with tensor_split matching effective GPU count works.
+
+        When tensor_split has the same count as effective GPUs,
+        tensor_split_valid should be true.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            # Mock GPU summary with 7 usable GPUs (simulating the target machine)
+            mock_gpu_summary = {
+                "ok": True,
+                "gpus": [
+                    {"index": 0, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                     "memory_used_mib": 1000, "memory_free_mib": 45068},
+                    {"index": 2, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                     "memory_used_mib": 1000, "memory_free_mib": 45068},
+                    {"index": 3, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                     "memory_used_mib": 1000, "memory_free_mib": 45068},
+                    {"index": 4, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                     "memory_used_mib": 1000, "memory_free_mib": 45068},
+                    {"index": 5, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                     "memory_used_mib": 1000, "memory_free_mib": 45068},
+                    {"index": 6, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                     "memory_used_mib": 1000, "memory_free_mib": 45068},
+                    {"index": 7, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                     "memory_used_mib": 1000, "memory_free_mib": 45068},
+                ],
+                "usable_gpu_indices": "0,2,3,4,5,6,7",
+                "usable_gpu_devices": "0,2,3,4,5,6,7",
+            }
+            monkeypatch.setattr(
+                "qonduit_router_api_slots.collect_gpu_summary",
+                lambda: mock_gpu_summary,
+            )
+
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={
+                    "model": "test.gguf",
+                    "gpu_devices": "all",
+                    "tensor_split": "1,1,1,1,1,1,1",
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["requested_tensor_split"] == "1,1,1,1,1,1,1"
+            assert data["tensor_split"] == "1,1,1,1,1,1,1"
+            assert data["tensor_split_valid"] is True
+            assert data["tensor_split_entry_count"] == 7
+            assert data["effective_gpu_count"] == 7
+            assert data["effective_gpu_devices"] == "0,2,3,4,5,6,7"
+            # launch_args_preview should include --tensor-split
+            assert "--tensor-split" in data["launch_args_preview"]
+            assert "1,1,1,1,1,1,1" in data["launch_args_preview"]
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_with_tensor_split_count_mismatch(self, app_client, monkeypatch):
+        """Test 3: Preflight with tensor_split count mismatch returns clear error.
+
+        When tensor_split has a different count than effective GPUs,
+        tensor_split_valid should be false and a clear warning should be present.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            mock_gpu_summary = {
+                "ok": True,
+                "gpus": [
+                    {"index": 0, "name": "GPU0", "memory_total_mib": 24000,
+                     "memory_used_mib": 0, "memory_free_mib": 24000},
+                    {"index": 2, "name": "GPU2", "memory_total_mib": 24000,
+                     "memory_used_mib": 0, "memory_free_mib": 24000},
+                ],
+                "usable_gpu_indices": "0,2",
+                "usable_gpu_devices": "0,2",
+            }
+            monkeypatch.setattr(
+                "qonduit_router_api_slots.collect_gpu_summary",
+                lambda: mock_gpu_summary,
+            )
+
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={
+                    "model": "test.gguf",
+                    "gpu_devices": "all",
+                    "tensor_split": "1,1",  # 2 values but mock has 2 GPUs, so this should pass
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            # 2 values for 2 GPUs — this is actually valid in this mock
+            assert data["tensor_split_valid"] is True
+            assert data["tensor_split_entry_count"] == 2
+
+            # Now test with a true mismatch: 7 GPUs but 2 values
+            mock_gpu_summary_7 = {
+                "ok": True,
+                "gpus": [
+                    {"index": i, "name": f"GPU{i}", "memory_total_mib": 24000,
+                     "memory_used_mib": 0, "memory_free_mib": 24000}
+                    for i in [0, 2, 3, 4, 5, 6, 7]
+                ],
+                "usable_gpu_indices": "0,2,3,4,5,6,7",
+                "usable_gpu_devices": "0,2,3,4,5,6,7",
+            }
+            monkeypatch.setattr(
+                "qonduit_router_api_slots.collect_gpu_summary",
+                lambda: mock_gpu_summary_7,
+            )
+
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={
+                    "model": "test.gguf",
+                    "gpu_devices": "all",
+                    "tensor_split": "1,1",  # 2 values but 7 GPUs
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["tensor_split_valid"] is False
+            assert data["tensor_split_entry_count"] == 2
+            assert data["effective_gpu_count"] == 7
+            # Should have a clear warning about the mismatch
+            mismatch_warnings = [
+                w for w in data["warnings"]
+                if "tensor_split" in w.lower() and "value" in w.lower()
+            ]
+            assert len(mismatch_warnings) > 0, "Expected mismatch warning"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_with_malformed_tensor_split(self, app_client):
+        """Test 4: Preflight with malformed tensor_split returns HTTP 400.
+
+        Non-numeric values in tensor_split should be rejected with a 400 error.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf", "tensor_split": "abc"},
+            )
+            assert resp.status_code == 400
+            data = resp.get_json()
+            assert data["ok"] is False
+            assert data["error"] == "invalid_tensor_split"
+
+            # Empty entry
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf", "tensor_split": "1,,2"},
+            )
+            assert resp.status_code == 400
+            data = resp.get_json()
+            assert data["error"] == "invalid_tensor_split"
+
+            # Non-numeric in the middle
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf", "tensor_split": "1,abc,2"},
+            )
+            assert resp.status_code == 400
+            data = resp.get_json()
+            assert data["error"] == "invalid_tensor_split"
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_response_echoes_requested_tensor_split(self, app_client, monkeypatch):
+        """Test 5: Preflight response echoes requested_tensor_split.
+
+        The response should include requested_tensor_split with the exact
+        value sent by the frontend.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            monkeypatch.setattr(
+                "qonduit_router_api_slots.collect_gpu_summary",
+                lambda: {"ok": False, "error": "test"},
+            )
+
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf", "tensor_split": "138,55,80,91,80,79,79"},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["requested_tensor_split"] == "138,55,80,91,80,79,79"
+            assert data["tensor_split"] == "138,55,80,91,80,79,79"
+
+            # When not sent, requested should be null
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf"},
+            )
+            data = resp.get_json()
+            assert data["requested_tensor_split"] is None
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_response_includes_effective_gpu_count(self, app_client, monkeypatch):
+        """Test 6: Preflight response includes effective_gpu_count.
+
+        effective_gpu_count should be present and match the count of
+        effective_gpu_devices.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            mock_gpu_summary = {
+                "ok": True,
+                "gpus": [
+                    {"index": i, "name": f"GPU{i}", "memory_total_mib": 24000,
+                     "memory_used_mib": 0, "memory_free_mib": 24000}
+                    for i in [0, 2, 3, 4, 5, 6, 7]
+                ],
+                "usable_gpu_indices": "0,2,3,4,5,6,7",
+                "usable_gpu_devices": "0,2,3,4,5,6,7",
+            }
+            monkeypatch.setattr(
+                "qonduit_router_api_slots.collect_gpu_summary",
+                lambda: mock_gpu_summary,
+            )
+
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf", "gpu_devices": "all"},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["effective_gpu_count"] == 7
+            # Count devices in effective_gpu_devices string
+            devices = data["effective_gpu_devices"].split(",")
+            assert len([d for d in devices if d.strip()]) == 7
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_preflight_response_includes_suggested_tensor_splits(self, app_client, monkeypatch):
+        """Test 7: Preflight response includes suggested_tensor_splits.
+
+        The response should include suggested tensor splits: even,
+        free_vram_weighted_raw, and free_vram_weighted_normalized.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            mock_gpu_summary = {
+                "ok": True,
+                "gpus": [
+                    {"index": 0, "name": "GPU0", "memory_total_mib": 14128 + 1000,
+                     "memory_used_mib": 1000, "memory_free_mib": 14128},
+                    {"index": 2, "name": "GPU2", "memory_total_mib": 5614 + 1000,
+                     "memory_used_mib": 1000, "memory_free_mib": 5614},
+                    {"index": 3, "name": "GPU3", "memory_total_mib": 8174 + 1000,
+                     "memory_used_mib": 1000, "memory_free_mib": 8174},
+                    {"index": 4, "name": "GPU4", "memory_total_mib": 9280 + 1000,
+                     "memory_used_mib": 1000, "memory_free_mib": 9280},
+                    {"index": 5, "name": "GPU5", "memory_total_mib": 8174 + 1000,
+                     "memory_used_mib": 1000, "memory_free_mib": 8174},
+                    {"index": 6, "name": "GPU6", "memory_total_mib": 8112 + 1000,
+                     "memory_used_mib": 1000, "memory_free_mib": 8112},
+                    {"index": 7, "name": "GPU7", "memory_total_mib": 8138 + 1000,
+                     "memory_used_mib": 1000, "memory_free_mib": 8138},
+                ],
+                "usable_gpu_indices": "0,2,3,4,5,6,7",
+                "usable_gpu_devices": "0,2,3,4,5,6,7",
+            }
+            monkeypatch.setattr(
+                "qonduit_router_api_slots.collect_gpu_summary",
+                lambda: mock_gpu_summary,
+            )
+
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf"},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            suggestions = data["suggested_tensor_splits"]
+            assert "even" in suggestions
+            assert suggestions["even"] == "1,1,1,1,1,1,1"
+            assert "free_vram_weighted_raw" in suggestions
+            assert suggestions["free_vram_weighted_raw"] == "14128,5614,8174,9280,8174,8112,8138"
+            assert "free_vram_weighted_normalized" in suggestions
+            # Check that normalized values are reasonable
+            norm = suggestions["free_vram_weighted_normalized"]
+            norm_parts = norm.split(",")
+            assert len(norm_parts) == 7
+            # Values should be in a reasonable range (not all 1s, not zeros)
+            for v in norm_parts:
+                assert int(v) >= 1
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_launch_args_include_tensor_split_when_set(self, app_client, monkeypatch):
+        """Test 8: Launch args include --tensor-split when tensor_split is set.
+
+        The launch_args_preview in the preflight response should include
+        --tensor-split and the value when an explicit tensor_split is provided.
+        """
+        _known_models.add("/mnt/models/llm/test.gguf")
+        try:
+            monkeypatch.setattr(
+                "qonduit_router_api_slots.collect_gpu_summary",
+                lambda: {"ok": False, "error": "test"},
+            )
+
+            # With tensor_split set
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf", "tensor_split": "3,1,1"},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert "--tensor-split" in data["launch_args_preview"]
+            idx = data["launch_args_preview"].index("--tensor-split")
+            assert data["launch_args_preview"][idx + 1] == "3,1,1"
+
+            # Without tensor_split (auto)
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={"model": "test.gguf"},
+            )
+            data = resp.get_json()
+            assert "--tensor-split" not in data["launch_args_preview"]
+            assert data["launch_args_preview"] == []
+        finally:
+            _known_models.discard("/mnt/models/llm/test.gguf")
+
+    def test_extra_args_conflict_with_tensor_split(self, app_client, monkeypatch):
+        """Test 9: Extra args conflict with --tensor-split is handled.
+
+        When tensor_split is set and extra_args also contains --tensor-split,
+        a warning should be returned and the extra_args version should be
+        ignored.
+        """
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.collect_gpu_summary",
+            lambda: {"ok": False, "error": "test"},
+        )
+
+        # Register model file so mock os.path.exists returns True
+        _known_models.add("/mnt/models/llm/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf")
+        try:
+            # With --tensor-split in extra_args
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={
+                    "model": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+                    "tensor_split": "3,1,1",
+                    "extra_args": ["--tensor-split", "1,1,1"],
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            conflict_warnings = [
+                w for w in data["warnings"]
+                if "Ignoring" in w and "extra_args" in w
+            ]
+            assert len(conflict_warnings) > 0
+
+            # With --tensor-split=value in extra_args
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={
+                    "model": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+                    "tensor_split": "3,1,1",
+                    "extra_args": ["--tensor-split=1,1,1", "--other-arg"],
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            conflict_warnings = [
+                w for w in data["warnings"]
+                if "Ignoring" in w and "extra_args" in w
+            ]
+            assert len(conflict_warnings) > 0
+
+            # Without explicit tensor_split, extra_args should not conflict
+            resp = app_client.post(
+                "/api/v1/qonduit-router/slots/primary/preflight",
+                json={
+                    "model": "Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+                    "extra_args": ["--tensor-split", "1,1,1"],
+                },
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            conflict_warnings = [
+                w for w in data["warnings"]
+                if "Ignoring" in w and "extra_args" in w
+            ]
+            assert len(conflict_warnings) == 0
+        finally:
+            _known_models.discard("/mnt/models/llm/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf")
+
+
+class TestComputeSuggestedTensorSplits:
+    """Tests for the compute_suggested_tensor_splits helper function."""
+
+    def test_even_split_generated(self):
+        """Even split is always generated."""
+        from qonduit_docker_helpers import compute_suggested_tensor_splits
+        result = compute_suggested_tensor_splits({"ok": False}, 5)
+        assert result["even"] == "1,1,1,1,1"
+
+    def test_weighted_null_when_no_gpu_data(self):
+        """Weighted suggestions are null when no GPU data available."""
+        from qonduit_docker_helpers import compute_suggested_tensor_splits
+        result = compute_suggested_tensor_splits({"ok": False}, 3)
+        assert result["free_vram_weighted_raw"] is None
+        assert result["free_vram_weighted_normalized"] is None
+        assert "warning" in result
+
+    def test_weighted_generated_with_gpu_data(self):
+        """Weighted suggestions are generated when GPU data is available."""
+        from qonduit_docker_helpers import compute_suggested_tensor_splits
+        gpu_summary = {
+            "ok": True,
+            "gpus": [
+                {"index": 0, "name": "GPU0", "memory_total_mib": 24000,
+                 "memory_used_mib": 1000, "memory_free_mib": 23000},
+                {"index": 1, "name": "GPU1", "memory_total_mib": 12000,
+                 "memory_used_mib": 5000, "memory_free_mib": 7000},
+            ],
+            "usable_gpu_indices": "0,1",
+            "usable_gpu_devices": "0,1",
+        }
+        result = compute_suggested_tensor_splits(gpu_summary, 2)
+        assert result["even"] == "1,1"
+        assert result["free_vram_weighted_raw"] == "23000,7000"
+        # Normalized values should preserve proportions
+        norm_parts = result["free_vram_weighted_normalized"].split(",")
+        assert len(norm_parts) == 2
+        # GPU 0 has ~3.3x more free memory than GPU 1
+        ratio = int(norm_parts[0]) / int(norm_parts[1])
+        assert ratio > 2.5  # 23000/7000 ≈ 3.3
+
+    def test_normalized_preserves_proportions(self):
+        """Normalized split preserves relative VRAM proportions."""
+        from qonduit_docker_helpers import compute_suggested_tensor_splits
+        gpu_summary = {
+            "ok": True,
+            "gpus": [
+                {"index": 0, "name": "GPU0", "memory_total_mib": 20000,
+                 "memory_used_mib": 0, "memory_free_mib": 14128},
+                {"index": 1, "name": "GPU1", "memory_total_mib": 8000,
+                 "memory_used_mib": 0, "memory_free_mib": 5614},
+                {"index": 2, "name": "GPU2", "memory_total_mib": 16000,
+                 "memory_used_mib": 0, "memory_free_mib": 8174},
+            ],
+            "usable_gpu_indices": "0,1,2",
+            "usable_gpu_devices": "0,1,2",
+        }
+        result = compute_suggested_tensor_splits(gpu_summary, 3)
+        raw_parts = result["free_vram_weighted_raw"].split(",")
+        norm_parts = result["free_vram_weighted_normalized"].split(",")
+        assert len(raw_parts) == 3
+        assert len(norm_parts) == 3
+        # Verify normalization by 102.4
+        assert int(norm_parts[0]) == round(14128 / 102.4)
+        assert int(norm_parts[1]) == round(5614 / 102.4)
+        assert int(norm_parts[2]) == round(8174 / 102.4)
+
+    def test_zero_free_memory_excluded(self):
+        """GPUs with zero free memory are excluded from weighted suggestions."""
+        from qonduit_docker_helpers import compute_suggested_tensor_splits
+        gpu_summary = {
+            "ok": True,
+            "gpus": [
+                {"index": 0, "name": "GPU0", "memory_total_mib": 24000,
+                 "memory_used_mib": 24000, "memory_free_mib": 0},
+                {"index": 1, "name": "GPU1", "memory_total_mib": 24000,
+                 "memory_used_mib": 1000, "memory_free_mib": 23000},
+            ],
+            "usable_gpu_indices": "0,1",
+            "usable_gpu_devices": "0,1",
+        }
+        result = compute_suggested_tensor_splits(gpu_summary, 2)
+        # GPU 0 has 0 free, so only GPU 1 should appear in weighted
+        raw = result["free_vram_weighted_raw"]
+        assert raw == "23000"
+        assert result["free_vram_weighted_normalized"] == "225"

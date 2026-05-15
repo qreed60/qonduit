@@ -251,6 +251,31 @@ def launch_slot_container(
         f'"device={resolved_gpu_devices}"',
     ]
 
+    # ── Extra args conflict handling ───────────────────────────────────────
+    # When tensor_split is explicitly set (not "auto"), filter out conflicting
+    # --tensor-split or -ts from extra_args to prevent duplicate args.
+    filtered_extra_args: list[str] = []
+    extra_args_warning: str | None = None
+    if split_val != "1,1" or str(tensor_split).lower() != "auto":
+        # tensor_split is explicitly set
+        for arg in extra_args:
+            arg_str = str(arg).strip()
+            if arg_str in ("--tensor-split", "-ts"):
+                extra_args_warning = (
+                    f"Ignoring {arg_str} from extra_args because "
+                    f"tensor_split field is set"
+                )
+                continue
+            if arg_str.startswith("--tensor-split="):
+                extra_args_warning = (
+                    "Ignoring --tensor-split from extra_args because "
+                    "tensor_split field is set"
+                )
+                continue
+            filtered_extra_args.append(arg)
+    else:
+        filtered_extra_args = list(extra_args)
+
     # Build command
     cmd = [
         _QONDUIT_LLAMA_SERVER_BIN,
@@ -265,7 +290,7 @@ def launch_slot_container(
     if embeddings:
         cmd.append("--embeddings")
 
-    cmd.extend(extra_args)
+    cmd.extend(filtered_extra_args)
 
     # Port mapping
     port_map = f"{slot.get('host_port', 8080)}:{slot.get('internal_port', 8080)}"
@@ -625,6 +650,114 @@ def compute_auto_tensor_split(gpu_devices: Any) -> str:
         return ",".join(["1"] * len(devices))
     devices = [d.strip() for d in gpu_str.split(",")]
     return ",".join(["1"] * len(devices))
+
+
+# ── Suggested tensor split generation ────────────────────────────────────────
+#
+# Normalization rule:
+#   The free-VRAM-weighted normalized split divides each GPU's free memory
+#   (in MiB) by 102.4 to produce a readable integer that preserves the
+#   relative proportions of the raw free-VRAM values.  The divisor 102.4
+#   was chosen so that a GPU with ~14 GiB free yields ~137 (close to the
+#   llama.cpp convention of values in the 1-100 range per GPU).  This
+#   avoids zero values because every included GPU has at least the
+#   QONDUIT_GPU_MIN_TOTAL_MIB threshold of memory, and we only include
+#   GPUs that have some free memory.
+#
+# Example with the target machine's GPUs (effective inference GPUs):
+#   GPU 0 free: 14128 MiB  →  14128 / 102.4  ≈ 138
+#   GPU 2 free:  5614 MiB  →   5614 / 102.4  ≈  55
+#   GPU 3 free:  8174 MiB  →   8174 / 102.4  ≈  80
+#   GPU 4 free:  9280 MiB  →   9280 / 102.4  ≈  91
+#   GPU 5 free:  8174 MiB  →   8174 / 102.4  ≈  80
+#   GPU 6 free:  8112 MiB  →   8112 / 102.4  ≈  79
+#   GPU 7 free:  8138 MiB  →   8138 / 102.4  ≈  79
+
+
+def _gpu_free_mem_map(gpu_summary: dict[str, Any], effective_gpu_indices: list[int] | None) -> dict[int, int]:
+    """Return {gpu_index: free_mib} for GPUs in effective_gpu_indices.
+
+    If effective_gpu_indices is None, returns all usable GPUs from the summary.
+    Only includes GPUs that have free memory > 0.
+    """
+    free_map: dict[int, int] = {}
+    if not gpu_summary.get("ok") or not gpu_summary.get("gpus"):
+        return free_map
+
+    if effective_gpu_indices is None:
+        # Use all usable GPUs from the summary
+        usable = gpu_summary.get("usable_gpu_indices")
+        if usable is not None:
+            effective_gpu_indices = [int(i) for i in str(usable).split(",") if i.strip()]
+        else:
+            # Fallback: all GPUs in the summary
+            effective_gpu_indices = [g["index"] for g in gpu_summary["gpus"]]
+
+    for gpu in gpu_summary["gpus"]:
+        idx = gpu["index"]
+        if idx in effective_gpu_indices:
+            free = gpu.get("memory_free_mib", 0)
+            if free > 0:
+                free_map[idx] = free
+
+    return free_map
+
+
+def compute_suggested_tensor_splits(
+    gpu_summary: dict[str, Any],
+    effective_gpu_count: int,
+) -> dict[str, str | None]:
+    """Compute suggested tensor splits for the frontend.
+
+    Returns a dict with:
+      - "even": equal split, e.g. "1,1,1,1,1,1,1"
+      - "free_vram_weighted_raw": raw free memory per GPU, e.g. "14128,5614,8174,9280,8174,8112,8138"
+      - "free_vram_weighted_normalized": normalized by 102.4, e.g. "138,55,80,91,80,79,79"
+      - "warning" (optional): if GPU memory data unavailable
+
+    If GPU free memory data is unavailable, returns None for weighted suggestions
+    with a warning.  Never fakes weighted split as even split when data is missing.
+    """
+    suggestions: dict[str, str | None] = {}
+
+    # Always return even split
+    suggestions["even"] = ",".join(["1"] * max(effective_gpu_count, 0))
+
+    # Build free memory map for effective GPUs
+    effective_gpu_indices: list[int] | None = None
+    if effective_gpu_count > 0 and gpu_summary.get("ok") and gpu_summary.get("usable_gpu_indices"):
+        usable = gpu_summary["usable_gpu_indices"]
+        # Handle both list (e.g. [0,2,3]) and string (e.g. "0,2,3") formats
+        if isinstance(usable, list):
+            effective_gpu_indices = [int(i) for i in usable if str(i).strip()]
+        else:
+            effective_gpu_indices = [int(i) for i in str(usable).split(",") if str(i).strip()]
+        # If we have fewer effective GPUs than usable, take the first N
+        if len(effective_gpu_indices) > effective_gpu_count:
+            effective_gpu_indices = effective_gpu_indices[:effective_gpu_count]
+
+    free_map = _gpu_free_mem_map(gpu_summary, effective_gpu_indices)
+
+    if not free_map:
+        # No GPU free memory data available — return None for weighted, with warning
+        suggestions["free_vram_weighted_raw"] = None
+        suggestions["free_vram_weighted_normalized"] = None
+        suggestions["warning"] = "GPU free memory data unavailable; weighted suggestions not computed."
+        return suggestions
+
+    # Sort by GPU index to preserve CUDA_VISIBLE_DEVICES ordering
+    sorted_indices = sorted(free_map.keys())
+    raw_values = [str(free_map[idx]) for idx in sorted_indices]
+    suggestions["free_vram_weighted_raw"] = ",".join(raw_values)
+
+    # Normalized: divide by 102.4, clamp to minimum 1 to avoid zeros
+    normalized_values = []
+    for idx in sorted_indices:
+        val = free_map[idx] / 102.4
+        normalized_values.append(str(max(1, round(val))))
+    suggestions["free_vram_weighted_normalized"] = ",".join(normalized_values)
+
+    return suggestions
 
 
 # ── GPU detection helpers ────────────────────────────────────────────────────

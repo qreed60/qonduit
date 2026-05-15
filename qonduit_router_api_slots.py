@@ -45,8 +45,11 @@ from qonduit_docker_helpers import (
     stream_slot_logs,
     port_is_available,
     docker_name_is_available,
+    find_port_conflict,
+    find_container_name_conflict,
     collect_gpu_summary,
     compute_auto_tensor_split,
+    compute_suggested_tensor_splits,
     resolve_gpu_devices,
     docker_available,
 )
@@ -451,7 +454,7 @@ def register_slot_routes(app: Flask) -> None:
             return Response(logs_text, mimetype="text/plain", status=503)
         return Response(logs_text, mimetype="text/plain")
 
-    # --- GET /api/v1/qonduit-router/slots/<slot_id>/preflight ---
+    # --- POST /api/v1/qonduit-router/slots/<slot_id>/preflight ---
     @app.post("/api/v1/qonduit-router/slots/<slot_id>/preflight")
     def slot_preflight(slot_id: str):
         denied = _require_router_access()
@@ -469,8 +472,10 @@ def register_slot_routes(app: Flask) -> None:
             payload.get("context_size") or slot_data.get("context_size", 65536),
         )
         gpu_devices = payload.get("gpu_devices") or slot_data.get("gpu_devices", "all")
-        tensor_split = payload.get("tensor_split") or slot_data.get("tensor_split", "auto")
+        # tensor_split may be None if not provided in payload or slot — that's OK
+        tensor_split = payload.get("tensor_split") or slot_data.get("tensor_split") or "auto"
         embeddings = payload.get("embeddings_enabled") or slot_data.get("embeddings_enabled", False)
+        extra_args = payload.get("extra_args") or slot_data.get("extra_args", [])
 
         warnings: list[str] = []
         slot_id_str = slot_id
@@ -489,21 +494,70 @@ def register_slot_routes(app: Flask) -> None:
             warnings.append("No model specified in preflight; using slot default.")
 
         # Validate GPU devices
-        gpu_err = None
         gpu_str = str(gpu_devices).strip()
         if gpu_str != "all":
             if not re.match(r"^[0-9]+(,[0-9]+)*$", gpu_str):
                 return _json_error("invalid_gpu_devices", "Invalid GPU device list", 400)
 
-        # Validate tensor split
+        # ── Parse and validate tensor_split ──────────────────────────────────
+        # If tensor_split is None (not provided by frontend and not in slot),
+        # treat as "auto" — valid but not echoed.
+        requested_tensor_split = payload.get("tensor_split", None)
         ts_str = str(tensor_split).strip()
-        if ts_str != "auto":
-            ts_parts = ts_str.split(",")
+        tensor_split_valid = True
+        ts_count = 0
+
+        if ts_str == "auto":
+            # Auto mode — always valid, no count to check
+            tensor_split_valid = True
+            ts_count = 0
+        elif ts_str:
+            # Parse as comma-separated numeric values
+            ts_parts = [p.strip() for p in ts_str.split(",")]
+            parsed_ts: list[float] = []
             for p in ts_parts:
+                if not p:
+                    # Empty entry in comma-separated list
+                    return _json_error(
+                        "invalid_tensor_split",
+                        "tensor_split contains an empty value",
+                        400,
+                    )
                 try:
-                    float(p.strip())
+                    parsed_ts.append(float(p))
                 except ValueError:
-                    return _json_error("invalid_tensor_split", "Invalid tensor_split value", 400)
+                    return _json_error(
+                        "invalid_tensor_split",
+                        f"tensor_split contains non-numeric value: '{p}'",
+                        400,
+                    )
+            ts_count = len(parsed_ts)
+            tensor_split_valid = True
+        else:
+            # Empty string — treat as auto
+            ts_str = "auto"
+            ts_count = 0
+
+        # ── Extra args conflict handling ─────────────────────────────────────
+        # If tensor_split is explicitly set (not "auto"), check for conflicting
+        # --tensor-split or -ts in extra_args.
+        tensor_split_conflict_warning = None
+        if ts_str != "auto" and isinstance(extra_args, list):
+            for arg in extra_args:
+                arg_str = str(arg).strip()
+                if arg_str in ("--tensor-split", "-ts"):
+                    tensor_split_conflict_warning = (
+                        f"Ignoring {arg_str} from extra_args because tensor_split field is set"
+                    )
+                    warnings.append(tensor_split_conflict_warning)
+                    break
+                # Handle --tensor-split=value form
+                if arg_str.startswith("--tensor-split="):
+                    tensor_split_conflict_warning = (
+                        "Ignoring --tensor-split from extra_args because tensor_split field is set"
+                    )
+                    warnings.append(tensor_split_conflict_warning)
+                    break
 
         # GPU summary
         gpu_summary = collect_gpu_summary()
@@ -560,7 +614,17 @@ def register_slot_routes(app: Flask) -> None:
                 )
 
         # Resolve effective GPU devices
-        effective_gpu = resolve_gpu_devices(gpu_str)
+        # When gpu_devices="all", derive from gpu_summary if available
+        # (avoids calling detect_usable_gpus() directly, which would bypass mocks)
+        if gpu_str.lower() == "all":
+            effective_gpu = gpu_summary.get("usable_gpu_devices", "") or ""
+            if not effective_gpu:
+                # Fallback: try the system-level resolver
+                effective_gpu = resolve_gpu_devices(gpu_str)
+        else:
+            effective_gpu = resolve_gpu_devices(gpu_str)
+
+        effective_gpu_count = len([d for d in effective_gpu.split(",") if d.strip()]) if effective_gpu else 0
 
         # Embeddings on non-primary
         if embeddings and slot_data.get("purpose") != "primary":
@@ -568,29 +632,73 @@ def register_slot_routes(app: Flask) -> None:
                 "Embeddings enabled on a non-primary slot. This may increase VRAM usage."
             )
 
-        # Tensor split vs GPU count mismatch
-        if ts_str != "auto" and gpu_str != "all":
-            gpu_count = len(gpu_str.split(","))
-            ts_count = len(ts_str.split(","))
-            if ts_count != gpu_count:
+        # Tensor split vs effective GPU count validation
+        tensor_split_ok = True
+        if ts_str != "auto" and ts_count > 0:
+            # When gpu_devices is "all", effective_gpu_count reflects usable GPUs
+            # When gpu_devices is explicit, count those GPUs
+            if gpu_str == "all":
+                check_count = effective_gpu_count
+            else:
+                check_count = len([d for d in gpu_str.split(",") if d.strip()])
+
+            if ts_count != check_count:
                 warnings.append(
-                    f"tensor_split has {ts_count} values but {gpu_count} GPUs selected. "
+                    f"tensor_split has {ts_count} values but {check_count} GPU(s) selected. "
                     "Values should match GPU count."
                 )
+                # For explicit count mismatch, mark as not OK but still return
+                # the preflight with ok=true and a clear warning.
+                # The frontend should not silently accept this.
+                tensor_split_ok = False
 
-        # Port availability
+        # ── Build launch_args_preview ────────────────────────────────────────
+        # Pre-assemble args that would be passed to llama.cpp on launch.
+        # This is structured so future args (--ctx-size, --parallel,
+        # --cache-type-k, --cache-type-v) can be added cleanly.
+        launch_args_preview: list[str] = []
+        if ts_str != "auto" and ts_count > 0:
+            launch_args_preview.extend(["--tensor-split", ts_str])
+        # Future: launch_args_preview.extend(["--parallel", str(parallel)])
+        # Future: launch_args_preview.extend(["--cache-type-k", cache_type_k])
+        # Future: launch_args_preview.extend(["--cache-type-v", cache_type_v])
+
+        # ── Build suggested_tensor_splits ────────────────────────────────────
+        suggested_splits = compute_suggested_tensor_splits(gpu_summary, effective_gpu_count)
+
+        # ── Port / container availability ────────────────────────────────────
         host_port = payload.get("host_port") or slot_data.get("host_port", 8080)
-        port_available = port_is_available(int(host_port), exclude_slot_id=slot_id)
+        host_port_int = int(host_port)
+        port_available = port_is_available(host_port_int, exclude_slot_id=slot_id)
+        port_conflict = None
         if not port_available:
-            warnings.append(f"Port {host_port} is already in use by another slot.")
+            conflict_info = find_port_conflict(host_port_int, exclude_slot_id=slot_id)
+            if conflict_info:
+                conflict_slot_id = conflict_info.get("slot_id", "unknown")
+                warnings.append(
+                    f"Port {host_port} conflicts with slot '{conflict_slot_id}'."
+                )
+                port_conflict = conflict_info
+            else:
+                warnings.append(f"Port {host_port} is already in use.")
 
-        # Container name availability
         container_name = payload.get("container_name") or slot_data.get("container_name", "")
         name_available = docker_name_is_available(container_name, exclude_slot_id=slot_id)
+        container_name_conflict = None
         if not name_available:
-            warnings.append(f"Container name '{container_name}' is already in use.")
+            conflict_info = find_container_name_conflict(container_name, exclude_slot_id=slot_id)
+            if conflict_info:
+                conflict_slot_id = conflict_info.get("slot_id", "unknown")
+                warnings.append(
+                    f"Container name '{container_name}' conflicts with slot '{conflict_slot_id}'."
+                )
+                container_name_conflict = conflict_info
+            else:
+                warnings.append(f"Container name '{container_name}' is already in use.")
 
-        return jsonify({
+        # ── Build response ───────────────────────────────────────────────────
+        # Echo requested_tensor_split only if the frontend explicitly sent it.
+        resp: dict[str, Any] = {
             "ok": True,
             "slot_id": slot_id_str,
             "model": model,
@@ -598,6 +706,7 @@ def register_slot_routes(app: Flask) -> None:
             "gpu_devices": gpu_devices,
             "requested_gpu_devices": gpu_str,
             "effective_gpu_devices": effective_gpu,
+            "effective_gpu_count": effective_gpu_count,
             "model_size_bytes": model_size,
             "model_size_human": _format_bytes_human(model_size) if model_size > 0 else "N/A",
             "free_vram_mb": free_vram,
@@ -605,7 +714,21 @@ def register_slot_routes(app: Flask) -> None:
             "port_available": port_available,
             "container_name_available": name_available,
             "warnings": warnings,
-        })
+            # ── tensor_split echo ──────────────────────────────────────────
+            "requested_tensor_split": requested_tensor_split,
+            "tensor_split": ts_str if ts_str != "auto" else None,
+            "tensor_split_valid": tensor_split_valid and tensor_split_ok,
+            "tensor_split_entry_count": ts_count if ts_str != "auto" else None,
+            # ── launch args preview ────────────────────────────────────────
+            "launch_args_preview": launch_args_preview,
+            # ── suggested tensor splits ────────────────────────────────────
+            "suggested_tensor_splits": suggested_splits,
+            # ── conflict info ──────────────────────────────────────────────
+            "port_conflict": port_conflict,
+            "container_name_conflict": container_name_conflict,
+        }
+
+        return jsonify(resp)
 
     # --- GET /api/v1/qonduit-router/endpoints ---
     @app.get("/api/v1/qonduit-router/endpoints")
