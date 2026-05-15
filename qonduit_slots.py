@@ -131,17 +131,14 @@ def _validate_gpu_devices(gpu_devices: Any) -> Optional[str]:
 def _validate_tensor_split(tensor_split: Any) -> Optional[str]:
     """Return error string if tensor_split is invalid, else None.
 
-    None, empty string, and "auto" are all valid — they mean
-    "clear the tensor_split field" (use llama.cpp defaults).
+    None and empty string are valid clear values. The literal "auto" is
+    still accepted for callers that already rely on backend auto-splitting.
     """
     if tensor_split is None:
-        return None  # cleared / not set — valid
-    ts_str = str(tensor_split).strip()
-    if ts_str == "auto":
         return None
-    if ts_str == "":
-        return None  # empty string also means cleared
-    # Must be comma-separated numeric values
+    ts_str = str(tensor_split).strip()
+    if ts_str == "" or ts_str == "auto":
+        return None
     parts = ts_str.split(",")
     for part in parts:
         part = part.strip()
@@ -153,6 +150,18 @@ def _validate_tensor_split(tensor_split: Any) -> Optional[str]:
                 "comma-separated numeric values like \"0.5,0.5\""
             )
     return None
+
+
+def _normalize_tensor_split(tensor_split: Any) -> Optional[str]:
+    """Normalize a valid tensor_split value for persistence.
+
+    ``None`` and blank strings clear the saved value. Non-empty values are
+    trimmed before they are stored. Callers must validate before normalizing.
+    """
+    if tensor_split is None:
+        return None
+    ts_str = str(tensor_split).strip()
+    return ts_str or None
 
 
 def _validate_extra_args(extra_args: Any) -> Optional[str]:
@@ -490,6 +499,7 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
     err = _validate_tensor_split(tensor_split)
     if err:
         return {}, err
+    tensor_split = _normalize_tensor_split(tensor_split)
 
     extra_args = payload.get("extra_args", [])
     err = _validate_extra_args(extra_args)
@@ -588,9 +598,11 @@ def update_slot(
     for field in updatable:
         if field in payload:
             value = payload[field]
-            # Normalize None/empty tensor_split to "auto" for consistency
-            if field == "tensor_split" and (value is None or str(value).strip() == ""):
-                value = "auto"
+            if field == "tensor_split":
+                err = _validate_tensor_split(value)
+                if err:
+                    return {}, err
+                value = _normalize_tensor_split(value)
             slot[field] = value
 
     # Re-derive derived fields if host or host_port changed

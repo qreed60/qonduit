@@ -240,8 +240,8 @@ def launch_slot_container(
         tensor_split = slot["tensor_split"]
         tensor_split_cleared = tensor_split is None or str(tensor_split).strip() == ""
     else:
-        tensor_split = "auto"
-        tensor_split_cleared = False
+        tensor_split = None
+        tensor_split_cleared = True
     embeddings = launch_payload.get("embeddings_enabled") or slot.get("embeddings_enabled", False)
     extra_args = launch_payload.get("extra_args") or slot.get("extra_args", [])
 
