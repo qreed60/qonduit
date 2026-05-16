@@ -52,6 +52,8 @@ from qonduit_docker_helpers import (
     compute_suggested_tensor_splits,
     resolve_gpu_devices,
     docker_available,
+    probe_llama_server_flags,
+    estimate_kv_cache_mib,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -477,6 +479,19 @@ def register_slot_routes(app: Flask) -> None:
         embeddings = payload.get("embeddings_enabled") or slot_data.get("embeddings_enabled", False)
         extra_args = payload.get("extra_args") or slot_data.get("extra_args", [])
 
+        # ── New fields: parallel_slots, cache_type_k, cache_type_v ───────────
+        parallel_slots = int(
+            payload.get("parallel_slots") or slot_data.get("parallel_slots", 1),
+        )
+        cache_type_k = payload.get("cache_type_k") or slot_data.get("cache_type_k", "f16")
+        cache_type_v = payload.get("cache_type_v") or slot_data.get("cache_type_v", "f16")
+
+        # Defaults for omitted cache type values
+        if not cache_type_k or str(cache_type_k).strip() == "":
+            cache_type_k = "f16"
+        if not cache_type_v or str(cache_type_v).strip() == "":
+            cache_type_v = "f16"
+
         warnings: list[str] = []
         slot_id_str = slot_id
 
@@ -632,6 +647,23 @@ def register_slot_routes(app: Flask) -> None:
                 "Embeddings enabled on a non-primary slot. This may increase VRAM usage."
             )
 
+        # Parallel slots context sharing warning
+        effective_context_per_slot = max(1, context_size // max(1, parallel_slots))
+        if parallel_slots > 1:
+            warnings.append(
+                f"Context is shared across parallel slots. Effective guaranteed "
+                f"context per slot is approximately context_size / parallel_slots "
+                f"({effective_context_per_slot} tokens)."
+            )
+
+        # KV cache estimate
+        kv_cache_estimate = estimate_kv_cache_mib(
+            context_size=context_size,
+            parallel_slots=parallel_slots,
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
+        )
+
         # Tensor split vs effective GPU count validation
         tensor_split_ok = True
         if ts_str != "auto" and ts_count > 0:
@@ -654,14 +686,23 @@ def register_slot_routes(app: Flask) -> None:
 
         # ── Build launch_args_preview ────────────────────────────────────────
         # Pre-assemble args that would be passed to llama.cpp on launch.
-        # This is structured so future args (--ctx-size, --parallel,
-        # --cache-type-k, --cache-type-v) can be added cleanly.
         launch_args_preview: list[str] = []
         if ts_str != "auto" and ts_count > 0:
             launch_args_preview.extend(["--tensor-split", ts_str])
-        # Future: launch_args_preview.extend(["--parallel", str(parallel)])
-        # Future: launch_args_preview.extend(["--cache-type-k", cache_type_k])
-        # Future: launch_args_preview.extend(["--cache-type-v", cache_type_v])
+
+        # Parallel flag
+        parallel_flag = "--parallel"
+        probe_cache = probe_llama_server_flags()
+        if probe_cache.get("detected_parallel") == "-np":
+            parallel_flag = "-np"
+        elif probe_cache.get("detected_parallel") == "--parallel":
+            parallel_flag = "--parallel"
+        if parallel_slots > 1:
+            launch_args_preview.extend([parallel_flag, str(parallel_slots)])
+
+        # Cache type flags
+        launch_args_preview.extend(["--cache-type-k", cache_type_k])
+        launch_args_preview.extend(["--cache-type-v", cache_type_v])
 
         # ── Build suggested_tensor_splits ────────────────────────────────────
         suggested_splits = compute_suggested_tensor_splits(gpu_summary, effective_gpu_count)
@@ -719,6 +760,14 @@ def register_slot_routes(app: Flask) -> None:
             "tensor_split": ts_str if ts_str != "auto" else None,
             "tensor_split_valid": tensor_split_valid and tensor_split_ok,
             "tensor_split_entry_count": ts_count if ts_str != "auto" else None,
+            # ── parallel / cache type echo ─────────────────────────────────
+            "requested_parallel_slots": payload.get("parallel_slots", None),
+            "parallel_slots": parallel_slots,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
+            "effective_context_per_parallel_slot": effective_context_per_slot,
+            # ── KV cache estimate ──────────────────────────────────────────
+            "kv_cache_estimate": kv_cache_estimate,
             # ── launch args preview ────────────────────────────────────────
             "launch_args_preview": launch_args_preview,
             # ── suggested tensor splits ────────────────────────────────────
@@ -729,6 +778,43 @@ def register_slot_routes(app: Flask) -> None:
         }
 
         return jsonify(resp)
+
+    # --- GET /api/v1/qonduit-router/slot-options ---
+    @app.get("/api/v1/qonduit-router/slot-options")
+    def slot_options():
+        denied = _require_router_access()
+        if denied:
+            return denied
+
+        probe_cache = probe_llama_server_flags()
+        detected_parallel = probe_cache.get("detected_parallel", "--parallel")
+
+        return jsonify({
+            "ok": True,
+            "parallel": {
+                "field": "parallel_slots",
+                "default": 1,
+                "min": 1,
+                "max": 16,
+                "preferred_flag": "--parallel",
+                "detected_flag": detected_parallel,
+                "fallback_flags": ["-np"],
+                "context_semantics": (
+                    "context_size is shared across parallel slots; "
+                    "effective_context_per_parallel_slot = floor(context_size / parallel_slots)"
+                ),
+            },
+            "cache_types": {
+                "allowed": [
+                    "f32", "f16", "bf16", "q8_0", "q4_0",
+                    "q4_1", "iq4_nl", "q5_0", "q5_1",
+                ],
+                "default_k": "f16",
+                "default_v": "f16",
+                "cache_type_k_flag": "--cache-type-k",
+                "cache_type_v_flag": "--cache-type-v",
+            },
+        })
 
     # --- GET /api/v1/qonduit-router/endpoints ---
     @app.get("/api/v1/qonduit-router/endpoints")

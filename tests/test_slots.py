@@ -2392,7 +2392,7 @@ class TestRouterAccessControl:
     def test_delete_slots_restricted_by_access(self, app_client, monkeypatch):
         """DELETE /slots/<slot_id> is also restricted by router access control."""
         monkeypatch.setenv("QONDUIT_ROUTER_ALLOW_LAN", "false")
-        resp = self._delete_with_ip(app_client, "/api/v1/qonduit-router/slots/primary", "192.168.1.1")
+        resp = self._delete_with_ip(app_client, "/api/v1/qonduit-router/slots", "192.168.1.1")
         assert resp.status_code == 403
         data = resp.get_json()
         assert data["error"] == "router_access_denied"
@@ -2918,3 +2918,945 @@ class TestComputeSuggestedTensorSplits:
         raw = result["free_vram_weighted_raw"]
         assert raw == "23000"
         assert result["free_vram_weighted_normalized"] == "225"
+# ── Tests for parallel_slots, cache_type_k, cache_type_v ─────────────────────
+
+
+class TestParallelSlotsValidation:
+    """Tests for parallel_slots validation and defaults."""
+
+    def test_create_slot_with_parallel_slots(self, _fresh_slots):
+        """Slot creation accepts parallel_slots field."""
+        from qonduit_slots import load_slots, create_slot
+        new_slot, err = create_slot({
+            "slot_id": "parallel-slot",
+            "host_port": 8099,
+            "parallel_slots": 4,
+        })
+        assert err is None
+        assert new_slot["parallel_slots"] == 4
+
+    def test_create_slot_default_parallel_slots(self, _fresh_slots):
+        """parallel_slots defaults to 1 when omitted."""
+        from qonduit_slots import load_slots, create_slot
+        new_slot, err = create_slot({
+            "slot_id": "no-parallel",
+            "host_port": 8098,
+        })
+        assert err is None
+        assert new_slot["parallel_slots"] == 1
+
+    def test_reject_parallel_slots_zero(self, _fresh_slots):
+        """parallel_slots = 0 is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-parallel",
+            "host_port": 8097,
+            "parallel_slots": 0,
+        })
+        assert err == "invalid_slot"
+
+    def test_reject_parallel_slots_negative(self, _fresh_slots):
+        """parallel_slots < 0 is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-parallel",
+            "host_port": 8096,
+            "parallel_slots": -1,
+        })
+        assert err == "invalid_slot"
+
+    def test_reject_parallel_slots_too_high(self, _fresh_slots):
+        """parallel_slots > 16 is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-parallel",
+            "host_port": 8095,
+            "parallel_slots": 17,
+        })
+        assert err == "invalid_slot"
+
+    def test_accept_parallel_slots_max(self, _fresh_slots):
+        """parallel_slots = 16 is accepted."""
+        from qonduit_slots import load_slots, create_slot
+        new_slot, err = create_slot({
+            "slot_id": "max-parallel",
+            "host_port": 8094,
+            "parallel_slots": 16,
+        })
+        assert err is None
+        assert new_slot["parallel_slots"] == 16
+
+    def test_reject_parallel_slots_float(self, _fresh_slots):
+        """parallel_slots must be integer, float is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "float-parallel",
+            "host_port": 8093,
+            "parallel_slots": 2.5,
+        })
+        assert err == "invalid_slot"
+
+    def test_reject_parallel_slots_string(self, _fresh_slots):
+        """parallel_slots must be integer, string is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "str-parallel",
+            "host_port": 8092,
+            "parallel_slots": "4",
+        })
+        assert err == "invalid_slot"
+
+
+class TestCacheTypeValidation:
+    """Tests for cache_type_k and cache_type_v validation."""
+
+    def test_create_slot_with_cache_types(self, _fresh_slots):
+        """Slot creation accepts cache_type_k and cache_type_v."""
+        from qonduit_slots import load_slots, create_slot
+        new_slot, err = create_slot({
+            "slot_id": "cache-slot",
+            "host_port": 8091,
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q4_0",
+        })
+        assert err is None
+        assert new_slot["cache_type_k"] == "q8_0"
+        assert new_slot["cache_type_v"] == "q4_0"
+
+    def test_create_slot_default_cache_types(self, _fresh_slots):
+        """cache_type_k and cache_type_v default to f16 when omitted."""
+        from qonduit_slots import load_slots, create_slot
+        new_slot, err = create_slot({
+            "slot_id": "default-cache",
+            "host_port": 8090,
+        })
+        assert err is None
+        assert new_slot["cache_type_k"] == "f16"
+        assert new_slot["cache_type_v"] == "f16"
+
+    def test_reject_invalid_cache_type_k(self, _fresh_slots):
+        """Invalid cache_type_k is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-k",
+            "host_port": 8089,
+            "cache_type_k": "invalid",
+        })
+        assert err == "invalid_slot"
+
+    def test_reject_invalid_cache_type_v(self, _fresh_slots):
+        """Invalid cache_type_v is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-v",
+            "host_port": 8088,
+            "cache_type_v": "invalid",
+        })
+        assert err == "invalid_slot"
+
+    def test_allow_all_cache_types(self, _fresh_slots):
+        """All allowed cache types are accepted."""
+        allowed = ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
+        from qonduit_slots import create_slot
+        for cache_type in allowed:
+            new_slot, err = create_slot({
+                "slot_id": f"cache-{cache_type.replace('_', '-')}",
+                "host_port": 8200 + allowed.index(cache_type),
+                "cache_type_k": cache_type,
+                "cache_type_v": cache_type,
+            })
+            assert err is None, f"Failed for cache_type={cache_type}"
+            assert new_slot["cache_type_k"] == cache_type
+
+    def test_cache_types_case_insensitive(self, _fresh_slots):
+        """Cache types are normalized to lowercase."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "upper-cache",
+            "host_port": 8087,
+            "cache_type_k": "Q8_0",
+            "cache_type_v": "F16",
+        })
+        assert err is None
+        assert new_slot["cache_type_k"] == "q8_0"
+        assert new_slot["cache_type_v"] == "f16"
+
+
+class TestSlotPatchParallelCache:
+    """Tests for PATCH endpoint with parallel_slots and cache types."""
+
+    def test_patch_parallel_slots(self, app_client):
+        """PATCH can update parallel_slots."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8081, "parallel_slots": 4},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"parallel_slots": 8},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["parallel_slots"] == 8
+
+    def test_patch_cache_types(self, app_client):
+        """PATCH can update cache_type_k and cache_type_v."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8082},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"cache_type_k": "q8_0", "cache_type_v": "q4_0"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["cache_type_k"] == "q8_0"
+        assert data["cache_type_v"] == "q4_0"
+
+    def test_patch_omit_parallel_preserves_value(self, app_client):
+        """PATCH without parallel_slots preserves existing value."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8083, "parallel_slots": 4},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"display_name": "updated"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["parallel_slots"] == 4
+
+    def test_patch_omit_cache_preserves_value(self, app_client):
+        """PATCH without cache types preserves existing values."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8084, "cache_type_k": "q8_0", "cache_type_v": "q4_0"},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"display_name": "updated"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["cache_type_k"] == "q8_0"
+        assert data["cache_type_v"] == "q4_0"
+
+    def test_patch_null_cache_resets_to_default(self, app_client):
+        """PATCH with explicit null cache_type resets to f16."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8085, "cache_type_k": "q8_0", "cache_type_v": "q4_0"},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"cache_type_k": None, "cache_type_v": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["cache_type_k"] == "f16"
+        assert data["cache_type_v"] == "f16"
+
+    def test_patch_empty_string_cache_resets_to_default(self, app_client):
+        """PATCH with empty string cache_type resets to f16."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8086, "cache_type_k": "q8_0", "cache_type_v": "q4_0"},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"cache_type_k": "", "cache_type_v": ""},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["cache_type_k"] == "f16"
+        assert data["cache_type_v"] == "f16"
+
+    def test_patch_null_parallel_resets_to_default(self, app_client):
+        """PATCH with explicit null parallel_slots resets to 1."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8087, "parallel_slots": 4},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"parallel_slots": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["parallel_slots"] == 1
+
+    def test_reject_patch_invalid_parallel_slots(self, app_client):
+        """PATCH rejects invalid parallel_slots."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8088},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"parallel_slots": 0},
+        )
+        assert resp.status_code == 400
+
+    def test_reject_patch_invalid_cache_type(self, app_client):
+        """PATCH rejects invalid cache_type."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8089},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"cache_type_k": "invalid"},
+        )
+        assert resp.status_code == 400
+
+
+class TestSlotOptionsEndpoint:
+    """Tests for GET /slot-options endpoint."""
+
+    def test_slot_options_endpoint(self, app_client):
+        """GET /slot-options returns correct metadata."""
+        resp = app_client.get("/api/v1/qonduit-router/slot-options")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+
+        parallel = data["parallel"]
+        assert parallel["field"] == "parallel_slots"
+        assert parallel["default"] == 1
+        assert parallel["min"] == 1
+        assert parallel["max"] == 16
+        assert "--parallel" in parallel["preferred_flag"]
+
+        cache_types = data["cache_types"]
+        assert "f16" in cache_types["allowed"]
+        assert "q8_0" in cache_types["allowed"]
+        assert cache_types["default_k"] == "f16"
+        assert cache_types["default_v"] == "f16"
+        assert "--cache-type-k" in cache_types["cache_type_k_flag"]
+        assert "--cache-type-v" in cache_types["cache_type_v_flag"]
+
+
+class TestPreflightParallelCache:
+    """Tests for preflight with parallel_slots and cache types."""
+
+    def test_preflight_includes_effective_context(self, app_client):
+        """Preflight with parallel_slots includes effective_context_per_parallel_slot."""
+        _known_models.add("/mnt/models/llm/test-model.gguf")
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-preflight-ctx/preflight",
+            json={
+                "model": "test-model.gguf",
+                "context_size": 65536,
+                "parallel_slots": 2,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["parallel_slots"] == 2
+        assert data["effective_context_per_parallel_slot"] == 32768
+
+    def test_preflight_includes_kv_cache_estimate(self, app_client):
+        """Preflight includes kv_cache_estimate object."""
+        _known_models.add("/mnt/models/llm/test-kv.gguf")
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-preflight-kv/preflight",
+            json={
+                "model": "test-kv.gguf",
+                "context_size": 65536,
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "kv_cache_estimate" in data
+        estimate = data["kv_cache_estimate"]
+        assert estimate["ok"] is True
+        assert estimate["context_size"] == 65536
+        assert estimate["parallel_slots"] == 2
+        assert estimate["effective_context_per_parallel_slot"] == 32768
+        assert estimate["cache_type_k"] == "q8_0"
+        assert estimate["cache_type_v"] == "q8_0"
+        assert "estimated_kv_cache_mib" in estimate
+        assert "estimated_kv_cache_f16_mib" in estimate
+        assert "estimated_savings_vs_f16_mib" in estimate
+        assert "estimated_savings_vs_f16_percent" in estimate
+
+    def test_preflight_includes_parallel_warning(self, app_client):
+        """Preflight warns when parallel_slots > 1."""
+        # Create slot first
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "test-preflight-warn", "host_port": 8100},
+        )
+        assert resp.status_code == 201
+        _known_models.add("/mnt/models/llm/test-warn.gguf")
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-preflight-warn/preflight",
+            json={
+                "model": "test-warn.gguf",
+                "context_size": 65536,
+                "parallel_slots": 4,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        warnings = data.get("warnings", [])
+        assert any("shared" in w.lower() for w in warnings)
+
+    def test_preflight_launch_args_preview(self, app_client):
+        """Preflight launch_args_preview includes parallel and cache type flags."""
+        # Create slot first
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "test-preflight-preview", "host_port": 8101},
+        )
+        assert resp.status_code == 201
+        _known_models.add("/mnt/models/llm/test-preview.gguf")
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-preflight-preview/preflight",
+            json={
+                "model": "test-preview.gguf",
+                "context_size": 65536,
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q4_0",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        preview = data.get("launch_args_preview", [])
+        preview_str = " ".join(preview)
+        assert any("--parallel" in flag or "-np" in flag for flag in preview)
+        assert "--cache-type-k" in preview_str or "q8_0" in preview
+        assert "--cache-type-v" in preview_str or "q4_0" in preview
+
+    def test_preflight_request_uses_overrides(self, app_client):
+        """Preflight request fields override slot stored values."""
+        # Create slot with defaults
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "test-preflight-override", "host_port": 8090},
+        )
+        assert resp.status_code == 201
+
+        # Preflight with different values
+        _known_models.add("/mnt/models/llm/test-over.gguf")
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-preflight-override/preflight",
+            json={
+                "model": "test-over.gguf",
+                "context_size": 32768,
+                "parallel_slots": 3,
+                "cache_type_k": "q5_0",
+                "cache_type_v": "q5_1",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["parallel_slots"] == 3
+        assert data["cache_type_k"] == "q5_0"
+        assert data["cache_type_v"] == "q5_1"
+        assert data["effective_context_per_parallel_slot"] == 10922  # 32768 // 3
+
+
+class TestKVCacheEstimate:
+    """Tests for estimate_kv_cache_mib function."""
+
+    def test_estimate_basic(self):
+        """estimate_kv_cache_mib returns correct structure."""
+        from qonduit_docker_helpers import estimate_kv_cache_mib
+        result = estimate_kv_cache_mib(65536, 1, "f16", "f16")
+        assert result["ok"] is True
+        assert result["estimate_confidence"] == "heuristic"
+        assert result["context_size"] == 65536
+        assert result["parallel_slots"] == 1
+        assert result["effective_context_per_parallel_slot"] == 65536
+        assert result["cache_type_k"] == "f16"
+        assert result["cache_type_v"] == "f16"
+        assert result["baseline_cache_type_k"] == "f16"
+        assert result["baseline_cache_type_v"] == "f16"
+        assert result["estimated_kv_cache_mib"] > 0
+        assert result["estimated_kv_cache_f16_mib"] > 0
+
+    def test_estimate_with_metadata(self):
+        """estimate_kv_cache_mib uses metadata for exact calculation."""
+        from qonduit_docker_helpers import estimate_kv_cache_mib
+        result = estimate_kv_cache_mib(
+            65536, 1, "f16", "f16",
+            n_layers=32, n_embd=4096, head_dim=128, num_key_value_heads=32,
+        )
+        assert result["estimate_confidence"] == "exact"
+        assert result["estimated_kv_cache_mib"] > 0
+
+    def test_estimate_q8_saves_vs_f16(self):
+        """q8_0 cache type shows savings vs f16 baseline."""
+        from qonduit_docker_helpers import estimate_kv_cache_mib
+        q8_result = estimate_kv_cache_mib(65536, 1, "q8_0", "q8_0")
+        f16_result = estimate_kv_cache_mib(65536, 1, "f16", "f16")
+        assert q8_result["estimated_kv_cache_mib"] < f16_result["estimated_kv_cache_mib"]
+        assert q8_result["estimated_savings_vs_f16_percent"] > 0
+
+    def test_estimate_parallel_reduces_cache(self):
+        """Increasing parallel_slots reduces effective cache per slot."""
+        from qonduit_docker_helpers import estimate_kv_cache_mib
+        result_1 = estimate_kv_cache_mib(65536, 1, "f16", "f16")
+        result_2 = estimate_kv_cache_mib(65536, 2, "f16", "f16")
+        assert result_1["effective_context_per_parallel_slot"] == 65536
+        assert result_2["effective_context_per_parallel_slot"] == 32768
+        assert result_2["estimated_kv_cache_mib"] < result_1["estimated_kv_cache_mib"]
+
+    def test_estimate_unknown_type_falls_back_to_f16(self):
+        """Unknown cache type falls back to f16 byte multiplier."""
+        from qonduit_docker_helpers import estimate_kv_cache_mib
+        result = estimate_kv_cache_mib(65536, 1, "unknown", "unknown")
+        assert result["cache_type_k"] == "unknown"
+        # Should use f16 fallback bytes (2.0)
+        assert result["estimated_kv_cache_mib"] > 0
+
+    def test_estimate_savings_calculation(self):
+        """Savings calculation is correct."""
+        from qonduit_docker_helpers import estimate_kv_cache_mib
+        # f32 = 4 bytes per element, f16 = 2 bytes
+        # f32+f32 = 8 bytes vs f16+f16 = 4 bytes -> f32 should be MORE, not savings
+        f32_result = estimate_kv_cache_mib(65536, 1, "f32", "f32")
+        assert f32_result["estimated_kv_cache_mib"] > 0
+        # q4_0 = 0.5 bytes, so should be much smaller
+        q4_result = estimate_kv_cache_mib(65536, 1, "q4_0", "q4_0")
+        assert q4_result["estimated_kv_cache_mib"] < f32_result["estimated_kv_cache_mib"]
+
+
+class TestLaunchFlagsParallelCache:
+    """Tests for launch command with parallel_slots and cache types."""
+
+    def test_launch_args_include_parallel_flag(self, app_client, monkeypatch):
+        """Launch command includes --parallel flag when parallel_slots > 1."""
+        # Create slot first
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "test-launch-parallel", "host_port": 8110},
+        )
+        assert resp.status_code == 201
+        _known_models.add("/mnt/models/llm/test-launch-parallel.gguf")
+
+        # Mock docker run to capture the command
+        captured_cmd = []
+        def mock_run(cmd, *args, **kwargs):
+            captured_cmd.append(cmd)
+            return MagicMock(returncode=0, stdout=b"test", stderr=b"")
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        monkeypatch.setattr("qonduit_docker_helpers._get_docker_version", lambda: "25.0.0")
+
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-launch-parallel/slot",
+            json={
+                "model": "test-launch-parallel.gguf",
+                "parallel_slots": 4,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q4_0",
+            },
+        )
+        assert resp.status_code == 200
+
+        # Verify the command was called
+        assert len(captured_cmd) > 0
+        cmd_str = " ".join(captured_cmd[-1])
+        assert "--parallel" in cmd_str or "-np" in cmd_str
+        assert "4" in cmd_str
+
+    def test_launch_args_include_cache_type_flags(self, app_client, monkeypatch):
+        """Launch command includes --cache-type-k and --cache-type-v flags."""
+        # Create slot first
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "test-launch-cache", "host_port": 8111},
+        )
+        assert resp.status_code == 201
+        _known_models.add("/mnt/models/llm/test-launch-cache.gguf")
+
+        captured_cmd = []
+        def mock_run(cmd, *args, **kwargs):
+            captured_cmd.append(cmd)
+            return MagicMock(returncode=0, stdout=b"test", stderr=b"")
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+        monkeypatch.setattr("qonduit_docker_helpers._get_docker_version", lambda: "25.0.0")
+
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-launch-cache/slot",
+            json={
+                "model": "test-launch-cache.gguf",
+                "cache_type_k": "bf16",
+                "cache_type_v": "q8_0",
+            },
+        )
+        assert resp.status_code == 200
+
+        assert len(captured_cmd) > 0
+        cmd_str = " ".join(captured_cmd[-1])
+        assert "--cache-type-k" in cmd_str
+        assert "bf16" in cmd_str
+        assert "--cache-type-v" in cmd_str
+        assert "q8_0" in cmd_str
+
+
+class TestProbeLlamaServerFlags:
+    """Tests for llama-server flag probing."""
+
+    def test_probe_default_fallback(self):
+        """probe_llama_server_flags returns fallback flags when llama-server not found."""
+        from qonduit_docker_helpers import probe_llama_server_flags
+        result = probe_llama_server_flags()
+        assert result["parallel_flag"] == "--parallel"
+        assert result["cache_type_k_flag"] == "--cache-type-k"
+        assert result["cache_type_v_flag"] == "--cache-type-v"
+
+    def test_probe_with_mock_help(self):
+        """probe_llama_server_flags detects flags from llama-server --help output."""
+        from qonduit_docker_helpers import probe_llama_server_flags
+
+        help_output = b"""
+llama-server --help
+Usage: llama-server [options]
+
+Options:
+  -h, --help            Show help
+  --parallel N          Number of parallel sequences to run
+  -np N                 Number of parallel sequences (deprecated)
+  --cache-type-k TYPE   KV cache data type for K (f32, f16, q8_0, q4_0)
+  --cache-type-v TYPE   KV cache data type for V (f32, f16, q8_0, q4_0)
+"""
+        def mock_run(cmd, capture_output=True, *args, **kwargs):
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = help_output
+            mock_result.stderr = b""
+            return mock_result
+
+        with patch("subprocess.run", mock_run):
+            result = probe_llama_server_flags()
+            assert result["parallel_flag"] == "--parallel"
+            assert result["cache_type_k_flag"] == "--cache-type-k"
+            assert result["cache_type_v_flag"] == "--cache-type-v"
+
+    def test_probe_fallback_to_np(self):
+        """probe_llama_server_flags falls back to -np when --parallel not found."""
+        from qonduit_docker_helpers import probe_llama_server_flags
+
+        help_output = b"""
+llama-server --help
+Usage: llama-server [options]
+  -np N                 Number of parallel sequences
+"""
+        def mock_run(cmd, capture_output=True, *args, **kwargs):
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = help_output
+            mock_result.stderr = b""
+            return mock_result
+
+        with patch("subprocess.run", mock_run):
+            result = probe_llama_server_flags()
+            assert result["parallel_flag"] == "-np"
+
+
+class TestBackwardCompatibilityNewFields:
+    """Tests for backward compatibility with existing slots missing new fields."""
+
+    def test_old_slots_normalized_on_get(self, app_client):
+        """GET /slots normalizes old slots without new fields."""
+        import json
+        from qonduit_slots import _QONDUIT_SLOTS_FILE
+        # Write a slot without new fields (simulating old slot)
+        old_slot = {
+            "slot_id": "legacy",
+            "model": "test.gguf",
+            "host_port": 8091,
+            "container_name": "llama_server_legacy",
+            "status": "stopped",
+            "gpu_devices": "all",
+            "tensor_split": "auto",
+            "context_size": 4096,
+            "embeddings_enabled": False,
+            "created_at": "2024-01-01T00:00:00Z",
+        }
+        with open(_QONDUIT_SLOTS_FILE, "w") as f:
+            json.dump([old_slot], f)
+
+        resp = app_client.get("/api/v1/qonduit-router/slots")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        legacy_slot = [s for s in data["slots"] if s["slot_id"] == "legacy"][0]
+        assert legacy_slot["parallel_slots"] == 1
+        assert legacy_slot["cache_type_k"] == "f16"
+        assert legacy_slot["cache_type_v"] == "f16"
+
+    def test_old_slot_preflight_uses_defaults(self, app_client):
+        """Preflight on old slot uses default parallel/cache values."""
+        import json
+        from qonduit_slots import _QONDUIT_SLOTS_FILE
+        _known_models.add("/mnt/models/llm/test-legacy-preflight.gguf")
+        old_slot = {
+            "slot_id": "legacy-preflight",
+            "model": "test-legacy-preflight.gguf",
+            "host_port": 8092,
+            "container_name": "llama_server_legacy-preflight",
+            "status": "stopped",
+            "gpu_devices": "all",
+            "tensor_split": "auto",
+            "context_size": 65536,
+            "embeddings_enabled": False,
+            "created_at": "2024-01-01T00:00:00Z",
+        }
+        with open(_QONDUIT_SLOTS_FILE, "w") as f:
+            json.dump([old_slot], f)
+
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/legacy-preflight/preflight",
+            json={"model": "test-legacy-preflight.gguf", "context_size": 65536},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["parallel_slots"] == 1
+        assert data["effective_context_per_parallel_slot"] == 65536
+
+
+class TestTensorSplitNoRegression:
+    """Verify tensor_split behavior is not broken by new field changes."""
+
+    def test_tensor_split_omitted_preserved(self, app_client):
+        """PATCH without tensor_split preserves existing value."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8093, "tensor_split": "1,2,3"},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"display_name": "updated"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["tensor_split"] == "1,2,3"
+
+    def test_tensor_split_null_clears(self, app_client):
+        """PATCH with null tensor_split clears it."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8094, "tensor_split": "1,2"},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"tensor_split": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["tensor_split"] is None
+
+    def test_tensor_split_empty_clears(self, app_client):
+        """PATCH with empty string tensor_split clears it."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8095, "tensor_split": "1,2"},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"tensor_split": ""},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["tensor_split"] is None
+
+    def test_tensor_split_nonempty_updates(self, app_client):
+        """PATCH with new tensor_split value updates it."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8096, "tensor_split": "1,2"},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"tensor_split": "3,4,5"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["tensor_split"] == "3,4,5"
+
+    def test_tensor_split_auto_computed_in_preflight(self, app_client, monkeypatch):
+        """Preflight with tensor_split=auto includes suggested splits."""
+        _known_models.add("/mnt/models/llm/test-ts-auto.gguf")
+
+        gpu_summary = {
+            "ok": True,
+            "gpus": [
+                {"index": 0, "name": "GPU0", "memory_total_mib": 24000,
+                 "memory_used_mib": 1000, "memory_free_mib": 23000},
+                {"index": 1, "name": "GPU1", "memory_total_mib": 24000,
+                 "memory_used_mib": 2000, "memory_free_mib": 22000},
+            ],
+            "usable_gpu_indices": "0,1",
+            "usable_gpu_devices": "0,1",
+        }
+
+        def mock_docker_available():
+            return True
+
+        def mock_collect_gpu():
+            return gpu_summary
+
+        monkeypatch.setattr("qonduit_docker_helpers.docker_available", mock_docker_available)
+        monkeypatch.setattr("qonduit_docker_helpers.collect_gpu_summary", mock_collect_gpu)
+
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/test-ts-auto/preflight",
+            json={
+                "model": "test-ts-auto.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "auto",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "suggested_tensor_splits" in data
+
+
+class TestContextSizeField:
+    """Tests for context_size field in slot operations."""
+
+    def test_create_slot_with_context_size(self, _fresh_slots):
+        """Slot creation accepts context_size field."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "ctx-slot",
+            "host_port": 8097,
+            "context_size": 131072,
+        })
+        assert err is None
+        assert new_slot["context_size"] == 131072
+
+    def test_create_slot_default_context_size(self, _fresh_slots):
+        """context_size defaults to 65536 when omitted."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "ctx-default",
+            "host_port": 8098,
+        })
+        assert err is None
+        assert new_slot["context_size"] == 65536
+
+    def test_patch_context_size(self, app_client):
+        """PATCH can update context_size."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8099, "context_size": 8192},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"context_size": 32768},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["context_size"] == 32768
+
+
+class TestEmbeddingsField:
+    """Tests for embeddings_enabled field."""
+
+    def test_create_slot_with_embeddings(self, _fresh_slots):
+        """Slot creation accepts embeddings_enabled field."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "emb-slot",
+            "host_port": 8100,
+            "embeddings_enabled": True,
+        })
+        assert err is None
+        assert new_slot["embeddings_enabled"] is True
+
+    def test_create_slot_default_embeddings(self, _fresh_slots):
+        """embeddings_enabled defaults to False when omitted."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "emb-default",
+            "host_port": 8101,
+        })
+        assert err is None
+        assert new_slot["embeddings_enabled"] is False
+
+    def test_patch_embeddings(self, app_client):
+        """PATCH can update embeddings_enabled."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"host_port": 8102, "embeddings_enabled": False},
+        )
+        assert resp.status_code == 201
+        slot_data = resp.get_json()
+        slot_id = slot_data["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"embeddings_enabled": True},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["embeddings_enabled"] is True
+

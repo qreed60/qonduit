@@ -31,6 +31,32 @@ _QONDUIT_DEFAULT_HOST = os.getenv("QONDUIT_DEFAULT_HOST", "192.168.5.5")
 # Legacy container name for primary slot
 _PRIMARY_CONTAINER_NAME = "llama_server"
 
+# ── Parallel slots & KV cache constants ──────────────────────────────────────
+
+_ALLOWED_CACHE_TYPES: list[str] = [
+    "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+]
+
+_DEFAULT_CACHE_TYPE_K = "f16"
+_DEFAULT_CACHE_TYPE_V = "f16"
+
+_DEFAULT_PARALLEL_SLOTS = 1
+_MIN_PARALLEL_SLOTS = 1
+_MAX_PARALLEL_SLOTS = 16
+
+# Byte multipliers per element for KV cache estimate
+_KV_CACHE_BYTES: dict[str, float] = {
+    "f32": 4.0,
+    "f16": 2.0,
+    "bf16": 2.0,
+    "q8_0": 1.0,
+    "q5_0": 0.625,
+    "q5_1": 0.625,
+    "q4_0": 0.5,
+    "q4_1": 0.5,
+    "iq4_nl": 0.5,
+}
+
 def _format_bytes_human(nbytes: int) -> str:
     if nbytes < 0:
         return '0 B'
@@ -200,6 +226,42 @@ def _validate_embeddings(embeddings_enabled: Any) -> Optional[str]:
     return None
 
 
+def _validate_parallel_slots(parallel_slots: Any) -> Optional[str]:
+    """Return error string if parallel_slots is invalid, else None.
+
+    Accepts None (treated as default). Rejects bools, floats, strings, etc.
+    """
+    if parallel_slots is None:
+        return None
+    if not isinstance(parallel_slots, int) or isinstance(parallel_slots, bool):
+        return "parallel_slots must be an integer"
+    if parallel_slots < _MIN_PARALLEL_SLOTS or parallel_slots > _MAX_PARALLEL_SLOTS:
+        return (
+            f"parallel_slots must be between {_MIN_PARALLEL_SLOTS} and "
+            f"{_MAX_PARALLEL_SLOTS}"
+        )
+    return None
+
+
+def _validate_cache_type(cache_type: Any) -> Optional[str]:
+    """Return error string if cache_type is invalid, else None.
+
+    Accepts None or empty string (treated as default f16 reset).
+    """
+    if cache_type is None:
+        return None
+    if isinstance(cache_type, (int, float)):
+        return "cache_type must be a string"
+    val = str(cache_type).strip().lower()
+    if not val:
+        return None  # empty → reset to default
+    if val not in _ALLOWED_CACHE_TYPES:
+        return (
+            f"cache_type must be one of: {_ALLOWED_CACHE_TYPES}"
+        )
+    return None
+
+
 def validate_slot(slot: dict[str, Any]) -> list[dict[str, str]]:
     """Validate a slot dict. Return list of errors (empty if valid)."""
     errors: list[dict[str, str]] = []
@@ -263,6 +325,21 @@ def validate_slot(slot: dict[str, Any]) -> list[dict[str, str]]:
     if err:
         errors.append({"field": "embeddings_enabled", "message": err})
 
+    # parallel_slots
+    err = _validate_parallel_slots(slot.get("parallel_slots"))
+    if err:
+        errors.append({"field": "parallel_slots", "message": err})
+
+    # cache_type_k
+    err = _validate_cache_type(slot.get("cache_type_k"))
+    if err:
+        errors.append({"field": "cache_type_k", "message": err})
+
+    # cache_type_v
+    err = _validate_cache_type(slot.get("cache_type_v"))
+    if err:
+        errors.append({"field": "cache_type_v", "message": err})
+
     return errors
 
 
@@ -287,6 +364,9 @@ def _build_default_slot() -> dict[str, Any]:
         "tensor_split": "auto",
         "embeddings_enabled": True,
         "extra_args": [],
+        "parallel_slots": _DEFAULT_PARALLEL_SLOTS,
+        "cache_type_k": _DEFAULT_CACHE_TYPE_K,
+        "cache_type_v": _DEFAULT_CACHE_TYPE_V,
         "running": False,
         "exists": False,
         "ready": False,
@@ -508,6 +588,43 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
 
     embeddings_enabled = payload.get("embeddings_enabled", False)
 
+    # Parallel slots
+    if "parallel_slots" in payload:
+        parallel_slots = payload["parallel_slots"]
+        if isinstance(parallel_slots, bool):
+            return {}, "invalid_slot"
+        try:
+            parallel_slots = int(parallel_slots)
+        except (ValueError, TypeError):
+            return {}, "invalid_slot"
+        if parallel_slots < _MIN_PARALLEL_SLOTS or parallel_slots > _MAX_PARALLEL_SLOTS:
+            return {}, "invalid_slot"
+    else:
+        parallel_slots = _DEFAULT_PARALLEL_SLOTS
+
+    # Cache types
+    if "cache_type_k" in payload:
+        raw_k = payload["cache_type_k"]
+        if raw_k is None or (isinstance(raw_k, str) and not raw_k.strip()):
+            cache_type_k = _DEFAULT_CACHE_TYPE_K
+        else:
+            cache_type_k = str(raw_k).strip().lower()
+            if cache_type_k not in _ALLOWED_CACHE_TYPES:
+                return {}, "invalid_slot"
+    else:
+        cache_type_k = _DEFAULT_CACHE_TYPE_K
+
+    if "cache_type_v" in payload:
+        raw_v = payload["cache_type_v"]
+        if raw_v is None or (isinstance(raw_v, str) and not raw_v.strip()):
+            cache_type_v = _DEFAULT_CACHE_TYPE_V
+        else:
+            cache_type_v = str(raw_v).strip().lower()
+            if cache_type_v not in _ALLOWED_CACHE_TYPES:
+                return {}, "invalid_slot"
+    else:
+        cache_type_v = _DEFAULT_CACHE_TYPE_V
+
     display_name = (payload.get("display_name") or slot_id).strip()
     if not display_name:
         display_name = slot_id
@@ -536,6 +653,9 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
         "tensor_split": tensor_split,
         "embeddings_enabled": bool(embeddings_enabled),
         "extra_args": extra_args,
+        "parallel_slots": parallel_slots,
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v,
         "running": False,
         "exists": False,
         "ready": False,
@@ -593,6 +713,9 @@ def update_slot(
         "context_size",
         "gpu_devices",
         "tensor_split",
+        "parallel_slots",
+        "cache_type_k",
+        "cache_type_v",
     ]
 
     for field in updatable:
@@ -603,6 +726,34 @@ def update_slot(
                 if err:
                     return {}, err
                 value = _normalize_tensor_split(value)
+            # PATCH explicit null/empty for cache types → reset to default f16
+            elif field == "cache_type_k":
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    value = _DEFAULT_CACHE_TYPE_K
+                else:
+                    value = str(value).strip().lower()
+                    if value not in _ALLOWED_CACHE_TYPES:
+                        return {}, "invalid_slot"
+            elif field == "cache_type_v":
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    value = _DEFAULT_CACHE_TYPE_V
+                else:
+                    value = str(value).strip().lower()
+                    if value not in _ALLOWED_CACHE_TYPES:
+                        return {}, "invalid_slot"
+            # PATCH explicit null/empty for parallel_slots → reset to default 1
+            elif field == "parallel_slots":
+                if value is None:
+                    value = _DEFAULT_PARALLEL_SLOTS
+                elif isinstance(value, bool):
+                    return {}, "invalid_slot"
+                else:
+                    try:
+                        value = int(value)
+                    except (ValueError, TypeError):
+                        return {}, "invalid_slot"
+                if value < _MIN_PARALLEL_SLOTS or value > _MAX_PARALLEL_SLOTS:
+                    return {}, "invalid_slot"
             slot[field] = value
 
     # Re-derive derived fields if host or host_port changed
@@ -662,13 +813,27 @@ def delete_slot(
 
 # ── Live status helpers ──────────────────────────────────────────────────────
 
+def _normalize_slot_fields(slot: dict[str, Any]) -> dict[str, Any]:
+    """Ensure new fields have defaults for slots created before this feature."""
+    if "parallel_slots" not in slot:
+        slot["parallel_slots"] = _DEFAULT_PARALLEL_SLOTS
+    if "cache_type_k" not in slot:
+        slot["cache_type_k"] = _DEFAULT_CACHE_TYPE_K
+    if "cache_type_v" not in slot:
+        slot["cache_type_v"] = _DEFAULT_CACHE_TYPE_V
+    return slot
+
+
 def slot_to_live_status(slot: dict[str, Any]) -> dict[str, Any]:
     """
     Merge persisted slot config with live Docker/status information.
     Returns a new dict with updated running/exists/ready fields
     and effective_gpu_devices resolved from gpu_devices.
+
+    New fields (parallel_slots, cache_type_k, cache_type_v) are
+    normalized to their defaults when absent from persisted data.
     """
-    result = dict(slot)
+    result = _normalize_slot_fields(dict(slot))
     try:
         from qonduit_docker_helpers import (
             container_exists,

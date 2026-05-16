@@ -64,6 +64,21 @@ def _docker_name_filter(name: str) -> str:
     return f"name=/{name}"
 
 
+def docker_available() -> bool:
+    """Check if Docker daemon is reachable and responsive."""
+    try:
+        result = subprocess.run(
+            ["sudo", "docker", "info"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        return False
+
+
 # ── Container existence/running checks ───────────────────────────────────────
 
 def container_exists(slot: dict[str, Any]) -> bool:
@@ -245,6 +260,24 @@ def launch_slot_container(
     embeddings = launch_payload.get("embeddings_enabled") or slot.get("embeddings_enabled", False)
     extra_args = launch_payload.get("extra_args") or slot.get("extra_args", [])
 
+    # Determine parallel_slots (default 1)
+    parallel_slots = int(
+        launch_payload.get("parallel_slots") or slot.get("parallel_slots", 1),
+    )
+    if parallel_slots < 1:
+        parallel_slots = 1
+    if parallel_slots > 16:
+        parallel_slots = 16
+
+    # Determine cache types (default f16)
+    cache_type_k = (launch_payload.get("cache_type_k") or slot.get("cache_type_k", "f16") or "f16").strip().lower()
+    cache_type_v = (launch_payload.get("cache_type_v") or slot.get("cache_type_v", "f16") or "f16").strip().lower()
+    _ALLOWED = ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
+    if cache_type_k not in _ALLOWED:
+        cache_type_k = "f16"
+    if cache_type_v not in _ALLOWED:
+        cache_type_v = "f16"
+
     # Compute tensor split value from resolved GPUs
     if tensor_split_cleared:
         split_val = None
@@ -297,11 +330,22 @@ def launch_slot_container(
         "--host", "0.0.0.0",
         "--port", str(slot.get("internal_port", 8080)),
     ]
+
+    # Parallel slots flag
+    if parallel_slots > 1:
+        cmd.extend(["--parallel", str(parallel_slots)])
+
     if split_val is not None:
         cmd.extend(["--tensor-split", split_val])
 
     if embeddings:
         cmd.append("--embeddings")
+
+    # Cache type flags
+    if cache_type_k:
+        cmd.extend(["--cache-type-k", cache_type_k])
+    if cache_type_v:
+        cmd.extend(["--cache-type-v", cache_type_v])
 
     cmd.extend(filtered_extra_args)
 
@@ -356,6 +400,9 @@ def launch_slot_container(
             "tensor_split": tensor_split,
             "embeddings_enabled": bool(embeddings),
             "extra_args": extra_args,
+            "parallel_slots": parallel_slots,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
         }, force=True)
 
         # Update timestamps
@@ -960,9 +1007,247 @@ def validate_gpu_devices(gpu_devices: Any, all_available: Optional[list[int]] = 
     return None
 
 
-# ── Docker availability ──────────────────────────────────────────────────────
+# ── llama.cpp flag probing ───────────────────────────────────────────────────
 
-def docker_available() -> bool:
-    """Check if Docker daemon is reachable."""
-    result = _docker_run(["info"], timeout=5)
-    return result.returncode == 0
+# Cached flag support detection (set by probe_llama_server_flags)
+_llama_server_flag_cache: dict[str, Any] | None = None
+
+
+def probe_llama_server_flags() -> dict[str, Any]:
+    """Probe the installed llama-server for supported flags.
+
+    Returns a dict with:
+      - "parallel_flag": detected parallel flag or "unknown"
+      - "cache_type_k_flag": detected cache-type-k flag or "unknown"
+      - "cache_type_v_flag": detected cache-type-v flag or "unknown"
+      - "probed": True/False
+
+    If probing fails, returns defaults without raising.
+    """
+    global _llama_server_flag_cache
+    if _llama_server_flag_cache is not None:
+        return dict(_llama_server_flag_cache)
+
+    result: dict[str, Any] = {
+        "parallel_flag": "--parallel",
+        "cache_type_k_flag": "--cache-type-k",
+        "cache_type_v_flag": "--cache-type-v",
+        "probed": False,
+    }
+
+    try:
+        # Try to run llama-server --help inside a dummy container or from PATH
+        # First try docker image (common way llama-server is deployed)
+        images_to_try = [
+            # Common llama.cpp container image names
+            "ghcr.io/ggerganov/llama.cpp",
+            # Try any running llama-server container to inspect its help
+        ]
+
+        help_text = ""
+
+        # Try to find llama-server in docker images
+        for img in images_to_try:
+            try:
+                inspect = subprocess.run(
+                    ["docker", "image", "inspect", img,
+                     "--format", "{{.Config.Cmd}}"],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                if inspect.returncode == 0 and inspect.stdout.strip():
+                    result_text = subprocess.run(
+                        ["docker", "run", "--rm", img, "--help"],
+                        capture_output=True, text=True, check=False, timeout=15,
+                    )
+                    if result_text.returncode == 0:
+                        help_text = result_text.stdout
+                        break
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
+
+        # Fallback: try running llama-server directly from PATH
+        if not help_text:
+            try:
+                result_text = subprocess.run(
+                    ["llama-server", "--help"],
+                    capture_output=True, text=True, check=False, timeout=15,
+                )
+                if result_text.returncode == 0:
+                    help_text = result_text.stdout
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+        # Fallback: try llama.cpp server from common paths
+        if not help_text:
+            common_paths = [
+                "/usr/local/bin/llama-server",
+                "/usr/bin/llama-server",
+                "./llama-server",
+            ]
+            for path in common_paths:
+                try:
+                    result_text = subprocess.run(
+                        [path, "--help"],
+                        capture_output=True, text=True, check=False, timeout=15,
+                    )
+                    if result_text.returncode == 0:
+                        help_text = result_text.stdout
+                        break
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    continue
+
+        if help_text:
+            result["probed"] = True
+            # Check for --parallel flag
+            if "--parallel" in help_text:
+                result["parallel_flag"] = "--parallel"
+            elif "-np" in help_text or "--num-processor" in help_text:
+                result["parallel_flag"] = "-np"
+            # Check for cache type flags
+            if "--cache-type-k" in help_text:
+                result["cache_type_k_flag"] = "--cache-type-k"
+            if "--cache-type-v" in help_text:
+                result["cache_type_v_flag"] = "--cache-type-v"
+        else:
+            result["probed"] = False
+            result["warning"] = "llama-server help text unavailable; using default flag assumptions"
+
+    except Exception as e:
+        result["warning"] = f"flag probing failed: {e}"
+
+    _llama_server_flag_cache = result
+    return result
+
+
+def reset_flag_probe_cache() -> None:
+    """Clear the flag probe cache (useful for testing)."""
+    global _llama_server_flag_cache
+    _llama_server_flag_cache = None
+
+
+# ── KV cache estimate ────────────────────────────────────────────────────────
+
+# Byte multipliers per element for each cache type (for K or V tensor)
+_CACHE_TYPE_BYTES: dict[str, float] = {
+    "f32": 4.0,
+    "f16": 2.0,
+    "bf16": 2.0,
+    "q8_0": 1.0,
+    "q5_0": 0.625,
+    "q5_1": 0.625,
+    "q4_0": 0.5,
+    "q4_1": 0.5,
+    "iq4_nl": 0.5,
+}
+
+# Baseline: f16 for both K and V = 2.0 + 2.0 = 4.0 bytes per element
+_BASELINE_CACHE_BYTES = 4.0
+
+
+def estimate_kv_cache_mib(
+    context_size: int,
+    parallel_slots: int,
+    cache_type_k: str,
+    cache_type_v: str,
+    n_layers: int | None = None,
+    n_embd: int | None = None,
+    head_dim: int | None = None,
+    num_key_value_heads: int | None = None,
+) -> dict[str, Any]:
+    """Estimate KV cache memory usage in MiB.
+
+    Uses model metadata (n_layers, n_embd, etc.) if provided for exact
+    calculation. Falls back to a heuristic based on context_size if
+    metadata is unavailable.
+
+    Returns dict with:
+      - ok: True
+      - estimate_confidence: "exact" or "heuristic"
+      - context_size, parallel_slots, effective_context_per_parallel_slot
+      - cache_type_k, cache_type_v, baseline_cache_type_k, baseline_cache_type_v
+      - estimated_kv_cache_mib: current estimate
+      - estimated_kv_cache_f16_mib: baseline f16/f16 estimate
+      - estimated_savings_vs_f16_mib: absolute savings
+      - estimated_savings_vs_f16_percent: percentage savings
+      - warning (optional): if heuristic
+    """
+    effective_ctx = max(1, context_size // max(1, parallel_slots))
+
+    # Determine byte multipliers
+    bytes_k = _CACHE_TYPE_BYTES.get(cache_type_k, _CACHE_TYPE_BYTES["f16"])
+    bytes_v = _CACHE_TYPE_BYTES.get(cache_type_v, _CACHE_TYPE_BYTES["f16"])
+    baseline_bytes_k = _CACHE_TYPE_BYTES.get("f16", 2.0)
+    baseline_bytes_v = _CACHE_TYPE_BYTES.get("f16", 2.0)
+
+    current_bytes_per_element = bytes_k + bytes_v
+    baseline_bytes_per_element = baseline_bytes_k + baseline_bytes_v
+
+    if n_layers is not None and n_embd is not None:
+        # Exact calculation using model metadata
+        # KV cache shape per layer: [2, context, n_kv_heads, head_dim]
+        # Total KV cache elements = 2 * n_layers * effective_ctx * (n_kv_heads * head_dim)
+        # But n_kv_heads * head_dim = n_embd / n_heads * n_kv_heads ...
+        # Simplified: KV cache per layer ≈ 2 * effective_ctx * n_embd (for full attention)
+        # For GQA/MQA, KV is smaller, but we use a conservative estimate
+        n_kv_heads = num_key_value_heads
+        if n_kv_heads is None:
+            # Assume MHA (n_kv_heads == n_heads) for conservative estimate
+            n_heads_est = max(1, n_embd // (head_dim or 128))
+            n_kv_heads = n_heads_est
+
+        # KV cache elements = n_layers * effective_ctx * n_kv_heads * head_dim
+        # For MHA: n_kv_heads * head_dim = n_embd
+        # KV cache bytes = elements * (bytes_k + bytes_v)
+        kv_elements = n_layers * effective_ctx * n_embd
+        kv_bytes = kv_elements * current_bytes_per_element
+        confidence = "exact"
+    else:
+        # Heuristic: estimate n_layers from context_size
+        # Conservative: assume ~32 layers for a mid-size model
+        # KV cache ≈ elements * (bytes_k + bytes_v)
+        # We estimate n_layers * n_embd ≈ 32 * 4096 (conservative heuristic)
+        est_n_layers = 32
+        est_n_embd = 4096
+        kv_elements = est_n_layers * effective_ctx * est_n_embd
+        kv_bytes = kv_elements * current_bytes_per_element
+        confidence = "heuristic"
+
+    # Baseline: f16/f16 = 4.0 bytes per element
+    if n_layers is not None and n_embd is not None:
+        baseline_elements = n_layers * effective_ctx * n_embd
+    else:
+        baseline_elements = 32 * effective_ctx * 4096
+    baseline_bytes = baseline_elements * _BASELINE_CACHE_BYTES
+
+    # Convert bytes to MiB
+    exact_mib = kv_bytes / (1024 * 1024)
+    baseline_mib = baseline_bytes / (1024 * 1024)
+
+    savings_mib = max(0, baseline_mib - exact_mib)
+    savings_percent = (
+        100 * (1 - exact_mib / baseline_mib) if baseline_mib > 0 else 0
+    )
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "estimate_confidence": confidence,
+        "context_size": context_size,
+        "parallel_slots": parallel_slots,
+        "effective_context_per_parallel_slot": effective_ctx,
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v,
+        "baseline_cache_type_k": "f16",
+        "baseline_cache_type_v": "f16",
+        "estimated_kv_cache_mib": round(exact_mib, 2),
+        "estimated_kv_cache_f16_mib": round(baseline_mib, 2),
+        "estimated_savings_vs_f16_mib": round(savings_mib, 2),
+        "estimated_savings_vs_f16_percent": round(savings_percent, 1),
+    }
+
+    if confidence == "heuristic":
+        result["warning"] = (
+            "KV cache estimate is heuristic (model metadata unavailable). "
+            "Actual usage may differ."
+        )
+
+    return result
