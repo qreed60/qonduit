@@ -14,6 +14,7 @@ Tests cover:
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -3859,4 +3860,897 @@ class TestEmbeddingsField:
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["embeddings_enabled"] is True
+
+
+# ── Phase 6: Batch Size / Micro-Batch Size Tests ────────────────────────────
+
+class TestBatchSizeValidation:
+    """Tests for batch_size and ubatch_size validation in qonduit_slots."""
+
+    def test_create_slot_with_batch_size(self, _fresh_slots):
+        """Create slot with explicit batch_size."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "batch-test",
+            "host_port": 8110,
+            "batch_size": 4096,
+        })
+        assert err is None
+        assert new_slot["batch_size"] == 4096
+
+    def test_create_slot_with_ubatch_size(self, _fresh_slots):
+        """Create slot with explicit ubatch_size."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "ubatch-test",
+            "host_port": 8111,
+            "ubatch_size": 1024,
+        })
+        assert err is None
+        assert new_slot["ubatch_size"] == 1024
+
+    def test_create_slot_with_both_batch_fields(self, _fresh_slots):
+        """Create slot with both batch_size and ubatch_size."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "both-batch",
+            "host_port": 8112,
+            "batch_size": 8192,
+            "ubatch_size": 2048,
+        })
+        assert err is None
+        assert new_slot["batch_size"] == 8192
+        assert new_slot["ubatch_size"] == 2048
+
+    def test_create_slot_default_batch_size(self, _fresh_slots):
+        """Batch defaults to 8192 when not specified."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "default-batch",
+            "host_port": 8113,
+        })
+        assert err is None
+        assert new_slot["batch_size"] == 8192
+
+    def test_create_slot_default_ubatch_size(self, _fresh_slots):
+        """Ubath defaults to 2048 when not specified."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "default-ubatch",
+            "host_port": 8114,
+        })
+        assert err is None
+        assert new_slot["ubatch_size"] == 2048
+
+    def test_reject_batch_size_non_integer_string(self, _fresh_slots):
+        """Non-numeric batch_size string is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-batch-str",
+            "host_port": 8115,
+            "batch_size": "not-a-number",
+        })
+        assert err is not None
+        assert "batch_size must be a positive integer" in err
+
+    def test_reject_ubatch_size_non_integer_string(self, _fresh_slots):
+        """Non-numeric ubatch_size string is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-ubatch-str",
+            "host_port": 8116,
+            "ubatch_size": "abc",
+        })
+        assert err is not None
+        assert "ubatch_size must be a positive integer" in err
+
+    def test_reject_batch_size_zero(self, _fresh_slots):
+        """batch_size of 0 is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "zero-batch",
+            "host_port": 8117,
+            "batch_size": 0,
+        })
+        assert err is not None
+        assert "batch_size must be a positive integer" in err
+
+    def test_reject_ubatch_size_zero(self, _fresh_slots):
+        """ubatch_size of 0 is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "zero-ubatch",
+            "host_port": 8118,
+            "ubatch_size": 0,
+        })
+        assert err is not None
+        assert "ubatch_size must be a positive integer" in err
+
+    def test_reject_batch_size_negative(self, _fresh_slots):
+        """Negative batch_size is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "neg-batch",
+            "host_port": 8119,
+            "batch_size": -1,
+        })
+        assert err is not None
+
+    def test_reject_ubatch_size_negative(self, _fresh_slots):
+        """Negative ubatch_size is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "neg-ubatch",
+            "host_port": 8120,
+            "ubatch_size": -1,
+        })
+        assert err is not None
+
+    def test_reject_ubatch_size_greater_than_batch(self, _fresh_slots):
+        """ubatch_size > batch_size is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "ubatch-gt-batch",
+            "host_port": 8121,
+            "batch_size": 1024,
+            "ubatch_size": 4096,
+        })
+        assert err is not None
+        assert "ubatch_size must not exceed batch_size" in err
+
+    def test_reject_batch_size_bool(self, _fresh_slots):
+        """Boolean batch_size is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bool-batch",
+            "host_port": 8122,
+            "batch_size": True,
+        })
+        assert err is not None
+
+    def test_reject_ubatch_size_bool(self, _fresh_slots):
+        """Boolean ubatch_size is rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bool-ubatch",
+            "host_port": 8123,
+            "ubatch_size": False,
+        })
+        assert err is not None
+
+    def test_batch_size_validated_in_update(self, _fresh_slots):
+        """PATCH rejects invalid batch_size."""
+        from qonduit_slots import create_slot, update_slot
+        new_slot, _ = create_slot({"slot_id": "upd-batch", "host_port": 8124})
+        _, err = update_slot("upd-batch", {"batch_size": -5})
+        assert err is not None
+
+    def test_ubatch_size_validated_in_update(self, _fresh_slots):
+        """PATCH rejects invalid ubatch_size."""
+        from qonduit_slots import create_slot, update_slot
+        new_slot, _ = create_slot({"slot_id": "upd-ubatch", "host_port": 8125})
+        _, err = update_slot("upd-ubatch", {"ubatch_size": 0})
+        assert err is not None
+
+
+class TestSlotPatchBatchSize:
+    """PATCH behavior for batch_size and ubatch_size."""
+
+    def test_patch_batch_size(self, app_client):
+        """PATCH can update batch_size."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-1", "host_port": 8130},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"batch_size": 4096},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["batch_size"] == 4096
+
+    def test_patch_ubatch_size(self, app_client):
+        """PATCH can update ubatch_size."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-2", "host_port": 8131},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"ubatch_size": 512},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["ubatch_size"] == 512
+
+    def test_patch_omit_batch_preserves_value(self, app_client):
+        """Omitted batch_size in PATCH preserves existing value."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-3", "host_port": 8132, "batch_size": 4096},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"display_name": "renamed"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["batch_size"] == 4096
+        assert data["slot"]["display_name"] == "renamed"
+
+    def test_patch_omit_ubatch_preserves_value(self, app_client):
+        """Omitted ubatch_size in PATCH preserves existing value."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-4", "host_port": 8133, "ubatch_size": 1024},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"display_name": "renamed2"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["ubatch_size"] == 1024
+
+    def test_patch_null_batch_resets_to_default(self, app_client):
+        """PATCH batch_size=null resets to default 8192."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-5", "host_port": 8134, "batch_size": 4096},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"batch_size": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["batch_size"] == 8192
+
+    def test_patch_empty_string_batch_resets_to_default(self, app_client):
+        """PATCH batch_size="" resets to default 8192."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-6", "host_port": 8135, "batch_size": 4096},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"batch_size": ""},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["batch_size"] == 8192
+
+    def test_patch_null_ubatch_resets_to_default(self, app_client):
+        """PATCH ubatch_size=null resets to default 2048."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-7", "host_port": 8136, "ubatch_size": 1024},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"ubatch_size": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["ubatch_size"] == 2048
+
+    def test_patch_empty_string_ubatch_resets_to_default(self, app_client):
+        """PATCH ubatch_size="" resets to default 2048."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-test-8", "host_port": 8137, "ubatch_size": 1024},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"ubatch_size": ""},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["ubatch_size"] == 2048
+
+
+class TestBatchSizePreflightLaunch:
+    """Preflight and launch behavior for batch_size/ubatch_size."""
+
+    def test_preflight_echoes_batch_size(self, app_client, monkeypatch):
+        """Preflight response includes batch_size and ubatch_size."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-preflight-1", "host_port": 8140},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/preflight",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["batch_size"] == 4096
+        assert data["ubatch_size"] == 1024
+
+    def test_preflight_launch_args_includes_batch_flags(self, app_client, monkeypatch):
+        """Preflight launch_args_preview includes --batch-size and --ubatch-size."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-preflight-2", "host_port": 8141},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/preflight",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "batch_size": 8192,
+                "ubatch_size": 2048,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        preview = data.get("launch_args_preview", [])
+        # launch_args_preview is a flat list: ["--batch-size", "8192", "--ubatch-size", "2048", ...]
+        assert "--batch-size" in preview
+        batch_idx = preview.index("--batch-size")
+        assert preview[batch_idx + 1] == "8192"
+        assert "--ubatch-size" in preview
+        ubatch_idx = preview.index("--ubatch-size")
+        assert preview[ubatch_idx + 1] == "2048"
+
+    def test_launch_command_includes_batch_flags(self, app_client, monkeypatch):
+        """Actual launch command includes --batch-size and --ubatch-size."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-launch-1", "host_port": 8142},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "abc123"
+        mock_result.stderr = ""
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_result)
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.port_is_available",
+            lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.docker_name_is_available",
+            lambda *a, **kw: True,
+        )
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/launch",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "batch_size": 4096,
+                "ubatch_size": 512,
+            },
+        )
+        assert resp.status_code == 200
+
+        # Verify subprocess.run was called with batch flags
+        call_args = subprocess.run.call_args
+        cmd = call_args[0][0]
+        cmd_str = " ".join(str(c) for c in cmd)
+        assert "--batch-size" in cmd_str
+        assert "4096" in cmd_str
+        assert "--ubatch-size" in cmd_str
+        assert "512" in cmd_str
+
+    def test_extra_args_conflict_batch_size(self, app_client, monkeypatch):
+        """Conflicting --batch-size in extra_args is handled without duplicate flags."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-conflict-1", "host_port": 8143},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "abc123"
+        mock_result.stderr = ""
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_result)
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.port_is_available",
+            lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.docker_name_is_available",
+            lambda *a, **kw: True,
+        )
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/launch",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+                "extra_args": ["--batch-size", "9999"],
+            },
+        )
+        assert resp.status_code == 200
+
+        call_args = subprocess.run.call_args
+        cmd = call_args[0][0]
+        cmd_str = " ".join(str(c) for c in cmd)
+        # Should only have the first-class value, not the extra_args value
+        assert cmd_str.count("--batch-size") == 1
+        assert "--batch-size" in cmd_str
+        assert "4096" in cmd_str
+
+    def test_extra_args_conflict_ubatch_size(self, app_client, monkeypatch):
+        """Conflicting --ubatch-size in extra_args is handled without duplicate flags."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "batch-conflict-2", "host_port": 8144},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "abc123"
+        mock_result.stderr = ""
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_result)
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.port_is_available",
+            lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.docker_name_is_available",
+            lambda *a, **kw: True,
+        )
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/launch",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+                "extra_args": ["--ubatch-size", "9999"],
+            },
+        )
+        assert resp.status_code == 200
+
+        call_args = subprocess.run.call_args
+        cmd = call_args[0][0]
+        cmd_str = " ".join(str(c) for c in cmd)
+        assert cmd_str.count("--ubatch-size") == 1
+        assert "--ubatch-size" in cmd_str
+        assert "1024" in cmd_str
+
+
+class TestCombinedPerformanceFields:
+    """Combined validation of tensor_split + parallel_slots + cache_type + batch_size."""
+
+    def test_combined_preflight_all_fields(self, app_client, monkeypatch):
+        """Preflight echoes all six performance fields together."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "combined-preflight-1", "host_port": 8150},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/preflight",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "2,2,2",
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "batch_size": 8192,
+                "ubatch_size": 2048,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["tensor_split"] == "2,2,2"
+        assert data["parallel_slots"] == 2
+        assert data["cache_type_k"] == "q8_0"
+        assert data["cache_type_v"] == "q8_0"
+        assert data["batch_size"] == 8192
+        assert data["ubatch_size"] == 2048
+
+    def test_combined_launch_args_preview_all_flags(self, app_client, monkeypatch):
+        """launch_args_preview includes all expected flags together."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "combined-preflight-2", "host_port": 8151},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/preflight",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "2,2,2",
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        preview = data.get("launch_args_preview", [])
+
+        preview_dict = dict(zip(preview[0::2], preview[1::2])) if isinstance(preview, list) else preview
+        assert "--batch-size" in preview_dict
+        assert "--ubatch-size" in preview_dict
+        assert "--cache-type-k" in preview_dict
+        assert "--cache-type-v" in preview_dict
+
+    def test_combined_patch_persists_all_fields(self, app_client):
+        """PATCH persists all six performance fields together."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "combined-patch-1", "host_port": 8152},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={
+                "tensor_split": "3,3,3",
+                "parallel_slots": 3,
+                "cache_type_k": "bf16",
+                "cache_type_v": "bf16",
+                "batch_size": 2048,
+                "ubatch_size": 512,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["tensor_split"] == "3,3,3"
+        assert data["slot"]["parallel_slots"] == 3
+        assert data["slot"]["cache_type_k"] == "bf16"
+        assert data["slot"]["cache_type_v"] == "bf16"
+        assert data["slot"]["batch_size"] == 2048
+        assert data["slot"]["ubatch_size"] == 512
+
+    def test_clear_batch_size_does_not_affect_other_fields(self, app_client):
+        """Clearing batch_size/ubatch_size does not alter other performance fields."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={
+                "slot_id": "combined-patch-2",
+                "host_port": 8153,
+                "tensor_split": "2,2",
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+            },
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        # Patch only batch fields to defaults
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"batch_size": None, "ubatch_size": ""},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["batch_size"] == 8192
+        assert data["slot"]["ubatch_size"] == 2048
+        # Other fields unchanged
+        assert data["slot"]["tensor_split"] == "2,2"
+        assert data["slot"]["parallel_slots"] == 2
+        assert data["slot"]["cache_type_k"] == "q8_0"
+        assert data["slot"]["cache_type_v"] == "q8_0"
+
+    def test_clear_tensor_split_does_not_affect_batch_fields(self, app_client):
+        """Clearing tensor_split does not reset batch fields."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={
+                "slot_id": "combined-patch-3",
+                "host_port": 8154,
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+            },
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"tensor_split": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["slot"]["tensor_split"] is None
+        assert data["slot"]["batch_size"] == 4096
+        assert data["slot"]["ubatch_size"] == 1024
+
+    def test_extra_args_batch_conflicts_do_not_affect_other_flags(self, app_client, monkeypatch):
+        """Extra batch conflicts do not affect tensor_split/parallel/cache flags."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "combined-patch-4", "host_port": 8155},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+        mock_gpu_summary = {
+            "ok": True,
+            "gpus": [
+                {"index": 0, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                 "memory_used_mib": 1000, "memory_free_mib": 45068},
+                {"index": 1, "name": "NVIDIA A40", "memory_total_mib": 46068,
+                 "memory_used_mib": 1000, "memory_free_mib": 45068},
+            ],
+            "usable_gpu_indices": "0,1",
+            "usable_gpu_devices": "0,1",
+        }
+        monkeypatch.setattr(
+            "qonduit_docker_helpers.collect_gpu_summary",
+            lambda: mock_gpu_summary,
+        )
+        monkeypatch.setattr(
+            "qonduit_router_api_slots.collect_gpu_summary",
+            lambda: mock_gpu_summary,
+        )
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "abc123"
+        mock_result.stderr = ""
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_result)
+        monkeypatch.setattr("qonduit_router_api_slots.port_is_available", lambda *a, **kw: True)
+        monkeypatch.setattr("qonduit_router_api_slots.docker_name_is_available", lambda *a, **kw: True)
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/launch",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "2,2",
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+                "extra_args": ["--batch-size", "9999", "--tensor-split", "9,9"],
+            },
+        )
+        assert resp.status_code == 200
+
+        call_args = subprocess.run.call_args
+        cmd = call_args[0][0]
+        cmd_str = " ".join(str(c) for c in cmd)
+        # batch-size should appear once with first-class value
+        assert cmd_str.count("--batch-size") == 1
+        # tensor-split should appear once with first-class value
+        assert cmd_str.count("--tensor-split") == 1
+        # parallel should appear
+        assert "--parallel" in cmd_str or "-np" in cmd_str or "2" in cmd_str
+        # cache types should appear
+        assert "--cache-type-k" in cmd_str
+        assert "--cache-type-v" in cmd_str
+
+
+class TestBatchSizeSlotOptions:
+    """Slot options endpoint includes batch section."""
+
+    def test_slot_options_has_batch_section(self, app_client):
+        """slot-options response includes batch section."""
+        resp = app_client.get("/api/v1/qonduit-router/slot-options")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "batch" in data
+        batch = data["batch"]
+        assert batch["batch_size_default"] == 8192
+        assert batch["ubatch_size_default"] == 2048
+        assert 8192 in batch["batch_size_options"]
+        assert 2048 in batch["ubatch_size_options"]
+        assert batch["batch_size_flag"] == "--batch-size"
+        assert batch["ubatch_size_flag"] == "--ubatch-size"
+
+    def test_slot_options_preserves_parallel_section(self, app_client):
+        """slot-options still includes parallel section."""
+        resp = app_client.get("/api/v1/qonduit-router/slot-options")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "parallel" in data
+        assert data["parallel"]["default"] == 1
+
+    def test_slot_options_preserves_cache_types_section(self, app_client):
+        """slot-options still includes cache_types section."""
+        resp = app_client.get("/api/v1/qonduit-router/slot-options")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "cache_types" in data
+        assert "f16" in data["cache_types"]["allowed"]
+
+
+class TestBackwardCompatibilityBatchDefaults:
+    """Old slots without batch fields should return defaults."""
+
+    def test_old_slots_return_batch_defaults_on_get(self, app_client, monkeypatch, tmp_path):
+        """GET /slots returns defaults for batch_size/ubatch_size on old slots."""
+        # Create a slot file with an old-style slot (no batch fields)
+        data_dir = tmp_path / "data"
+        data_dir.mkdir(exist_ok=True)
+        slots_file = data_dir / "router_slots.json"
+
+        import qonduit_slots
+        qonduit_slots._QONDUIT_SLOTS_FILE = slots_file
+        qonduit_slots._QONDUIT_ROUTER_DATA_DIR = data_dir
+        slots_file.write_text("[]")
+        _ = qonduit_slots.load_slots()  # triggers default slot creation
+
+        # Manually write an old-style slot without batch fields
+        old_slot = {
+            "slot_id": "legacy",
+            "display_name": "Legacy",
+            "purpose": "custom",
+            "container_name": "llama_server_legacy",
+            "host": "192.168.5.5",
+            "host_port": 8160,
+            "internal_port": 8080,
+            "endpoint_base": "http://192.168.5.5:8160",
+            "openai_base": "http://192.168.5.5:8160/v1",
+            "model": None,
+            "context_size": 65536,
+            "gpu_devices": "all",
+            "tensor_split": "auto",
+            "embeddings_enabled": True,
+            "extra_args": [],
+            "parallel_slots": 1,
+            "cache_type_k": "f16",
+            "cache_type_v": "f16",
+            # NOTE: no batch_size or ubatch_size keys
+            "running": False,
+            "exists": False,
+            "ready": False,
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "updated_at": "2025-01-01T00:00:00+00:00",
+            "last_started_at": None,
+            "last_stopped_at": None,
+            "last_error": None,
+        }
+        slots_file.write_text(json.dumps([old_slot]))
+
+        # Reload modules to pick up new slots file
+        import importlib
+        importlib.reload(qonduit_slots)
+        import qonduit_router_api_slots
+        importlib.reload(qonduit_router_api_slots)
+        import qonduit_router_api
+        importlib.reload(qonduit_router_api)
+
+        resp = app_client.get("/api/v1/qonduit-router/slots")
+        assert resp.status_code == 200
+        slots_data = resp.get_json()["slots"]
+        legacy_slot = next((s for s in slots_data if s["slot_id"] == "legacy"), None)
+        assert legacy_slot is not None
+        assert legacy_slot["batch_size"] == 8192
+        assert legacy_slot["ubatch_size"] == 2048
+
+    def test_old_slot_preflight_uses_batch_defaults(self, app_client, monkeypatch, tmp_path):
+        """Preflight on old slot without batch fields uses defaults."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir(exist_ok=True)
+        slots_file = data_dir / "router_slots.json"
+
+        import qonduit_slots
+        qonduit_slots._QONDUIT_SLOTS_FILE = slots_file
+        qonduit_slots._QONDUIT_ROUTER_DATA_DIR = data_dir
+        slots_file.write_text("[]")
+        _ = qonduit_slots.load_slots()
+
+        old_slot = {
+            "slot_id": "legacy2",
+            "display_name": "Legacy2",
+            "purpose": "custom",
+            "container_name": "llama_server_legacy2",
+            "host": "192.168.5.5",
+            "host_port": 8161,
+            "internal_port": 8080,
+            "endpoint_base": "http://192.168.5.5:8161",
+            "openai_base": "http://192.168.5.5:8161/v1",
+            "model": None,
+            "context_size": 65536,
+            "gpu_devices": "all",
+            "tensor_split": "auto",
+            "embeddings_enabled": True,
+            "extra_args": [],
+            "parallel_slots": 1,
+            "cache_type_k": "f16",
+            "cache_type_v": "f16",
+            "running": False,
+            "exists": False,
+            "ready": False,
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "updated_at": "2025-01-01T00:00:00+00:00",
+            "last_started_at": None,
+            "last_stopped_at": None,
+            "last_error": None,
+        }
+        slots_file.write_text(json.dumps(old_slot))
+
+        import importlib
+        importlib.reload(qonduit_slots)
+        import qonduit_router_api_slots
+        importlib.reload(qonduit_router_api_slots)
+        import qonduit_router_api
+        importlib.reload(qonduit_router_api)
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots/legacy2/preflight",
+            json={"model": "test.gguf", "context_size": 65536, "gpu_devices": "all"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["batch_size"] == 8192
+        assert data["ubatch_size"] == 2048
 

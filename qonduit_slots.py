@@ -44,6 +44,65 @@ _DEFAULT_PARALLEL_SLOTS = 1
 _MIN_PARALLEL_SLOTS = 1
 _MAX_PARALLEL_SLOTS = 16
 
+# ── Batch & micro-batch constants ────────────────────────────────────────────
+
+_DEFAULT_BATCH_SIZE = 8192
+_DEFAULT_UBATCH_SIZE = 2048
+
+_BATCH_SIZE_OPTIONS: list[int] = [512, 1024, 2048, 4096, 8192]
+_UBATCH_SIZE_OPTIONS: list[int] = [256, 512, 1024, 2048]
+
+
+def _validate_batch_size(value: object) -> tuple[int | None, str | None]:
+    """Validate and normalize a batch_size value.
+
+    Returns (normalized_value, error_string).
+    - ``None`` value means "reset to default".
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, "batch_size must be a positive integer"
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return None, None
+        try:
+            value = int(stripped)
+        except ValueError:
+            return None, "batch_size must be a positive integer"
+    if not isinstance(value, int):
+        return None, "batch_size must be a positive integer"
+    if value <= 0:
+        return None, "batch_size must be a positive integer"
+    return value, None
+
+
+def _validate_ubatch_size(value: object) -> tuple[int | None, str | None]:
+    """Validate and normalize a ubatch_size value.
+
+    Returns (normalized_value, error_string).
+    - ``None`` value means "reset to default".
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, "ubatch_size must be a positive integer"
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return None, None
+        try:
+            value = int(stripped)
+        except ValueError:
+            return None, "ubatch_size must be a positive integer"
+    if not isinstance(value, int):
+        return None, "ubatch_size must be a positive integer"
+    if value <= 0:
+        return None, "ubatch_size must be a positive integer"
+    return value, None
+
+
 # Byte multipliers per element for KV cache estimate
 _KV_CACHE_BYTES: dict[str, float] = {
     "f32": 4.0,
@@ -340,6 +399,24 @@ def validate_slot(slot: dict[str, Any]) -> list[dict[str, str]]:
     if err:
         errors.append({"field": "cache_type_v", "message": err})
 
+    # batch_size
+    bs_valid, bs_err = _validate_batch_size(slot.get("batch_size"))
+    if bs_err:
+        errors.append({"field": "batch_size", "message": bs_err})
+
+    # ubatch_size
+    us_valid, us_err = _validate_ubatch_size(slot.get("ubatch_size"))
+    if us_err:
+        errors.append({"field": "ubatch_size", "message": us_err})
+
+    # Cross-validate: ubatch_size must not exceed batch_size
+    if not bs_err and not us_err:
+        if us_valid > bs_valid:
+            errors.append({
+                "field": "ubatch_size",
+                "message": "ubatch_size must not exceed batch_size",
+            })
+
     return errors
 
 
@@ -367,6 +444,8 @@ def _build_default_slot() -> dict[str, Any]:
         "parallel_slots": _DEFAULT_PARALLEL_SLOTS,
         "cache_type_k": _DEFAULT_CACHE_TYPE_K,
         "cache_type_v": _DEFAULT_CACHE_TYPE_V,
+        "batch_size": _DEFAULT_BATCH_SIZE,
+        "ubatch_size": _DEFAULT_UBATCH_SIZE,
         "running": False,
         "exists": False,
         "ready": False,
@@ -625,6 +704,36 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
     else:
         cache_type_v = _DEFAULT_CACHE_TYPE_V
 
+    # Batch size
+    if "batch_size" in payload:
+        raw_bs = payload["batch_size"]
+        if raw_bs is None or (isinstance(raw_bs, str) and not raw_bs.strip()):
+            batch_size = _DEFAULT_BATCH_SIZE
+        else:
+            bs_valid, bs_err = _validate_batch_size(raw_bs)
+            if bs_err:
+                return {}, bs_err
+            batch_size = bs_valid
+    else:
+        batch_size = _DEFAULT_BATCH_SIZE
+
+    # Micro-batch size
+    if "ubatch_size" in payload:
+        raw_us = payload["ubatch_size"]
+        if raw_us is None or (isinstance(raw_us, str) and not raw_us.strip()):
+            ubatch_size = _DEFAULT_UBATCH_SIZE
+        else:
+            us_valid, us_err = _validate_ubatch_size(raw_us)
+            if us_err:
+                return {}, us_err
+            ubatch_size = us_valid
+    else:
+        ubatch_size = _DEFAULT_UBATCH_SIZE
+
+    # Cross-validate: ubatch_size must not exceed batch_size
+    if ubatch_size > batch_size:
+        return {}, "ubatch_size must not exceed batch_size"
+
     display_name = (payload.get("display_name") or slot_id).strip()
     if not display_name:
         display_name = slot_id
@@ -656,6 +765,8 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
         "parallel_slots": parallel_slots,
         "cache_type_k": cache_type_k,
         "cache_type_v": cache_type_v,
+        "batch_size": batch_size,
+        "ubatch_size": ubatch_size,
         "running": False,
         "exists": False,
         "ready": False,
@@ -716,6 +827,8 @@ def update_slot(
         "parallel_slots",
         "cache_type_k",
         "cache_type_v",
+        "batch_size",
+        "ubatch_size",
     ]
 
     for field in updatable:
@@ -754,6 +867,24 @@ def update_slot(
                         return {}, "invalid_slot"
                 if value < _MIN_PARALLEL_SLOTS or value > _MAX_PARALLEL_SLOTS:
                     return {}, "invalid_slot"
+            # PATCH explicit null/empty for batch_size → reset to default 8192
+            elif field == "batch_size":
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    value = _DEFAULT_BATCH_SIZE
+                else:
+                    v_valid, v_err = _validate_batch_size(value)
+                    if v_err:
+                        return {}, v_err
+                    value = v_valid
+            # PATCH explicit null/empty for ubatch_size → reset to default 2048
+            elif field == "ubatch_size":
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    value = _DEFAULT_UBATCH_SIZE
+                else:
+                    v_valid, v_err = _validate_ubatch_size(value)
+                    if v_err:
+                        return {}, v_err
+                    value = v_valid
             slot[field] = value
 
     # Re-derive derived fields if host or host_port changed
@@ -821,6 +952,10 @@ def _normalize_slot_fields(slot: dict[str, Any]) -> dict[str, Any]:
         slot["cache_type_k"] = _DEFAULT_CACHE_TYPE_K
     if "cache_type_v" not in slot:
         slot["cache_type_v"] = _DEFAULT_CACHE_TYPE_V
+    if "batch_size" not in slot:
+        slot["batch_size"] = _DEFAULT_BATCH_SIZE
+    if "ubatch_size" not in slot:
+        slot["ubatch_size"] = _DEFAULT_UBATCH_SIZE
     return slot
 
 

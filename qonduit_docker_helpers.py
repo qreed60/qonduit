@@ -278,6 +278,54 @@ def launch_slot_container(
     if cache_type_v not in _ALLOWED:
         cache_type_v = "f16"
 
+    # Determine batch_size (default 8192)
+    _BATCH_DEFAULT = 8192
+    _UBATCH_DEFAULT = 2048
+    if "batch_size" in launch_payload:
+        raw_bs = launch_payload["batch_size"]
+        if raw_bs is None or str(raw_bs).strip() == "":
+            batch_size = _BATCH_DEFAULT
+        else:
+            try:
+                batch_size = int(raw_bs)
+                if batch_size <= 0:
+                    batch_size = _BATCH_DEFAULT
+            except (ValueError, TypeError):
+                batch_size = _BATCH_DEFAULT
+    elif "batch_size" in slot:
+        raw_bs = slot["batch_size"]
+        if isinstance(raw_bs, int) and raw_bs > 0:
+            batch_size = raw_bs
+        else:
+            batch_size = _BATCH_DEFAULT
+    else:
+        batch_size = _BATCH_DEFAULT
+
+    # Determine ubatch_size (default 2048)
+    if "ubatch_size" in launch_payload:
+        raw_ub = launch_payload["ubatch_size"]
+        if raw_ub is None or str(raw_ub).strip() == "":
+            ubatch_size = _UBATCH_DEFAULT
+        else:
+            try:
+                ubatch_size = int(raw_ub)
+                if ubatch_size <= 0:
+                    ubatch_size = _UBATCH_DEFAULT
+            except (ValueError, TypeError):
+                ubatch_size = _UBATCH_DEFAULT
+    elif "ubatch_size" in slot:
+        raw_ub = slot["ubatch_size"]
+        if isinstance(raw_ub, int) and raw_ub > 0:
+            ubatch_size = raw_ub
+        else:
+            ubatch_size = _UBATCH_DEFAULT
+    else:
+        ubatch_size = _UBATCH_DEFAULT
+
+    # Enforce ubatch_size <= batch_size
+    if ubatch_size > batch_size:
+        ubatch_size = batch_size
+
     # Compute tensor split value from resolved GPUs
     if tensor_split_cleared:
         split_val = None
@@ -296,17 +344,22 @@ def launch_slot_container(
     ]
 
     # ── Extra args conflict handling ───────────────────────────────────────
-    # When tensor_split is explicitly set (not "auto" and not cleared), filter out
-    # conflicting --tensor-split or -ts from extra_args to prevent duplicate args.
+    # When a first-class field is set, filter out conflicting flags from
+    # extra_args to prevent duplicate args.
     filtered_extra_args: list[str] = []
     extra_args_warning: str | None = None
-    if tensor_split_cleared or str(tensor_split).lower() == "auto":
-        # tensor_split cleared or auto — pass through extra_args unchanged
-        filtered_extra_args = list(extra_args)
-    else:
-        # tensor_split is explicitly set — filter conflicting --tensor-split
-        for arg in extra_args:
-            arg_str = str(arg).strip()
+
+    # Flags that are actively set via first-class fields
+    has_tensor_split = (not tensor_split_cleared
+                        and str(tensor_split).lower() != "auto")
+    has_batch = True  # batch_size always has a default value
+    has_ubatch = True  # ubatch_size always has a default value
+
+    for arg in extra_args:
+        arg_str = str(arg).strip()
+
+        # tensor_split conflicts
+        if has_tensor_split:
             if arg_str in ("--tensor-split", "-ts"):
                 extra_args_warning = (
                     f"Ignoring {arg_str} from extra_args because "
@@ -319,7 +372,38 @@ def launch_slot_container(
                     "tensor_split field is set"
                 )
                 continue
-            filtered_extra_args.append(arg)
+
+        # batch_size conflicts
+        if has_batch:
+            if arg_str in ("--batch-size", "-b"):
+                extra_args_warning = (
+                    f"Ignoring {arg_str} from extra_args because "
+                    f"batch_size field is set"
+                )
+                continue
+            if arg_str.startswith("--batch-size="):
+                extra_args_warning = (
+                    "Ignoring --batch-size from extra_args because "
+                    "batch_size field is set"
+                )
+                continue
+
+        # ubatch_size conflicts
+        if has_ubatch:
+            if arg_str in ("--ubatch-size", "-ub"):
+                extra_args_warning = (
+                    f"Ignoring {arg_str} from extra_args because "
+                    f"ubatch_size field is set"
+                )
+                continue
+            if arg_str.startswith("--ubatch-size="):
+                extra_args_warning = (
+                    "Ignoring --ubatch-size from extra_args because "
+                    "ubatch_size field is set"
+                )
+                continue
+
+        filtered_extra_args.append(arg)
 
     # Build command
     cmd = [
@@ -346,6 +430,10 @@ def launch_slot_container(
         cmd.extend(["--cache-type-k", cache_type_k])
     if cache_type_v:
         cmd.extend(["--cache-type-v", cache_type_v])
+
+    # Batch size flags
+    cmd.extend(["--batch-size", str(batch_size)])
+    cmd.extend(["--ubatch-size", str(ubatch_size)])
 
     cmd.extend(filtered_extra_args)
 
@@ -403,6 +491,8 @@ def launch_slot_container(
             "parallel_slots": parallel_slots,
             "cache_type_k": cache_type_k,
             "cache_type_v": cache_type_v,
+            "batch_size": batch_size,
+            "ubatch_size": ubatch_size,
         }, force=True)
 
         # Update timestamps

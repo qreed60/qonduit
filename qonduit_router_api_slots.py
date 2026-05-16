@@ -492,6 +492,62 @@ def register_slot_routes(app: Flask) -> None:
         if not cache_type_v or str(cache_type_v).strip() == "":
             cache_type_v = "f16"
 
+        # ── Batch size fields: batch_size, ubatch_size ───────────────────────
+        batch_size_default = 8192
+        ubatch_size_default = 2048
+        batch_size_options = [512, 1024, 2048, 4096, 8192]
+        ubatch_size_options = [256, 512, 1024, 2048]
+
+        # Resolve batch_size from payload or slot, with defaults
+        raw_batch_size = payload.get("batch_size", None)
+        slot_batch_size = slot_data.get("batch_size", batch_size_default)
+        if raw_batch_size is None:
+            # Not provided in payload — use slot value (or default)
+            if isinstance(slot_batch_size, int) and slot_batch_size > 0:
+                batch_size = slot_batch_size
+            else:
+                batch_size = batch_size_default
+        elif raw_batch_size == "" or (isinstance(raw_batch_size, float) and raw_batch_size == 0.0):
+            # Explicit null/empty — reset to default
+            batch_size = batch_size_default
+        else:
+            try:
+                batch_size = int(raw_batch_size)
+            except (ValueError, TypeError):
+                return _json_error(
+                    "invalid_batch_size",
+                    "batch_size must be a positive integer",
+                    400,
+                )
+
+        # Resolve ubatch_size from payload or slot, with defaults
+        raw_ubatch_size = payload.get("ubatch_size", None)
+        slot_ubatch_size = slot_data.get("ubatch_size", ubatch_size_default)
+        if raw_ubatch_size is None:
+            if isinstance(slot_ubatch_size, int) and slot_ubatch_size > 0:
+                ubatch_size = slot_ubatch_size
+            else:
+                ubatch_size = ubatch_size_default
+        elif raw_ubatch_size == "" or (isinstance(raw_ubatch_size, float) and raw_ubatch_size == 0.0):
+            ubatch_size = ubatch_size_default
+        else:
+            try:
+                ubatch_size = int(raw_ubatch_size)
+            except (ValueError, TypeError):
+                return _json_error(
+                    "invalid_ubatch_size",
+                    "ubatch_size must be a positive integer",
+                    400,
+                )
+
+        # Validate ubatch_size <= batch_size
+        if ubatch_size > batch_size:
+            return _json_error(
+                "invalid_ubatch_size",
+                f"ubatch_size ({ubatch_size}) must not exceed batch_size ({batch_size})",
+                400,
+            )
+
         warnings: list[str] = []
         slot_id_str = slot_id
 
@@ -573,6 +629,33 @@ def register_slot_routes(app: Flask) -> None:
                     )
                     warnings.append(tensor_split_conflict_warning)
                     break
+
+        # If batch_size or ubatch_size is set (non-default), check for conflicting
+        # --batch-size/-b/--ubatch-size/-ub in extra_args.
+        batch_conflict_warnings: list[str] = []
+        if isinstance(extra_args, list) and (batch_size != batch_size_default or ubatch_size != ubatch_size_default):
+            for arg in extra_args:
+                arg_str = str(arg).strip()
+                # --batch-size conflicts
+                if arg_str in ("--batch-size", "-b"):
+                    batch_conflict_warnings.append(
+                        f"Ignoring {arg_str} from extra_args because batch_size is set"
+                    )
+                elif arg_str.startswith("--batch-size="):
+                    batch_conflict_warnings.append(
+                        "Ignoring --batch-size from extra_args because batch_size is set"
+                    )
+                # --ubatch-size conflicts
+                elif arg_str in ("--ubatch-size", "-ub"):
+                    batch_conflict_warnings.append(
+                        f"Ignoring {arg_str} from extra_args because ubatch_size is set"
+                    )
+                elif arg_str.startswith("--ubatch-size="):
+                    batch_conflict_warnings.append(
+                        "Ignoring --ubatch-size from extra_args because ubatch_size is set"
+                    )
+        for _w in batch_conflict_warnings:
+            warnings.append(_w)
 
         # GPU summary
         gpu_summary = collect_gpu_summary()
@@ -704,6 +787,10 @@ def register_slot_routes(app: Flask) -> None:
         launch_args_preview.extend(["--cache-type-k", cache_type_k])
         launch_args_preview.extend(["--cache-type-v", cache_type_v])
 
+        # Batch size flags
+        launch_args_preview.extend(["--batch-size", str(batch_size)])
+        launch_args_preview.extend(["--ubatch-size", str(ubatch_size)])
+
         # ── Build suggested_tensor_splits ────────────────────────────────────
         suggested_splits = compute_suggested_tensor_splits(gpu_summary, effective_gpu_count)
 
@@ -766,6 +853,11 @@ def register_slot_routes(app: Flask) -> None:
             "cache_type_k": cache_type_k,
             "cache_type_v": cache_type_v,
             "effective_context_per_parallel_slot": effective_context_per_slot,
+            # ── batch size echo ────────────────────────────────────────────
+            "requested_batch_size": payload.get("batch_size", None),
+            "requested_ubatch_size": payload.get("ubatch_size", None),
+            "batch_size": batch_size,
+            "ubatch_size": ubatch_size,
             # ── KV cache estimate ──────────────────────────────────────────
             "kv_cache_estimate": kv_cache_estimate,
             # ── launch args preview ────────────────────────────────────────
@@ -813,6 +905,18 @@ def register_slot_routes(app: Flask) -> None:
                 "default_v": "f16",
                 "cache_type_k_flag": "--cache-type-k",
                 "cache_type_v_flag": "--cache-type-v",
+            },
+            "batch": {
+                "batch_size_default": 8192,
+                "ubatch_size_default": 2048,
+                "batch_size_options": [512, 1024, 2048, 4096, 8192],
+                "ubatch_size_options": [256, 512, 1024, 2048],
+                "batch_size_flag": "--batch-size",
+                "ubatch_size_flag": "--ubatch-size",
+                "notes": (
+                    "batch_size controls prompt processing batch size; "
+                    "ubatch_size controls physical/micro batch size."
+                ),
             },
         })
 
