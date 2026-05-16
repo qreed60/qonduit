@@ -480,36 +480,89 @@ def register_slot_routes(app: Flask) -> None:
         extra_args = payload.get("extra_args") or slot_data.get("extra_args", [])
 
         # ── New fields: parallel_slots, cache_type_k, cache_type_v ───────────
-        parallel_slots = int(
-            payload.get("parallel_slots") or slot_data.get("parallel_slots", 1),
+        allowed_cache_types = {
+            "f32", "f16", "bf16", "q8_0", "q4_0",
+            "q4_1", "iq4_nl", "q5_0", "q5_1",
+        }
+
+        raw_parallel_slots = payload.get(
+            "parallel_slots",
+            slot_data.get("parallel_slots", 1),
         )
-        cache_type_k = payload.get("cache_type_k") or slot_data.get("cache_type_k", "f16")
-        cache_type_v = payload.get("cache_type_v") or slot_data.get("cache_type_v", "f16")
+        if raw_parallel_slots is None or (
+            isinstance(raw_parallel_slots, str)
+            and not raw_parallel_slots.strip()
+        ):
+            parallel_slots = 1
+        elif isinstance(raw_parallel_slots, bool):
+            return _json_error(
+                "invalid_parallel_slots",
+                "parallel_slots must be a positive integer",
+                400,
+            )
+        else:
+            try:
+                parallel_slots = int(raw_parallel_slots)
+            except (ValueError, TypeError):
+                return _json_error(
+                    "invalid_parallel_slots",
+                    "parallel_slots must be a positive integer",
+                    400,
+                )
+        if parallel_slots <= 0:
+            return _json_error(
+                "invalid_parallel_slots",
+                "parallel_slots must be a positive integer",
+                400,
+            )
+
+        cache_type_k = payload.get(
+            "cache_type_k",
+            slot_data.get("cache_type_k", "f16"),
+        )
+        cache_type_v = payload.get(
+            "cache_type_v",
+            slot_data.get("cache_type_v", "f16"),
+        )
 
         # Defaults for omitted cache type values
         if not cache_type_k or str(cache_type_k).strip() == "":
             cache_type_k = "f16"
+        else:
+            cache_type_k = str(cache_type_k).strip().lower()
         if not cache_type_v or str(cache_type_v).strip() == "":
             cache_type_v = "f16"
+        else:
+            cache_type_v = str(cache_type_v).strip().lower()
+        if cache_type_k not in allowed_cache_types:
+            return _json_error(
+                "invalid_cache_type_k",
+                "cache_type_k must be one of the allowed cache types",
+                400,
+            )
+        if cache_type_v not in allowed_cache_types:
+            return _json_error(
+                "invalid_cache_type_v",
+                "cache_type_v must be one of the allowed cache types",
+                400,
+            )
 
         # ── Batch size fields: batch_size, ubatch_size ───────────────────────
         batch_size_default = 8192
         ubatch_size_default = 2048
-        batch_size_options = [512, 1024, 2048, 4096, 8192]
-        ubatch_size_options = [256, 512, 1024, 2048]
 
-        # Resolve batch_size from payload or slot, with defaults
-        raw_batch_size = payload.get("batch_size", None)
-        slot_batch_size = slot_data.get("batch_size", batch_size_default)
-        if raw_batch_size is None:
-            # Not provided in payload — use slot value (or default)
-            if isinstance(slot_batch_size, int) and slot_batch_size > 0:
-                batch_size = slot_batch_size
-            else:
-                batch_size = batch_size_default
-        elif raw_batch_size == "" or (isinstance(raw_batch_size, float) and raw_batch_size == 0.0):
-            # Explicit null/empty — reset to default
+        # Resolve batch_size from payload or slot, with defaults.
+        raw_batch_size = payload.get("batch_size", slot_data.get("batch_size"))
+        if raw_batch_size is None or (
+            isinstance(raw_batch_size, str) and not raw_batch_size.strip()
+        ):
             batch_size = batch_size_default
+        elif isinstance(raw_batch_size, bool):
+            return _json_error(
+                "invalid_batch_size",
+                "batch_size must be a positive integer",
+                400,
+            )
         else:
             try:
                 batch_size = int(raw_batch_size)
@@ -519,17 +572,25 @@ def register_slot_routes(app: Flask) -> None:
                     "batch_size must be a positive integer",
                     400,
                 )
+        if batch_size <= 0:
+            return _json_error(
+                "invalid_batch_size",
+                "batch_size must be a positive integer",
+                400,
+            )
 
-        # Resolve ubatch_size from payload or slot, with defaults
-        raw_ubatch_size = payload.get("ubatch_size", None)
-        slot_ubatch_size = slot_data.get("ubatch_size", ubatch_size_default)
-        if raw_ubatch_size is None:
-            if isinstance(slot_ubatch_size, int) and slot_ubatch_size > 0:
-                ubatch_size = slot_ubatch_size
-            else:
-                ubatch_size = ubatch_size_default
-        elif raw_ubatch_size == "" or (isinstance(raw_ubatch_size, float) and raw_ubatch_size == 0.0):
+        # Resolve ubatch_size from payload or slot, with defaults.
+        raw_ubatch_size = payload.get("ubatch_size", slot_data.get("ubatch_size"))
+        if raw_ubatch_size is None or (
+            isinstance(raw_ubatch_size, str) and not raw_ubatch_size.strip()
+        ):
             ubatch_size = ubatch_size_default
+        elif isinstance(raw_ubatch_size, bool):
+            return _json_error(
+                "invalid_ubatch_size",
+                "ubatch_size must be a positive integer",
+                400,
+            )
         else:
             try:
                 ubatch_size = int(raw_ubatch_size)
@@ -539,6 +600,12 @@ def register_slot_routes(app: Flask) -> None:
                     "ubatch_size must be a positive integer",
                     400,
                 )
+        if ubatch_size <= 0:
+            return _json_error(
+                "invalid_ubatch_size",
+                "ubatch_size must be a positive integer",
+                400,
+            )
 
         # Validate ubatch_size <= batch_size
         if ubatch_size > batch_size:
@@ -633,7 +700,7 @@ def register_slot_routes(app: Flask) -> None:
         # If batch_size or ubatch_size is set (non-default), check for conflicting
         # --batch-size/-b/--ubatch-size/-ub in extra_args.
         batch_conflict_warnings: list[str] = []
-        if isinstance(extra_args, list) and (batch_size != batch_size_default or ubatch_size != ubatch_size_default):
+        if isinstance(extra_args, list):
             for arg in extra_args:
                 arg_str = str(arg).strip()
                 # --batch-size conflicts
@@ -776,9 +843,10 @@ def register_slot_routes(app: Flask) -> None:
         # Parallel flag
         parallel_flag = "--parallel"
         probe_cache = probe_llama_server_flags()
-        if probe_cache.get("detected_parallel") == "-np":
+        detected_parallel = probe_cache.get("parallel_flag", "--parallel")
+        if detected_parallel == "-np":
             parallel_flag = "-np"
-        elif probe_cache.get("detected_parallel") == "--parallel":
+        elif detected_parallel == "--parallel":
             parallel_flag = "--parallel"
         if parallel_slots > 1:
             launch_args_preview.extend([parallel_flag, str(parallel_slots)])
@@ -879,7 +947,7 @@ def register_slot_routes(app: Flask) -> None:
             return denied
 
         probe_cache = probe_llama_server_flags()
-        detected_parallel = probe_cache.get("detected_parallel", "--parallel")
+        detected_parallel = probe_cache.get("parallel_flag", "--parallel")
 
         return jsonify({
             "ok": True,

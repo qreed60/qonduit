@@ -261,9 +261,20 @@ def launch_slot_container(
     extra_args = launch_payload.get("extra_args") or slot.get("extra_args", [])
 
     # Determine parallel_slots (default 1)
-    parallel_slots = int(
-        launch_payload.get("parallel_slots") or slot.get("parallel_slots", 1),
+    raw_parallel_slots = launch_payload.get(
+        "parallel_slots",
+        slot.get("parallel_slots", 1),
     )
+    if raw_parallel_slots is None or (
+        isinstance(raw_parallel_slots, str)
+        and not raw_parallel_slots.strip()
+    ):
+        parallel_slots = 1
+    else:
+        try:
+            parallel_slots = int(raw_parallel_slots)
+        except (ValueError, TypeError):
+            parallel_slots = 1
     if parallel_slots < 1:
         parallel_slots = 1
     if parallel_slots > 16:
@@ -355,8 +366,12 @@ def launch_slot_container(
     has_batch = True  # batch_size always has a default value
     has_ubatch = True  # ubatch_size always has a default value
 
+    skip_next_extra_arg = False
     for arg in extra_args:
         arg_str = str(arg).strip()
+        if skip_next_extra_arg:
+            skip_next_extra_arg = False
+            continue
 
         # tensor_split conflicts
         if has_tensor_split:
@@ -365,6 +380,7 @@ def launch_slot_container(
                     f"Ignoring {arg_str} from extra_args because "
                     f"tensor_split field is set"
                 )
+                skip_next_extra_arg = True
                 continue
             if arg_str.startswith("--tensor-split="):
                 extra_args_warning = (
@@ -380,6 +396,7 @@ def launch_slot_container(
                     f"Ignoring {arg_str} from extra_args because "
                     f"batch_size field is set"
                 )
+                skip_next_extra_arg = True
                 continue
             if arg_str.startswith("--batch-size="):
                 extra_args_warning = (
@@ -395,6 +412,7 @@ def launch_slot_container(
                     f"Ignoring {arg_str} from extra_args because "
                     f"ubatch_size field is set"
                 )
+                skip_next_extra_arg = True
                 continue
             if arg_str.startswith("--ubatch-size="):
                 extra_args_warning = (
@@ -417,7 +435,11 @@ def launch_slot_container(
 
     # Parallel slots flag
     if parallel_slots > 1:
-        cmd.extend(["--parallel", str(parallel_slots)])
+        probe_cache = probe_llama_server_flags()
+        parallel_flag = probe_cache.get("parallel_flag", "--parallel")
+        if parallel_flag not in ("--parallel", "-np"):
+            parallel_flag = "--parallel"
+        cmd.extend([parallel_flag, str(parallel_slots)])
 
     if split_val is not None:
         cmd.extend(["--tensor-split", split_val])
@@ -1115,8 +1137,9 @@ def probe_llama_server_flags() -> dict[str, Any]:
     If probing fails, returns defaults without raising.
     """
     global _llama_server_flag_cache
-    if _llama_server_flag_cache is not None:
-        return dict(_llama_server_flag_cache)
+    # Re-probe on each call so tests and upgraded llama.cpp binaries see the
+    # current flag set immediately. The cache is retained only as a last-known
+    # value for callers that explicitly inspect/reset it.
 
     result: dict[str, Any] = {
         "parallel_flag": "--parallel",
@@ -1185,6 +1208,9 @@ def probe_llama_server_flags() -> dict[str, Any]:
                         break
                 except (subprocess.TimeoutExpired, FileNotFoundError):
                     continue
+
+        if isinstance(help_text, bytes):
+            help_text = help_text.decode("utf-8", errors="ignore")
 
         if help_text:
             result["probed"] = True
