@@ -356,6 +356,50 @@ def _validate_batch_pair(batch_size: int, ubatch_size: int) -> Optional[str]:
     return None
 
 
+def _normalize_cache_type_value(value: Any, default: str) -> str:
+    """Return a valid cache type value, falling back to the default."""
+    if value is None:
+        return default
+    value_str = str(value).strip().lower()
+    if not value_str or value_str not in _ALLOWED_CACHE_TYPES:
+        return default
+    return value_str
+
+
+def _with_performance_defaults(slot: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy with normalized persisted performance defaults."""
+    normalized = dict(slot)
+
+    parallel_slots, err = _resolve_parallel_slots(
+        normalized.get("parallel_slots"),
+    )
+    normalized["parallel_slots"] = (
+        _DEFAULT_PARALLEL_SLOTS if err else parallel_slots
+    )
+
+    normalized["cache_type_k"] = _normalize_cache_type_value(
+        normalized.get("cache_type_k"),
+        _DEFAULT_CACHE_TYPE_K,
+    )
+    normalized["cache_type_v"] = _normalize_cache_type_value(
+        normalized.get("cache_type_v"),
+        _DEFAULT_CACHE_TYPE_V,
+    )
+
+    batch_size, err = _resolve_batch_size(normalized.get("batch_size"))
+    normalized["batch_size"] = _DEFAULT_BATCH_SIZE if err else batch_size
+
+    ubatch_size, err = _resolve_ubatch_size(normalized.get("ubatch_size"))
+    normalized["ubatch_size"] = _DEFAULT_UBATCH_SIZE if err else ubatch_size
+
+    if normalized["ubatch_size"] > normalized["batch_size"]:
+        normalized["ubatch_size"] = min(
+            _DEFAULT_UBATCH_SIZE,
+            normalized["batch_size"],
+        )
+
+    return normalized
+
 def _validate_cache_type(cache_type: Any) -> Optional[str]:
     """Return error string if cache_type is invalid, else None.
 
@@ -595,11 +639,13 @@ def load_slots() -> list[dict[str, Any]]:
             if isinstance(data, list) and all(
                 isinstance(s, dict) and "slot_id" in s for s in data
             ):
-                # Ensure every slot has all fields (migrate old configs)
+                # Ensure every slot has all fields (migrate old configs).
                 result = []
                 default_template = _build_default_slot()
+                changed = False
                 for slot in data:
                     merged = {**default_template, **slot}
+                    merged = _with_performance_defaults(merged)
                     # Re-derive derived fields from persisted values
                     merged["endpoint_base"] = (
                         f"http://{merged.get('host', _QONDUIT_DEFAULT_HOST)}:{merged.get('host_port', 8080)}"
@@ -607,12 +653,16 @@ def load_slots() -> list[dict[str, Any]]:
                     merged["openai_base"] = (
                         f"http://{merged.get('host', _QONDUIT_DEFAULT_HOST)}:{merged.get('host_port', 8080)}/v1"
                     )
+                    if merged != slot:
+                        changed = True
                     result.append(merged)
 
                 # Apply container name migration
                 result = _migrate_primary_container_name(result)
 
                 if result:
+                    if changed:
+                        _write_slots_file(result)
                     return result
                 # Empty list — recreate with default
         except (json.JSONDecodeError, OSError):
@@ -964,18 +1014,8 @@ def delete_slot(
 # ── Live status helpers ──────────────────────────────────────────────────────
 
 def _normalize_slot_fields(slot: dict[str, Any]) -> dict[str, Any]:
-    """Ensure new fields have defaults for slots created before this feature."""
-    if "parallel_slots" not in slot:
-        slot["parallel_slots"] = _DEFAULT_PARALLEL_SLOTS
-    if "cache_type_k" not in slot:
-        slot["cache_type_k"] = _DEFAULT_CACHE_TYPE_K
-    if "cache_type_v" not in slot:
-        slot["cache_type_v"] = _DEFAULT_CACHE_TYPE_V
-    if "batch_size" not in slot:
-        slot["batch_size"] = _DEFAULT_BATCH_SIZE
-    if "ubatch_size" not in slot:
-        slot["ubatch_size"] = _DEFAULT_UBATCH_SIZE
-    return slot
+    """Ensure slots include normalized persisted performance fields."""
+    return _with_performance_defaults(slot)
 
 
 def slot_to_live_status(slot: dict[str, Any]) -> dict[str, Any]:

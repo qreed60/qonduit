@@ -82,13 +82,7 @@ def _docker_name_filter(name: str) -> str:
 def docker_available() -> bool:
     """Check if Docker daemon is reachable and responsive."""
     try:
-        result = subprocess.run(
-            ["sudo", "docker", "info"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
+        result = _docker_run(["info"], timeout=10)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
         return False
