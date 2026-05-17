@@ -1142,7 +1142,12 @@ def probe_llama_server_flags() -> dict[str, Any]:
     # value for callers that explicitly inspect/reset it.
 
     result: dict[str, Any] = {
+        "ok": False,
         "parallel_flag": "--parallel",
+        "supports_parallel": False,
+        "supports_np": False,
+        "error": None,
+        # Backward-compatible fields used by existing tests/callers.
         "cache_type_k_flag": "--cache-type-k",
         "cache_type_v_flag": "--cache-type-v",
         "probed": False,
@@ -1213,11 +1218,15 @@ def probe_llama_server_flags() -> dict[str, Any]:
             help_text = help_text.decode("utf-8", errors="ignore")
 
         if help_text:
+            result["ok"] = True
             result["probed"] = True
-            # Check for --parallel flag
-            if "--parallel" in help_text:
+            result["supports_parallel"] = "--parallel" in help_text
+            result["supports_np"] = (
+                "-np" in help_text or "--num-processor" in help_text
+            )
+            if result["supports_parallel"]:
                 result["parallel_flag"] = "--parallel"
-            elif "-np" in help_text or "--num-processor" in help_text:
+            elif result["supports_np"]:
                 result["parallel_flag"] = "-np"
             # Check for cache type flags
             if "--cache-type-k" in help_text:
@@ -1226,9 +1235,11 @@ def probe_llama_server_flags() -> dict[str, Any]:
                 result["cache_type_v_flag"] = "--cache-type-v"
         else:
             result["probed"] = False
+            result["error"] = "llama-server help text unavailable"
             result["warning"] = "llama-server help text unavailable; using default flag assumptions"
 
     except Exception as e:
+        result["error"] = str(e)
         result["warning"] = f"flag probing failed: {e}"
 
     _llama_server_flag_cache = result
@@ -1354,6 +1365,9 @@ def estimate_kv_cache_mib(
         "cache_type_v": cache_type_v,
         "baseline_cache_type_k": "f16",
         "baseline_cache_type_v": "f16",
+        "estimated_mib": round(exact_mib, 2),
+        "kv_cache_mib": round(exact_mib, 2),
+        "total_mib": round(exact_mib, 2),
         "estimated_kv_cache_mib": round(exact_mib, 2),
         "estimated_kv_cache_f16_mib": round(baseline_mib, 2),
         "estimated_savings_vs_f16_mib": round(savings_mib, 2),
