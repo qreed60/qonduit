@@ -50,6 +50,8 @@ from qonduit_docker_helpers import (
     compute_suggested_tensor_splits,
     resolve_gpu_devices,
     docker_available,
+    docker_network_exists,
+    QONDUIT_DOCKER_NETWORK,
     probe_llama_server_flags,
     estimate_kv_cache_mib,
 )
@@ -328,6 +330,13 @@ def register_slot_routes(app: Flask) -> None:
         if not docker_name_is_available(container_name, exclude_slot_id=slot_id):
             return _json_error("duplicate_container_name", "container_name already in use", 409)
 
+        if not docker_network_exists():
+            return _json_error(
+                "docker_network_missing",
+                f"Docker network '{QONDUIT_DOCKER_NETWORK}' does not exist",
+                503,
+            )
+
         # Launch
         ok, message, error = launch_slot_container(slot, payload)
         if not ok:
@@ -335,6 +344,13 @@ def register_slot_routes(app: Flask) -> None:
                 return _json_error("model_required", "model is required", 400)
             if error == "model_not_found":
                 return _json_error("model_not_found", f"model file not found: {model}", 404)
+            if error and error.startswith("docker_network_missing:"):
+                network = error.split(":", 1)[1]
+                return _json_error(
+                    "docker_network_missing",
+                    f"Docker network '{network}' does not exist",
+                    503,
+                )
             return _json_error("launch_failed", error or "docker failed", 500)
 
         # Refresh slot status
@@ -832,6 +848,13 @@ def register_slot_routes(app: Flask) -> None:
                 # The frontend should not silently accept this.
                 tensor_split_ok = False
 
+        docker_network_exists_now = docker_network_exists()
+        if not docker_network_exists_now:
+            warnings.append(
+                f"Docker network '{QONDUIT_DOCKER_NETWORK}' does not exist; "
+                "launch will fail until it is created."
+            )
+
         # ── Build launch_args_preview ────────────────────────────────────────
         # Pre-assemble args that would be passed to llama.cpp on launch.
         launch_args_preview: list[str] = []
@@ -907,6 +930,8 @@ def register_slot_routes(app: Flask) -> None:
             "gpu_summary": gpu_summary.get("gpus", []) if gpu_summary.get("ok") else [],
             "port_available": port_available,
             "container_name_available": name_available,
+            "docker_network": QONDUIT_DOCKER_NETWORK,
+            "docker_network_exists": docker_network_exists_now,
             "warnings": warnings,
             # ── tensor_split echo ──────────────────────────────────────────
             "requested_tensor_split": requested_tensor_split,
