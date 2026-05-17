@@ -5,7 +5,7 @@ CONTAINER_NAME="llama_server"
 IMAGE_NAME="llama_cpp_cuda"
 MODEL_DIR="/mnt/models/llm"
 HOST_PORT="8080"
-DOCKER_NETWORK="qonduit-ai-net"
+DOCKER_NETWORK="${QONDUIT_DOCKER_NETWORK:-qonduit-ai-net}"
 BATCH_SIZE="8192"
 UBATCH_SIZE="2048"
 
@@ -72,9 +72,12 @@ if [ ! -f "$MODEL_PATH" ]; then
     exit 1
 fi
 
-# ---- Ensure Docker network exists ----
-echo "Ensuring Docker network exists: $DOCKER_NETWORK"
-sudo docker network create "$DOCKER_NETWORK" 2>/dev/null || true
+# ---- Verify Docker network exists ----
+echo "Verifying Docker network exists: $DOCKER_NETWORK"
+if ! sudo docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
+    echo "❌ Docker network not found: $DOCKER_NETWORK"
+    exit 1
+fi
 
 # ---- Detect compute GPUs and free VRAM ----
 # Only include Tesla compute GPUs. Exclude display cards like Quadro K620.

@@ -41,7 +41,9 @@ _QONDUIT_LLAMA_SERVER_BIN = os.getenv(
     "./build/bin/llama-server",
 )
 _QONDUIT_MODEL_MOUNT = "/mnt/models"
-_QONDUIT_DOCKER_NETWORK = os.getenv("QONDUIT_DOCKER_NETWORK", "host")
+QONDUIT_DOCKER_NETWORK = (
+    os.getenv("QONDUIT_DOCKER_NETWORK") or "qonduit-ai-net"
+)
 
 # ── GPU detection configuration ─────────────────────────────────────────────
 
@@ -83,6 +85,18 @@ def docker_available() -> bool:
     """Check if Docker daemon is reachable and responsive."""
     try:
         result = _docker_run(["info"], timeout=10)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        return False
+
+
+def docker_network_exists(network_name: str | None = None) -> bool:
+    """Return whether the configured Docker network exists."""
+    network = network_name or QONDUIT_DOCKER_NETWORK
+    if not network.strip():
+        return False
+    try:
+        result = _docker_run(["network", "inspect", network], timeout=10)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
         return False
@@ -358,6 +372,9 @@ def launch_slot_container(
     if not resolved_gpu_devices:
         return False, "", "no_usable_gpus"
 
+    if not docker_network_exists():
+        return False, "", f"docker_network_missing:{QONDUIT_DOCKER_NETWORK}"
+
     gpu_args = [
         "--gpus",
         f'"device={resolved_gpu_devices}"',
@@ -491,6 +508,7 @@ def launch_slot_container(
         ["sudo", "docker", "run", "-d", "--rm"]
         + gpu_args
         + ["--name", slot["container_name"]]
+        + ["--network", QONDUIT_DOCKER_NETWORK]
         + ["-p", port_map]
         + volume_args
         + label_args
