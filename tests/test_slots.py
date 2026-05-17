@@ -311,6 +311,81 @@ class TestSlotConfigStorage:
         slot = get_slot("primary")
         assert slot["display_name"] == "My Primary"
 
+    def test_update_slot_persists_performance_fields(self, _fresh_slots):
+        """PATCH storage fields are persisted in router_slots.json."""
+        from qonduit_slots import update_slot
+
+        updated, err = update_slot("primary", {
+            "parallel_slots": 2,
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q8_0",
+            "batch_size": 4096,
+            "ubatch_size": 1024,
+        })
+
+        assert err is None
+        assert updated["parallel_slots"] == 2
+        assert updated["cache_type_k"] == "q8_0"
+        assert updated["cache_type_v"] == "q8_0"
+        assert updated["batch_size"] == 4096
+        assert updated["ubatch_size"] == 1024
+
+        saved = json.loads(_fresh_slots.read_text())
+        primary = next(s for s in saved if s["slot_id"] == "primary")
+        assert primary["parallel_slots"] == 2
+        assert primary["cache_type_k"] == "q8_0"
+        assert primary["cache_type_v"] == "q8_0"
+        assert primary["batch_size"] == 4096
+        assert primary["ubatch_size"] == 1024
+
+    def test_performance_fields_survive_save_load_cycle(self, _fresh_slots):
+        """Non-default performance values survive reloading slot storage."""
+        from qonduit_slots import load_slots, save_slots
+
+        slots = load_slots()
+        slots[0]["parallel_slots"] = 3
+        slots[0]["cache_type_k"] = "bf16"
+        slots[0]["cache_type_v"] = "q8_0"
+        slots[0]["batch_size"] = 4096
+        slots[0]["ubatch_size"] = 512
+        save_slots(slots)
+
+        reloaded = load_slots()[0]
+        assert reloaded["parallel_slots"] == 3
+        assert reloaded["cache_type_k"] == "bf16"
+        assert reloaded["cache_type_v"] == "q8_0"
+        assert reloaded["batch_size"] == 4096
+        assert reloaded["ubatch_size"] == 512
+
+    def test_load_slots_persists_missing_performance_defaults(self, _fresh_slots):
+        """Legacy slots missing performance fields are normalized on disk."""
+        from qonduit_slots import load_slots
+
+        legacy = load_slots()[0]
+        for field in (
+            "parallel_slots",
+            "cache_type_k",
+            "cache_type_v",
+            "batch_size",
+            "ubatch_size",
+        ):
+            legacy.pop(field, None)
+        _fresh_slots.write_text(json.dumps([legacy]))
+
+        loaded = load_slots()[0]
+        assert loaded["parallel_slots"] == 1
+        assert loaded["cache_type_k"] == "f16"
+        assert loaded["cache_type_v"] == "f16"
+        assert loaded["batch_size"] == 8192
+        assert loaded["ubatch_size"] == 2048
+
+        saved = json.loads(_fresh_slots.read_text())[0]
+        assert saved["parallel_slots"] == 1
+        assert saved["cache_type_k"] == "f16"
+        assert saved["cache_type_v"] == "f16"
+        assert saved["batch_size"] == 8192
+        assert saved["ubatch_size"] == 2048
+
     def test_update_tensor_split_clear_null(self, _fresh_slots):
         """Updating tensor_split to None clears the saved value."""
         from qonduit_slots import get_slot, update_slot
@@ -4765,6 +4840,101 @@ class TestCombinedPerformanceFields:
         assert data["slot"]["cache_type_v"] == "bf16"
         assert data["slot"]["batch_size"] == 2048
         assert data["slot"]["ubatch_size"] == 512
+
+    def test_preflight_uses_saved_performance_fields(
+        self,
+        app_client,
+        monkeypatch,
+    ):
+        """Preflight uses saved performance fields when payload omits them."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "saved-preflight", "host_port": 8157},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+            },
+        )
+        assert resp.status_code == 200
+
+        monkeypatch.setattr(
+            "os.path.exists",
+            lambda p: str(p).endswith("test.gguf"),
+        )
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/preflight",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "2,2,2",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["parallel_slots"] == 2
+        assert data["cache_type_k"] == "q8_0"
+        assert data["cache_type_v"] == "q8_0"
+        assert data["batch_size"] == 4096
+        assert data["ubatch_size"] == 1024
+
+    def test_launch_args_preview_uses_saved_performance_fields(
+        self,
+        app_client,
+        monkeypatch,
+    ):
+        """launch_args_preview uses saved fields when payload omits them."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "saved-preview", "host_port": 8158},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={
+                "parallel_slots": 2,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "batch_size": 4096,
+                "ubatch_size": 1024,
+            },
+        )
+        assert resp.status_code == 200
+
+        monkeypatch.setattr(
+            "os.path.exists",
+            lambda p: str(p).endswith("test.gguf"),
+        )
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/preflight",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "all",
+                "tensor_split": "2,2,2",
+            },
+        )
+        assert resp.status_code == 200
+        preview = resp.get_json()["launch_args_preview"]
+        preview_dict = dict(zip(preview[0::2], preview[1::2]))
+        assert preview_dict["--parallel"] == "2"
+        assert preview_dict["--cache-type-k"] == "q8_0"
+        assert preview_dict["--cache-type-v"] == "q8_0"
+        assert preview_dict["--batch-size"] == "4096"
+        assert preview_dict["--ubatch-size"] == "1024"
 
     def test_patch_empty_parallel_slots_resets_to_default(self, app_client):
         """PATCH parallel_slots="" resets to the default of 1."""
