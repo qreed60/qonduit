@@ -49,6 +49,15 @@ _MAX_PARALLEL_SLOTS = 16
 _DEFAULT_BATCH_SIZE = 8192
 _DEFAULT_UBATCH_SIZE = 2048
 
+_PERFORMANCE_DEFAULTS: dict[str, Any] = {
+    "parallel_slots": _DEFAULT_PARALLEL_SLOTS,
+    "cache_type_k": _DEFAULT_CACHE_TYPE_K,
+    "cache_type_v": _DEFAULT_CACHE_TYPE_V,
+    "batch_size": _DEFAULT_BATCH_SIZE,
+    "ubatch_size": _DEFAULT_UBATCH_SIZE,
+}
+_PERFORMANCE_FIELDS = tuple(_PERFORMANCE_DEFAULTS)
+
 _BATCH_SIZE_OPTIONS: list[int] = [512, 1024, 2048, 4096, 8192]
 _UBATCH_SIZE_OPTIONS: list[int] = [256, 512, 1024, 2048]
 
@@ -367,7 +376,12 @@ def _normalize_cache_type_value(value: Any, default: str) -> str:
 
 
 def _with_performance_defaults(slot: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy with normalized persisted performance defaults."""
+    """Return a copy with normalized persisted performance defaults.
+
+    This is the migration point for legacy slot files. It guarantees every
+    slot loaded from storage, returned by the API, or used as a preflight
+    base has the persisted performance fields expected by newer callers.
+    """
     normalized = dict(slot)
 
     parallel_slots, err = _resolve_parallel_slots(
@@ -399,6 +413,13 @@ def _with_performance_defaults(slot: dict[str, Any]) -> dict[str, Any]:
         )
 
     return normalized
+
+
+def _performance_field_values(slot: dict[str, Any]) -> dict[str, Any]:
+    """Return only normalized performance fields for storage/API merging."""
+    normalized = _with_performance_defaults(slot)
+    return {field: normalized[field] for field in _PERFORMANCE_FIELDS}
+
 
 def _validate_cache_type(cache_type: Any) -> Optional[str]:
     """Return error string if cache_type is invalid, else None.
@@ -544,11 +565,7 @@ def _build_default_slot() -> dict[str, Any]:
         "tensor_split": "auto",
         "embeddings_enabled": True,
         "extra_args": [],
-        "parallel_slots": _DEFAULT_PARALLEL_SLOTS,
-        "cache_type_k": _DEFAULT_CACHE_TYPE_K,
-        "cache_type_v": _DEFAULT_CACHE_TYPE_V,
-        "batch_size": _DEFAULT_BATCH_SIZE,
-        "ubatch_size": _DEFAULT_UBATCH_SIZE,
+        **_PERFORMANCE_DEFAULTS,
         "running": False,
         "exists": False,
         "ready": False,
@@ -645,7 +662,7 @@ def load_slots() -> list[dict[str, Any]]:
                 changed = False
                 for slot in data:
                     merged = {**default_template, **slot}
-                    merged = _with_performance_defaults(merged)
+                    merged.update(_performance_field_values(merged))
                     # Re-derive derived fields from persisted values
                     merged["endpoint_base"] = (
                         f"http://{merged.get('host', _QONDUIT_DEFAULT_HOST)}:{merged.get('host_port', 8080)}"

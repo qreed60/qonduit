@@ -311,6 +311,35 @@ class TestSlotConfigStorage:
         slot = get_slot("primary")
         assert slot["display_name"] == "My Primary"
 
+    def test_create_slot_stores_all_performance_fields(self, _fresh_slots):
+        """Create stores all persisted performance fields together."""
+        from qonduit_slots import create_slot, load_slots
+
+        created, err = create_slot({
+            "slot_id": "perf-create",
+            "host_port": 8188,
+            "parallel_slots": 2,
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q8_0",
+            "batch_size": 4096,
+            "ubatch_size": 1024,
+        })
+
+        assert err is None
+        expected = {
+            "parallel_slots": 2,
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q8_0",
+            "batch_size": 4096,
+            "ubatch_size": 1024,
+        }
+        for field, value in expected.items():
+            assert created[field] == value
+
+        stored = next(s for s in load_slots() if s["slot_id"] == "perf-create")
+        for field, value in expected.items():
+            assert stored[field] == value
+
     def test_update_slot_persists_performance_fields(self, _fresh_slots):
         """PATCH storage fields are persisted in router_slots.json."""
         from qonduit_slots import update_slot
@@ -337,6 +366,31 @@ class TestSlotConfigStorage:
         assert primary["cache_type_v"] == "q8_0"
         assert primary["batch_size"] == 4096
         assert primary["ubatch_size"] == 1024
+
+    def test_slot_to_live_status_includes_performance_fields(self, _fresh_slots):
+        """Live status responses include normalized performance fields."""
+        from qonduit_slots import slot_to_live_status
+
+        status = slot_to_live_status({
+            "slot_id": "legacy-status",
+            "display_name": "Legacy Status",
+            "purpose": "custom",
+            "container_name": "llama_server_legacy_status",
+            "host": "192.168.5.5",
+            "host_port": 8198,
+            "internal_port": 8080,
+            "context_size": 65536,
+            "gpu_devices": "all",
+            "tensor_split": "auto",
+            "embeddings_enabled": True,
+            "extra_args": [],
+        })
+
+        assert status["parallel_slots"] == 1
+        assert status["cache_type_k"] == "f16"
+        assert status["cache_type_v"] == "f16"
+        assert status["batch_size"] == 8192
+        assert status["ubatch_size"] == 2048
 
     def test_performance_fields_survive_save_load_cycle(self, _fresh_slots):
         """Non-default performance values survive reloading slot storage."""
