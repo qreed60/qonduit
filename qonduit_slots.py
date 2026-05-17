@@ -409,9 +409,13 @@ def validate_slot(slot: dict[str, Any]) -> list[dict[str, str]]:
     if us_err:
         errors.append({"field": "ubatch_size", "message": us_err})
 
-    # Cross-validate: ubatch_size must not exceed batch_size
+    # Cross-validate: ubatch_size must not exceed batch_size.
+    # Missing/null values are accepted above as reset-to-default, so compare the
+    # effective defaults here rather than raw None values.
     if not bs_err and not us_err:
-        if us_valid > bs_valid:
+        effective_bs = bs_valid or _DEFAULT_BATCH_SIZE
+        effective_us = us_valid or _DEFAULT_UBATCH_SIZE
+        if effective_us > effective_bs:
             errors.append({
                 "field": "ubatch_size",
                 "message": "ubatch_size must not exceed batch_size",
@@ -670,11 +674,11 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
     # Parallel slots
     if "parallel_slots" in payload:
         parallel_slots = payload["parallel_slots"]
-        if isinstance(parallel_slots, bool):
-            return {}, "invalid_slot"
-        try:
-            parallel_slots = int(parallel_slots)
-        except (ValueError, TypeError):
+        if parallel_slots is None or (
+            isinstance(parallel_slots, str) and not parallel_slots.strip()
+        ):
+            parallel_slots = _DEFAULT_PARALLEL_SLOTS
+        elif not isinstance(parallel_slots, int) or isinstance(parallel_slots, bool):
             return {}, "invalid_slot"
         if parallel_slots < _MIN_PARALLEL_SLOTS or parallel_slots > _MAX_PARALLEL_SLOTS:
             return {}, "invalid_slot"
@@ -856,7 +860,7 @@ def update_slot(
                         return {}, "invalid_slot"
             # PATCH explicit null/empty for parallel_slots → reset to default 1
             elif field == "parallel_slots":
-                if value is None:
+                if value is None or (isinstance(value, str) and not value.strip()):
                     value = _DEFAULT_PARALLEL_SLOTS
                 elif isinstance(value, bool):
                     return {}, "invalid_slot"

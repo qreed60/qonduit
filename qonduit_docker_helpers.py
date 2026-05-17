@@ -261,9 +261,20 @@ def launch_slot_container(
     extra_args = launch_payload.get("extra_args") or slot.get("extra_args", [])
 
     # Determine parallel_slots (default 1)
-    parallel_slots = int(
-        launch_payload.get("parallel_slots") or slot.get("parallel_slots", 1),
+    raw_parallel_slots = launch_payload.get(
+        "parallel_slots",
+        slot.get("parallel_slots", 1),
     )
+    if raw_parallel_slots is None or (
+        isinstance(raw_parallel_slots, str)
+        and not raw_parallel_slots.strip()
+    ):
+        parallel_slots = 1
+    else:
+        try:
+            parallel_slots = int(raw_parallel_slots)
+        except (ValueError, TypeError):
+            parallel_slots = 1
     if parallel_slots < 1:
         parallel_slots = 1
     if parallel_slots > 16:
@@ -355,8 +366,12 @@ def launch_slot_container(
     has_batch = True  # batch_size always has a default value
     has_ubatch = True  # ubatch_size always has a default value
 
+    skip_next_extra_arg = False
     for arg in extra_args:
         arg_str = str(arg).strip()
+        if skip_next_extra_arg:
+            skip_next_extra_arg = False
+            continue
 
         # tensor_split conflicts
         if has_tensor_split:
@@ -365,6 +380,7 @@ def launch_slot_container(
                     f"Ignoring {arg_str} from extra_args because "
                     f"tensor_split field is set"
                 )
+                skip_next_extra_arg = True
                 continue
             if arg_str.startswith("--tensor-split="):
                 extra_args_warning = (
@@ -380,6 +396,7 @@ def launch_slot_container(
                     f"Ignoring {arg_str} from extra_args because "
                     f"batch_size field is set"
                 )
+                skip_next_extra_arg = True
                 continue
             if arg_str.startswith("--batch-size="):
                 extra_args_warning = (
@@ -395,6 +412,7 @@ def launch_slot_container(
                     f"Ignoring {arg_str} from extra_args because "
                     f"ubatch_size field is set"
                 )
+                skip_next_extra_arg = True
                 continue
             if arg_str.startswith("--ubatch-size="):
                 extra_args_warning = (
@@ -417,7 +435,11 @@ def launch_slot_container(
 
     # Parallel slots flag
     if parallel_slots > 1:
-        cmd.extend(["--parallel", str(parallel_slots)])
+        probe_cache = probe_llama_server_flags()
+        parallel_flag = probe_cache.get("parallel_flag", "--parallel")
+        if parallel_flag not in ("--parallel", "-np"):
+            parallel_flag = "--parallel"
+        cmd.extend([parallel_flag, str(parallel_slots)])
 
     if split_val is not None:
         cmd.extend(["--tensor-split", split_val])
@@ -1115,11 +1137,17 @@ def probe_llama_server_flags() -> dict[str, Any]:
     If probing fails, returns defaults without raising.
     """
     global _llama_server_flag_cache
-    if _llama_server_flag_cache is not None:
-        return dict(_llama_server_flag_cache)
+    # Re-probe on each call so tests and upgraded llama.cpp binaries see the
+    # current flag set immediately. The cache is retained only as a last-known
+    # value for callers that explicitly inspect/reset it.
 
     result: dict[str, Any] = {
+        "ok": False,
         "parallel_flag": "--parallel",
+        "supports_parallel": False,
+        "supports_np": False,
+        "error": None,
+        # Backward-compatible fields used by existing tests/callers.
         "cache_type_k_flag": "--cache-type-k",
         "cache_type_v_flag": "--cache-type-v",
         "probed": False,
@@ -1186,12 +1214,19 @@ def probe_llama_server_flags() -> dict[str, Any]:
                 except (subprocess.TimeoutExpired, FileNotFoundError):
                     continue
 
+        if isinstance(help_text, bytes):
+            help_text = help_text.decode("utf-8", errors="ignore")
+
         if help_text:
+            result["ok"] = True
             result["probed"] = True
-            # Check for --parallel flag
-            if "--parallel" in help_text:
+            result["supports_parallel"] = "--parallel" in help_text
+            result["supports_np"] = (
+                "-np" in help_text or "--num-processor" in help_text
+            )
+            if result["supports_parallel"]:
                 result["parallel_flag"] = "--parallel"
-            elif "-np" in help_text or "--num-processor" in help_text:
+            elif result["supports_np"]:
                 result["parallel_flag"] = "-np"
             # Check for cache type flags
             if "--cache-type-k" in help_text:
@@ -1200,9 +1235,11 @@ def probe_llama_server_flags() -> dict[str, Any]:
                 result["cache_type_v_flag"] = "--cache-type-v"
         else:
             result["probed"] = False
+            result["error"] = "llama-server help text unavailable"
             result["warning"] = "llama-server help text unavailable; using default flag assumptions"
 
     except Exception as e:
+        result["error"] = str(e)
         result["warning"] = f"flag probing failed: {e}"
 
     _llama_server_flag_cache = result
@@ -1328,6 +1365,9 @@ def estimate_kv_cache_mib(
         "cache_type_v": cache_type_v,
         "baseline_cache_type_k": "f16",
         "baseline_cache_type_v": "f16",
+        "estimated_mib": round(exact_mib, 2),
+        "kv_cache_mib": round(exact_mib, 2),
+        "total_mib": round(exact_mib, 2),
         "estimated_kv_cache_mib": round(exact_mib, 2),
         "estimated_kv_cache_f16_mib": round(baseline_mib, 2),
         "estimated_savings_vs_f16_mib": round(savings_mib, 2),
