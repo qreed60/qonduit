@@ -8,12 +8,27 @@ No function touches another slot's container.
 from __future__ import annotations
 
 import json
+import importlib
+import importlib.util
 import os
 import re
 import subprocess
 from typing import Any, Optional
 
-import requests
+
+class _RequestsUnavailable:
+    """Minimal requests-compatible placeholder for missing test deps."""
+
+    def get(self, *_args: Any, **_kwargs: Any) -> Any:
+        """Raise the dependency error when HTTP helpers are actually used."""
+        raise ModuleNotFoundError("No module named 'requests'")
+
+
+requests = (
+    importlib.import_module("requests")
+    if importlib.util.find_spec("requests") is not None
+    else _RequestsUnavailable()
+)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
