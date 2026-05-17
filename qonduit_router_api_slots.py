@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import requests
-
 from flask import Flask, jsonify, request, Response
 
 from qonduit_slots import (

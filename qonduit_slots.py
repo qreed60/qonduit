@@ -285,19 +285,73 @@ def _validate_embeddings(embeddings_enabled: Any) -> Optional[str]:
     return None
 
 
-def _validate_parallel_slots(parallel_slots: Any) -> Optional[str]:
-    """Return error string if parallel_slots is invalid, else None.
+def _normalize_parallel_slots(
+    parallel_slots: Any,
+) -> tuple[int | None, str | None]:
+    """Validate and normalize a parallel_slots value.
 
-    Accepts None (treated as default). Rejects bools, floats, strings, etc.
+    Numeric strings are accepted because HTML form inputs commonly submit
+    numeric values as strings. ``None`` or an empty string means reset to the
+    default. Booleans are rejected explicitly because ``bool`` is a subclass of
+    ``int`` in Python.
     """
     if parallel_slots is None:
-        return None
-    if not isinstance(parallel_slots, int) or isinstance(parallel_slots, bool):
-        return "parallel_slots must be an integer"
+        return None, None
+    if isinstance(parallel_slots, bool):
+        return None, "parallel_slots must be an integer"
+    if isinstance(parallel_slots, str):
+        stripped = parallel_slots.strip()
+        if stripped == "":
+            return None, None
+        try:
+            parallel_slots = int(stripped)
+        except ValueError:
+            return None, "parallel_slots must be an integer"
+    if not isinstance(parallel_slots, int):
+        return None, "parallel_slots must be an integer"
     if parallel_slots < _MIN_PARALLEL_SLOTS or parallel_slots > _MAX_PARALLEL_SLOTS:
-        return (
+        return None, (
             f"parallel_slots must be between {_MIN_PARALLEL_SLOTS} and "
             f"{_MAX_PARALLEL_SLOTS}"
+        )
+    return parallel_slots, None
+
+
+def _validate_parallel_slots(parallel_slots: Any) -> Optional[str]:
+    """Return error string if parallel_slots is invalid, else None."""
+    _, err = _normalize_parallel_slots(parallel_slots)
+    return err
+
+
+def _resolve_parallel_slots(value: Any) -> tuple[int | None, str | None]:
+    """Return a concrete parallel slot count, applying the default reset."""
+    normalized, err = _normalize_parallel_slots(value)
+    if err:
+        return None, err
+    return normalized or _DEFAULT_PARALLEL_SLOTS, None
+
+
+def _resolve_batch_size(value: Any) -> tuple[int | None, str | None]:
+    """Return a concrete batch size, applying the default reset."""
+    normalized, err = _validate_batch_size(value)
+    if err:
+        return None, err
+    return normalized or _DEFAULT_BATCH_SIZE, None
+
+
+def _resolve_ubatch_size(value: Any) -> tuple[int | None, str | None]:
+    """Return a concrete micro-batch size, applying the default reset."""
+    normalized, err = _validate_ubatch_size(value)
+    if err:
+        return None, err
+    return normalized or _DEFAULT_UBATCH_SIZE, None
+
+
+def _validate_batch_pair(batch_size: int, ubatch_size: int) -> Optional[str]:
+    """Validate relationship between batch and micro-batch sizes."""
+    if ubatch_size > batch_size:
+        return (
+            "ubatch_size must not exceed batch_size"
         )
     return None
 
@@ -415,10 +469,11 @@ def validate_slot(slot: dict[str, Any]) -> list[dict[str, str]]:
     if not bs_err and not us_err:
         effective_bs = bs_valid or _DEFAULT_BATCH_SIZE
         effective_us = us_valid or _DEFAULT_UBATCH_SIZE
-        if effective_us > effective_bs:
+        err = _validate_batch_pair(effective_bs, effective_us)
+        if err:
             errors.append({
                 "field": "ubatch_size",
-                "message": "ubatch_size must not exceed batch_size",
+                "message": err,
             })
 
     return errors
@@ -672,18 +727,9 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
     embeddings_enabled = payload.get("embeddings_enabled", False)
 
     # Parallel slots
-    if "parallel_slots" in payload:
-        parallel_slots = payload["parallel_slots"]
-        if parallel_slots is None or (
-            isinstance(parallel_slots, str) and not parallel_slots.strip()
-        ):
-            parallel_slots = _DEFAULT_PARALLEL_SLOTS
-        elif not isinstance(parallel_slots, int) or isinstance(parallel_slots, bool):
-            return {}, "invalid_slot"
-        if parallel_slots < _MIN_PARALLEL_SLOTS or parallel_slots > _MAX_PARALLEL_SLOTS:
-            return {}, "invalid_slot"
-    else:
-        parallel_slots = _DEFAULT_PARALLEL_SLOTS
+    parallel_slots, err = _resolve_parallel_slots(payload.get("parallel_slots"))
+    if err:
+        return {}, "invalid_slot"
 
     # Cache types
     if "cache_type_k" in payload:
@@ -709,34 +755,19 @@ def create_slot(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]
         cache_type_v = _DEFAULT_CACHE_TYPE_V
 
     # Batch size
-    if "batch_size" in payload:
-        raw_bs = payload["batch_size"]
-        if raw_bs is None or (isinstance(raw_bs, str) and not raw_bs.strip()):
-            batch_size = _DEFAULT_BATCH_SIZE
-        else:
-            bs_valid, bs_err = _validate_batch_size(raw_bs)
-            if bs_err:
-                return {}, bs_err
-            batch_size = bs_valid
-    else:
-        batch_size = _DEFAULT_BATCH_SIZE
+    batch_size, err = _resolve_batch_size(payload.get("batch_size"))
+    if err:
+        return {}, err
 
     # Micro-batch size
-    if "ubatch_size" in payload:
-        raw_us = payload["ubatch_size"]
-        if raw_us is None or (isinstance(raw_us, str) and not raw_us.strip()):
-            ubatch_size = _DEFAULT_UBATCH_SIZE
-        else:
-            us_valid, us_err = _validate_ubatch_size(raw_us)
-            if us_err:
-                return {}, us_err
-            ubatch_size = us_valid
-    else:
-        ubatch_size = _DEFAULT_UBATCH_SIZE
+    ubatch_size, err = _resolve_ubatch_size(payload.get("ubatch_size"))
+    if err:
+        return {}, err
 
     # Cross-validate: ubatch_size must not exceed batch_size
-    if ubatch_size > batch_size:
-        return {}, "ubatch_size must not exceed batch_size"
+    err = _validate_batch_pair(batch_size, ubatch_size)
+    if err:
+        return {}, err
 
     display_name = (payload.get("display_name") or slot_id).strip()
     if not display_name:
@@ -860,35 +891,19 @@ def update_slot(
                         return {}, "invalid_slot"
             # PATCH explicit null/empty for parallel_slots → reset to default 1
             elif field == "parallel_slots":
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    value = _DEFAULT_PARALLEL_SLOTS
-                elif isinstance(value, bool):
-                    return {}, "invalid_slot"
-                else:
-                    try:
-                        value = int(value)
-                    except (ValueError, TypeError):
-                        return {}, "invalid_slot"
-                if value < _MIN_PARALLEL_SLOTS or value > _MAX_PARALLEL_SLOTS:
+                value, err = _resolve_parallel_slots(value)
+                if err:
                     return {}, "invalid_slot"
             # PATCH explicit null/empty for batch_size → reset to default 8192
             elif field == "batch_size":
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    value = _DEFAULT_BATCH_SIZE
-                else:
-                    v_valid, v_err = _validate_batch_size(value)
-                    if v_err:
-                        return {}, v_err
-                    value = v_valid
+                value, err = _resolve_batch_size(value)
+                if err:
+                    return {}, err
             # PATCH explicit null/empty for ubatch_size → reset to default 2048
             elif field == "ubatch_size":
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    value = _DEFAULT_UBATCH_SIZE
-                else:
-                    v_valid, v_err = _validate_ubatch_size(value)
-                    if v_err:
-                        return {}, v_err
-                    value = v_valid
+                value, err = _resolve_ubatch_size(value)
+                if err:
+                    return {}, err
             slot[field] = value
 
     # Re-derive derived fields if host or host_port changed

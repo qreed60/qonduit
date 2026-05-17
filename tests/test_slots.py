@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import json
+import importlib
 import os
 import subprocess
 import sys
@@ -2997,13 +2998,46 @@ class TestParallelSlotsValidation:
         })
         assert err == "invalid_slot"
 
-    def test_reject_parallel_slots_string(self, _fresh_slots):
-        """parallel_slots must be integer, string is rejected."""
+    def test_accept_parallel_slots_numeric_string(self, _fresh_slots):
+        """parallel_slots accepts numeric strings from web forms."""
         from qonduit_slots import create_slot
-        _, err = create_slot({
+        new_slot, err = create_slot({
             "slot_id": "str-parallel",
             "host_port": 8092,
             "parallel_slots": "4",
+        })
+        assert err is None
+        assert new_slot["parallel_slots"] == 4
+
+    def test_create_slot_empty_parallel_slots_defaults(self, _fresh_slots):
+        """Empty-string parallel_slots resets to default on create."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "empty-parallel",
+            "host_port": 8192,
+            "parallel_slots": "",
+        })
+        assert err is None
+        assert new_slot["parallel_slots"] == 1
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_reject_parallel_slots_bool(self, _fresh_slots, value):
+        """Boolean parallel_slots values are rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": f"bool-parallel-{value}",
+            "host_port": 8193 + int(value),
+            "parallel_slots": value,
+        })
+        assert err == "invalid_slot"
+
+    def test_reject_parallel_slots_invalid_string(self, _fresh_slots):
+        """Non-numeric parallel_slots strings are rejected."""
+        from qonduit_slots import create_slot
+        _, err = create_slot({
+            "slot_id": "bad-str-parallel",
+            "host_port": 8195,
+            "parallel_slots": "abc",
         })
         assert err == "invalid_slot"
 
@@ -3403,6 +3437,12 @@ class TestPreflightParallelCache:
 class TestKVCacheEstimate:
     """Tests for estimate_kv_cache_mib function."""
 
+    def test_estimate_helper_is_exposed(self):
+        """qonduit_docker_helpers exposes estimate_kv_cache_mib."""
+        import qonduit_docker_helpers
+
+        assert callable(qonduit_docker_helpers.estimate_kv_cache_mib)
+
     def test_estimate_basic(self):
         """estimate_kv_cache_mib returns correct structure."""
         from qonduit_docker_helpers import estimate_kv_cache_mib
@@ -3416,6 +3456,9 @@ class TestKVCacheEstimate:
         assert result["cache_type_v"] == "f16"
         assert result["baseline_cache_type_k"] == "f16"
         assert result["baseline_cache_type_v"] == "f16"
+        assert result["estimated_mib"] > 0
+        assert result["kv_cache_mib"] > 0
+        assert result["total_mib"] > 0
         assert result["estimated_kv_cache_mib"] > 0
         assert result["estimated_kv_cache_f16_mib"] > 0
 
@@ -3543,6 +3586,36 @@ class TestLaunchFlagsParallelCache:
 
 class TestProbeLlamaServerFlags:
     """Tests for llama-server flag probing."""
+
+    def test_probe_helper_is_exposed(self):
+        """qonduit_docker_helpers exposes probe_llama_server_flags."""
+        import qonduit_docker_helpers
+
+        assert callable(qonduit_docker_helpers.probe_llama_server_flags)
+
+    def test_router_api_slots_imports_cleanly(self):
+        """qonduit_router_api_slots imports its helper contract cleanly."""
+        pytest.importorskip("flask")
+
+        import qonduit_router_api_slots
+        reloaded = importlib.reload(qonduit_router_api_slots)
+        assert callable(reloaded.probe_llama_server_flags)
+        assert callable(reloaded.estimate_kv_cache_mib)
+
+    def test_probe_stable_shape(self):
+        """probe_llama_server_flags returns the stable frontend contract."""
+        from qonduit_docker_helpers import probe_llama_server_flags
+
+        result = probe_llama_server_flags()
+        for key in [
+            "ok",
+            "parallel_flag",
+            "supports_parallel",
+            "supports_np",
+            "error",
+        ]:
+            assert key in result
+        assert result["parallel_flag"] in {"--parallel", "-np"}
 
     def test_probe_default_fallback(self):
         """probe_llama_server_flags returns fallback flags when llama-server not found."""
@@ -3878,6 +3951,17 @@ class TestBatchSizeValidation:
         assert err is None
         assert new_slot["batch_size"] == 4096
 
+    def test_create_slot_with_batch_size_numeric_string(self, _fresh_slots):
+        """Create slot accepts batch_size as a numeric string."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "batch-string-test",
+            "host_port": 8210,
+            "batch_size": "8192",
+        })
+        assert err is None
+        assert new_slot["batch_size"] == 8192
+
     def test_create_slot_with_ubatch_size(self, _fresh_slots):
         """Create slot with explicit ubatch_size."""
         from qonduit_slots import create_slot
@@ -3888,6 +3972,17 @@ class TestBatchSizeValidation:
         })
         assert err is None
         assert new_slot["ubatch_size"] == 1024
+
+    def test_create_slot_with_ubatch_size_numeric_string(self, _fresh_slots):
+        """Create slot accepts ubatch_size as a numeric string."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "ubatch-string-test",
+            "host_port": 8211,
+            "ubatch_size": "2048",
+        })
+        assert err is None
+        assert new_slot["ubatch_size"] == 2048
 
     def test_create_slot_with_both_batch_fields(self, _fresh_slots):
         """Create slot with both batch_size and ubatch_size."""
@@ -3912,12 +4007,34 @@ class TestBatchSizeValidation:
         assert err is None
         assert new_slot["batch_size"] == 8192
 
+    def test_create_slot_empty_batch_size_defaults(self, _fresh_slots):
+        """Empty-string batch_size resets to default on create."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "default-empty-batch",
+            "host_port": 8212,
+            "batch_size": "",
+        })
+        assert err is None
+        assert new_slot["batch_size"] == 8192
+
     def test_create_slot_default_ubatch_size(self, _fresh_slots):
         """Ubath defaults to 2048 when not specified."""
         from qonduit_slots import create_slot
         new_slot, err = create_slot({
             "slot_id": "default-ubatch",
             "host_port": 8114,
+        })
+        assert err is None
+        assert new_slot["ubatch_size"] == 2048
+
+    def test_create_slot_empty_ubatch_size_defaults(self, _fresh_slots):
+        """Empty-string ubatch_size resets to default on create."""
+        from qonduit_slots import create_slot
+        new_slot, err = create_slot({
+            "slot_id": "default-empty-ubatch",
+            "host_port": 8213,
+            "ubatch_size": "",
         })
         assert err is None
         assert new_slot["ubatch_size"] == 2048
@@ -3998,37 +4115,39 @@ class TestBatchSizeValidation:
         assert err is not None
         assert "ubatch_size must not exceed batch_size" in err
 
-    def test_reject_batch_size_bool(self, _fresh_slots):
+    @pytest.mark.parametrize("value", [True, False])
+    def test_reject_batch_size_bool(self, _fresh_slots, value):
         """Boolean batch_size is rejected."""
         from qonduit_slots import create_slot
         _, err = create_slot({
-            "slot_id": "bool-batch",
-            "host_port": 8122,
-            "batch_size": True,
+            "slot_id": f"bool-batch-{value}",
+            "host_port": 8122 + int(value),
+            "batch_size": value,
         })
         assert err is not None
 
-    def test_reject_ubatch_size_bool(self, _fresh_slots):
+    @pytest.mark.parametrize("value", [True, False])
+    def test_reject_ubatch_size_bool(self, _fresh_slots, value):
         """Boolean ubatch_size is rejected."""
         from qonduit_slots import create_slot
         _, err = create_slot({
-            "slot_id": "bool-ubatch",
-            "host_port": 8123,
-            "ubatch_size": False,
+            "slot_id": f"bool-ubatch-{value}",
+            "host_port": 8124 + int(value),
+            "ubatch_size": value,
         })
         assert err is not None
 
     def test_batch_size_validated_in_update(self, _fresh_slots):
         """PATCH rejects invalid batch_size."""
         from qonduit_slots import create_slot, update_slot
-        new_slot, _ = create_slot({"slot_id": "upd-batch", "host_port": 8124})
+        new_slot, _ = create_slot({"slot_id": "upd-batch", "host_port": 8126})
         _, err = update_slot("upd-batch", {"batch_size": -5})
         assert err is not None
 
     def test_ubatch_size_validated_in_update(self, _fresh_slots):
         """PATCH rejects invalid ubatch_size."""
         from qonduit_slots import create_slot, update_slot
-        new_slot, _ = create_slot({"slot_id": "upd-ubatch", "host_port": 8125})
+        new_slot, _ = create_slot({"slot_id": "upd-ubatch", "host_port": 8127})
         _, err = update_slot("upd-ubatch", {"ubatch_size": 0})
         assert err is not None
 
@@ -4052,6 +4171,91 @@ class TestSlotPatchBatchSize:
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["slot"]["batch_size"] == 4096
+
+    def test_patch_numeric_strings(self, app_client):
+        """PATCH accepts numeric strings for performance-control fields."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "numeric-string-patch", "host_port": 8180},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={
+                "parallel_slots": "2",
+                "batch_size": "8192",
+                "ubatch_size": "2048",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()["slot"]
+        assert data["parallel_slots"] == 2
+        assert data["batch_size"] == 8192
+        assert data["ubatch_size"] == 2048
+
+    def test_clearing_tensor_split_preserves_performance_fields(self, app_client):
+        """Clearing tensor_split does not reset parallel/cache/batch fields."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={
+                "slot_id": "clear-tensor-preserve",
+                "host_port": 8181,
+                "tensor_split": "0.5,0.5",
+                "parallel_slots": "2",
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q4_0",
+                "batch_size": "4096",
+                "ubatch_size": "1024",
+            },
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"tensor_split": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()["slot"]
+        assert data["tensor_split"] is None
+        assert data["parallel_slots"] == 2
+        assert data["cache_type_k"] == "q8_0"
+        assert data["cache_type_v"] == "q4_0"
+        assert data["batch_size"] == 4096
+        assert data["ubatch_size"] == 1024
+
+    def test_resetting_batch_fields_preserves_other_performance_fields(self, app_client):
+        """Resetting batch fields leaves tensor_split/parallel/cache unchanged."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={
+                "slot_id": "reset-batch-preserve",
+                "host_port": 8182,
+                "tensor_split": "0.5,0.5",
+                "parallel_slots": "2",
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q4_0",
+                "batch_size": "4096",
+                "ubatch_size": "1024",
+            },
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        resp = app_client.patch(
+            f"/api/v1/qonduit-router/slots/{slot_id}",
+            json={"batch_size": "", "ubatch_size": None},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()["slot"]
+        assert data["tensor_split"] == "0.5,0.5"
+        assert data["parallel_slots"] == 2
+        assert data["cache_type_k"] == "q8_0"
+        assert data["cache_type_v"] == "q4_0"
+        assert data["batch_size"] == 8192
+        assert data["ubatch_size"] == 2048
 
     def test_patch_ubatch_size(self, app_client):
         """PATCH can update ubatch_size."""
@@ -4234,6 +4438,45 @@ class TestBatchSizePreflightLaunch:
         assert "--ubatch-size" in preview
         ubatch_idx = preview.index("--ubatch-size")
         assert preview[ubatch_idx + 1] == "2048"
+
+    def test_combined_numeric_string_preflight_launch_args(self, app_client, monkeypatch):
+        """Numeric-string preflight composes all performance-control flags."""
+        resp = app_client.post(
+            "/api/v1/qonduit-router/slots",
+            json={"slot_id": "combined-preflight", "host_port": 8183},
+        )
+        assert resp.status_code == 201
+        slot_id = resp.get_json()["slot"]["slot_id"]
+
+        monkeypatch.setattr("os.path.exists", lambda p: str(p).endswith("test.gguf"))
+
+        resp = app_client.post(
+            f"/api/v1/qonduit-router/slots/{slot_id}/preflight",
+            json={
+                "model": "test.gguf",
+                "context_size": 65536,
+                "gpu_devices": "0,1",
+                "tensor_split": "0.5,0.5",
+                "parallel_slots": "2",
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q4_0",
+                "batch_size": "8192",
+                "ubatch_size": "2048",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        preview = data.get("launch_args_preview", [])
+        preview_str = " ".join(preview)
+        assert data["parallel_slots"] == 2
+        assert data["batch_size"] == 8192
+        assert data["ubatch_size"] == 2048
+        assert "--tensor-split 0.5,0.5" in preview_str
+        assert "--parallel 2" in preview_str or "-np 2" in preview_str
+        assert "--cache-type-k q8_0" in preview_str
+        assert "--cache-type-v q4_0" in preview_str
+        assert "--batch-size 8192" in preview_str
+        assert "--ubatch-size 2048" in preview_str
 
     def test_launch_command_includes_batch_flags(self, app_client, monkeypatch):
         """Actual launch command includes --batch-size and --ubatch-size."""
@@ -4826,4 +5069,3 @@ class TestBackwardCompatibilityBatchDefaults:
         data = resp.get_json()
         assert data["batch_size"] == 8192
         assert data["ubatch_size"] == 2048
-
