@@ -5,7 +5,8 @@ Endpoints:
 - GET  /v1/tools/status               – tool status + dependency health
 - GET  /v1/gateway/settings/tools     – current tool settings
 - PATCH /v1/gateway/settings/tools    – update tool settings
-- POST /v1/tools/execute              – execute a tool
+- POST /v1/tools/execute              – execute a tool (body-based)
+- POST /v1/tools/{tool_id}/execute    – execute a tool (path-based, Phase 1)
 - GET  /v1/models/{model_id}/tools    – model-specific effective tools
 - GET  /v1/tools/audit                – audit log (Phase 5)
 """
@@ -66,6 +67,10 @@ class ErrorResponse(BaseModel):
     ok: bool = False
     error: str
     detail: str | None = None
+
+
+class ToolPathExecuteRequest(BaseModel):
+    input: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +816,120 @@ async def execute_tool_endpoint(req: ToolExecuteRequest) -> dict[str, Any]:
             "duration_ms": duration_ms,
             "error": "execution_error",
             "detail": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Path-parameter execute endpoint (simplified API)
+# ---------------------------------------------------------------------------
+
+# Phase 1: only these safe tools are executable via the path-based endpoint
+_PHASE1_EXECUTABLE_TOOLS: set[str] = {"gateway_health", "model_list"}
+
+
+@router.post("/v1/tools/{tool_id}/execute")
+async def path_execute_tool_endpoint(
+    tool_id: str,
+    req: ToolPathExecuteRequest | None = None,
+) -> dict[str, Any]:
+    """Execute a tool via path parameter with simplified request/response.
+
+    Phase 1 supports only safe, read-only tools: gateway_health and model_list.
+    """
+    input_data = req.input if req else {}
+    if input_data is None:
+        input_data = {}
+
+    start_ms = time.perf_counter_ns()
+
+    # 1. Look up tool definition
+    tool_def = get_tool(tool_id)
+    if not tool_def:
+        return {
+            "ok": False,
+            "tool_id": tool_id,
+            "danger_level": None,
+            "requires_confirmation": None,
+            "input": input_data,
+            "result": None,
+            "error": {"code": "tool_not_found", "message": "Tool not found or not executable"},
+        }
+
+    # 2. Determine danger level and confirmation requirement
+    is_safe = tool_id in SAFE_TOOLS
+    is_destructive = tool_def.get("destructive", False)
+
+    if is_destructive:
+        return {
+            "ok": False,
+            "tool_id": tool_id,
+            "danger_level": "destructive",
+            "requires_confirmation": True,
+            "input": input_data,
+            "result": None,
+            "error": {"code": "tool_destructive", "message": "Destructive tools are not executable in read-only mode"},
+        }
+
+    danger_level: str | None = "read_only" if is_safe else "write"
+    requires_confirmation: bool = False
+
+    # 3. Phase 1: only allow safe tools with an executor
+    if not is_safe:
+        return {
+            "ok": False,
+            "tool_id": tool_id,
+            "danger_level": danger_level,
+            "requires_confirmation": False,
+            "input": input_data,
+            "result": None,
+            "error": {"code": "tool_not_found", "message": "Tool not found or not executable"},
+        }
+
+    executor = _TOOL_EXECUTORS.get(tool_id)
+    if not executor:
+        return {
+            "ok": False,
+            "tool_id": tool_id,
+            "danger_level": danger_level,
+            "requires_confirmation": requires_confirmation,
+            "input": input_data,
+            "result": None,
+            "error": {"code": "tool_not_found", "message": f"No executor for tool: {tool_id}"},
+        }
+
+    # 4. Execute
+    try:
+        result = await executor(input_data)
+        duration_ns = time.perf_counter_ns() - start_ms
+        duration_ms = round(duration_ns / 1_000_000, 2)
+
+        ok = result.get("ok", False)
+        error = None if ok else {"code": "execution_failed", "message": result.get("error", str(result))}
+
+        return {
+            "ok": ok,
+            "tool_id": tool_id,
+            "danger_level": danger_level,
+            "requires_confirmation": requires_confirmation,
+            "input": input_data,
+            "result": result if ok else None,
+            "error": error,
+            "duration_ms": duration_ms,
+        }
+    except Exception as exc:
+        duration_ns = time.perf_counter_ns() - start_ms
+        duration_ms = round(duration_ns / 1_000_000, 2)
+        logger.exception("path_execute_tool_exception tool=%s", tool_id)
+
+        return {
+            "ok": False,
+            "tool_id": tool_id,
+            "danger_level": danger_level,
+            "requires_confirmation": requires_confirmation,
+            "input": input_data,
+            "result": None,
+            "error": {"code": "execution_error", "message": str(exc)},
+            "duration_ms": duration_ms,
         }
 
 
