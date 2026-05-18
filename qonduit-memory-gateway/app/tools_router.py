@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .tools import (
@@ -68,10 +68,6 @@ class ErrorResponse(BaseModel):
     ok: bool = False
     error: str
     detail: str | None = None
-
-
-class ToolPathExecuteRequest(BaseModel):
-    input: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -831,15 +827,73 @@ _PHASE1_EXECUTABLE_TOOLS: set[str] = {"gateway_health", "model_list"}
 @router.post("/v1/tools/{tool_id}/execute")
 async def path_execute_tool_endpoint(
     tool_id: str,
-    req: ToolPathExecuteRequest | None = None,
+    request: Request,
 ) -> dict[str, Any]:
     """Execute a tool via path parameter with simplified request/response.
 
     Phase 1 supports only safe, read-only tools: gateway_health and model_list.
     """
-    input_data = req.input if req else {}
-    if input_data is None:
-        input_data = {}
+    # Parse request body safely — no Pydantic 422 on malformed JSON
+    raw_body = await request.body()
+
+    if not raw_body or not raw_body.strip():
+        # No body at all → treat as empty input
+        input_data: dict[str, Any] = {}
+    else:
+        try:
+            parsed = json.loads(raw_body)
+        except (json.JSONDecodeError, ValueError):
+            # Malformed JSON → clean error response
+            return {
+                "ok": False,
+                "tool_id": tool_id,
+                "danger_level": None,
+                "requires_confirmation": None,
+                "input": {},
+                "result": None,
+                "error": {
+                    "code": "invalid_tool_input",
+                    "message": "Request body is not valid JSON",
+                },
+            }
+
+        if not isinstance(parsed, dict):
+            # Top-level body is not an object (e.g. "[1,2]" or "true")
+            return {
+                "ok": False,
+                "tool_id": tool_id,
+                "danger_level": None,
+                "requires_confirmation": None,
+                "input": {},
+                "result": None,
+                "error": {
+                    "code": "invalid_tool_input",
+                    "message": "Request body must be a JSON object",
+                },
+            }
+
+        raw_input = parsed.get("input")
+
+        if raw_input is None:
+            # {"input": null} or missing "input" key → treat as empty
+            input_data = {}
+        elif isinstance(raw_input, dict):
+            # {"input": {...}} → use as-is
+            input_data = raw_input
+        else:
+            # {"input": "bad"}, {"input": []}, {"input": 123}, {"input": true}
+            return {
+                "ok": False,
+                "tool_id": tool_id,
+                "danger_level": None,
+                "requires_confirmation": None,
+                "input": {},
+                "result": None,
+                "error": {
+                    "code": "invalid_tool_input",
+                    "message": "input must be an object or null",
+                },
+            }
 
     start_ms = time.perf_counter_ns()
 
