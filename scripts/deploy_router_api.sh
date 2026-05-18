@@ -24,13 +24,13 @@ for f in "$REPO"/qonduit_*.py; do
   [ -e "$f" ] || continue
   base="$(basename "$f")"
   echo "  /opt/$base -> $f"
-  ln -sfn "$f" "$OPT_DIR/$base"
+  sudo ln -sfn "$f" "$OPT_DIR/$base"
 done
 
 echo
 echo "==> Symlinking update script"
 if [ -f "$REPO/update.sh" ]; then
-  ln -sfn "$REPO/update.sh" "$OPT_DIR/update.sh"
+  sudo ln -sfn "$REPO/update.sh" "$OPT_DIR/update.sh"
 fi
 
 echo
@@ -47,7 +47,7 @@ python3 -m py_compile \
 
 echo
 echo "==> Restarting router API"
-systemctl restart qonduit-router-api.service
+sudo systemctl restart qonduit-router-api.service
 
 sleep 2
 
