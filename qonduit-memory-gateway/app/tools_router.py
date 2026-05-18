@@ -1089,24 +1089,38 @@ def _calc_duration_ms(start_ns: float) -> float:
 
 def _log_audit(response: dict[str, Any], input_data: dict[str, Any],
                client_host: str | None, path: str, tool_id: str) -> None:
-    """Record a tool execution audit event to the JSONL audit log."""
+    """Record a compact tool execution audit event to the JSONL audit log.
+
+    Audit records include only metadata — never full input/output payloads,
+    RAG text/chunks, secrets, or stack traces.
+    """
     event_id = str(uuid.uuid4())
+
+    # Compact input_keys: sorted list of keys if dict, else []
+    if isinstance(input_data, dict):
+        input_keys = sorted(input_data.keys())
+    else:
+        input_keys = []
+
+    # Extract error_code from response["error"]["code"] if present
+    error_val = response.get("error")
+    error_code = None
+    if isinstance(error_val, dict):
+        error_code = error_val.get("code")
+
     event: dict[str, Any] = {
         "event_id": event_id,
         "timestamp": _now_iso(),
         "event_type": "tool_execution",
         "tool_id": tool_id,
-        "path": path,
-        "client_host": client_host,
-        "input": input_data,
-        "output": {
-            "ok": response.get("ok", False),
-            "tool_id": response.get("tool_id"),
-            "danger_level": response.get("danger_level"),
-            "requires_confirmation": response.get("requires_confirmation"),
-            "result": response.get("result"),
-            "error": response.get("error"),
-        },
+        "ok": response.get("ok", False),
+        "error_code": error_code,
+        "danger_level": response.get("danger_level"),
+        "requires_confirmation": response.get("requires_confirmation"),
         "duration_ms": response.get("duration_ms"),
+        "input_keys": input_keys,
+        "client_host": client_host,
+        "path": path,
     }
     _audit_log(event)
+
