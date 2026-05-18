@@ -74,7 +74,7 @@ class ErrorResponse(BaseModel):
 # Audit log (Phase 5)
 # ---------------------------------------------------------------------------
 
-AUDIT_LOG_PATH = _data_dir() / "tool_audit.jsonl"
+AUDIT_LOG_PATH = _data_dir() / "tool_execution_audit.jsonl"
 
 
 def _audit_log(event: dict[str, Any]) -> None:
@@ -833,6 +833,10 @@ async def path_execute_tool_endpoint(
 
     Phase 1 supports only safe, read-only tools: gateway_health and model_list.
     """
+    # Capture request metadata for audit logging
+    client_host: str | None = request.client.host if request.client else None
+    path: str = request.url.path
+
     # Parse request body safely — no Pydantic 422 on malformed JSON
     raw_body = await request.body()
 
@@ -844,7 +848,7 @@ async def path_execute_tool_endpoint(
             parsed = json.loads(raw_body)
         except (json.JSONDecodeError, ValueError):
             # Malformed JSON → clean error response
-            return {
+            response = {
                 "ok": False,
                 "tool_id": tool_id,
                 "danger_level": None,
@@ -856,10 +860,12 @@ async def path_execute_tool_endpoint(
                     "message": "Request body is not valid JSON",
                 },
             }
+            _log_audit(response, {}, client_host, path, tool_id)
+            return response
 
         if not isinstance(parsed, dict):
             # Top-level body is not an object (e.g. "[1,2]" or "true")
-            return {
+            response = {
                 "ok": False,
                 "tool_id": tool_id,
                 "danger_level": None,
@@ -871,6 +877,8 @@ async def path_execute_tool_endpoint(
                     "message": "Request body must be a JSON object",
                 },
             }
+            _log_audit(response, {}, client_host, path, tool_id)
+            return response
 
         raw_input = parsed.get("input")
 
@@ -882,7 +890,7 @@ async def path_execute_tool_endpoint(
             input_data = raw_input
         else:
             # {"input": "bad"}, {"input": []}, {"input": 123}, {"input": true}
-            return {
+            response = {
                 "ok": False,
                 "tool_id": tool_id,
                 "danger_level": None,
@@ -894,13 +902,15 @@ async def path_execute_tool_endpoint(
                     "message": "input must be an object or null",
                 },
             }
+            _log_audit(response, {}, client_host, path, tool_id)
+            return response
 
     start_ms = time.perf_counter_ns()
 
     # 1. Look up tool definition
     tool_def = get_tool(tool_id)
     if not tool_def:
-        return {
+        response = {
             "ok": False,
             "tool_id": tool_id,
             "danger_level": None,
@@ -909,13 +919,17 @@ async def path_execute_tool_endpoint(
             "result": None,
             "error": {"code": "tool_not_found", "message": "Tool not found or not executable"},
         }
+        duration_ms = _calc_duration_ms(start_ms)
+        response["duration_ms"] = duration_ms
+        _log_audit(response, input_data, client_host, path, tool_id)
+        return response
 
     # 2. Determine danger level and confirmation requirement
     is_safe = tool_id in SAFE_TOOLS
     is_destructive = tool_def.get("destructive", False)
 
     if is_destructive:
-        return {
+        response = {
             "ok": False,
             "tool_id": tool_id,
             "danger_level": "destructive",
@@ -924,13 +938,17 @@ async def path_execute_tool_endpoint(
             "result": None,
             "error": {"code": "tool_destructive", "message": "Destructive tools are not executable in read-only mode"},
         }
+        duration_ms = _calc_duration_ms(start_ms)
+        response["duration_ms"] = duration_ms
+        _log_audit(response, input_data, client_host, path, tool_id)
+        return response
 
     danger_level: str | None = "read_only" if is_safe else "write"
     requires_confirmation: bool = False
 
     # 3. Phase 1: only allow safe tools with an executor
     if not is_safe:
-        return {
+        response = {
             "ok": False,
             "tool_id": tool_id,
             "danger_level": danger_level,
@@ -939,10 +957,14 @@ async def path_execute_tool_endpoint(
             "result": None,
             "error": {"code": "tool_not_found", "message": "Tool not found or not executable"},
         }
+        duration_ms = _calc_duration_ms(start_ms)
+        response["duration_ms"] = duration_ms
+        _log_audit(response, input_data, client_host, path, tool_id)
+        return response
 
     executor = _TOOL_EXECUTORS.get(tool_id)
     if not executor:
-        return {
+        response = {
             "ok": False,
             "tool_id": tool_id,
             "danger_level": danger_level,
@@ -951,6 +973,10 @@ async def path_execute_tool_endpoint(
             "result": None,
             "error": {"code": "tool_not_found", "message": f"No executor for tool: {tool_id}"},
         }
+        duration_ms = _calc_duration_ms(start_ms)
+        response["duration_ms"] = duration_ms
+        _log_audit(response, input_data, client_host, path, tool_id)
+        return response
 
     # 4. Execute
     try:
@@ -961,7 +987,7 @@ async def path_execute_tool_endpoint(
         ok = result.get("ok", False)
         error = None if ok else {"code": "execution_failed", "message": result.get("error", str(result))}
 
-        return {
+        response = {
             "ok": ok,
             "tool_id": tool_id,
             "danger_level": danger_level,
@@ -971,12 +997,14 @@ async def path_execute_tool_endpoint(
             "error": error,
             "duration_ms": duration_ms,
         }
+        _log_audit(response, input_data, client_host, path, tool_id)
+        return response
     except Exception as exc:
         duration_ns = time.perf_counter_ns() - start_ms
         duration_ms = round(duration_ns / 1_000_000, 2)
         logger.exception("path_execute_tool_exception tool=%s", tool_id)
 
-        return {
+        response = {
             "ok": False,
             "tool_id": tool_id,
             "danger_level": danger_level,
@@ -986,6 +1014,8 @@ async def path_execute_tool_endpoint(
             "error": {"code": "execution_error", "message": str(exc)},
             "duration_ms": duration_ms,
         }
+        _log_audit(response, input_data, client_host, path, tool_id)
+        return response
 
 
 @router.get("/v1/models/{model_id}/tools")
@@ -1049,3 +1079,34 @@ async def audit_log_endpoint(
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _calc_duration_ms(start_ns: float) -> float:
+    """Calculate duration in milliseconds from a start timestamp (perf_counter_ns)."""
+    duration_ns = time.perf_counter_ns() - start_ns
+    return round(duration_ns / 1_000_000, 2)
+
+
+def _log_audit(response: dict[str, Any], input_data: dict[str, Any],
+               client_host: str | None, path: str, tool_id: str) -> None:
+    """Record a tool execution audit event to the JSONL audit log."""
+    event_id = str(uuid.uuid4())
+    event: dict[str, Any] = {
+        "event_id": event_id,
+        "timestamp": _now_iso(),
+        "event_type": "tool_execution",
+        "tool_id": tool_id,
+        "path": path,
+        "client_host": client_host,
+        "input": input_data,
+        "output": {
+            "ok": response.get("ok", False),
+            "tool_id": response.get("tool_id"),
+            "danger_level": response.get("danger_level"),
+            "requires_confirmation": response.get("requires_confirmation"),
+            "result": response.get("result"),
+            "error": response.get("error"),
+        },
+        "duration_ms": response.get("duration_ms"),
+    }
+    _audit_log(event)
