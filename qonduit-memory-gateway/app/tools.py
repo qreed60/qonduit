@@ -615,3 +615,57 @@ def validate_tool_arguments(
                 return False, f"invalid_arguments: field '{field}' expected {schema.get('type')}"
 
     return True, None
+
+
+# ---------------------------------------------------------------------------
+# Executable safe tools — tools that have a registered executor
+# ---------------------------------------------------------------------------
+
+EXECUTABLE_SAFE_TOOLS: set[str] = {
+    "rag_project_list",
+    "rag_collection_list",
+    "rag_search",
+    "gateway_health",
+    "model_list",
+    "rag_document_list",
+    "rag_document_chunks",
+}
+
+
+def list_tools_with_metadata() -> list[dict[str, Any]]:
+    """Return all tool definitions enriched with stable snake_case metadata fields.
+
+    Preserves all existing camelCase fields for backward compatibility.
+    Adds: id, danger_level, requires_confirmation, input_schema,
+          output_schema, executable.
+    """
+    result: list[dict[str, Any]] = []
+    for tool in list_tools():
+        enriched: dict[str, Any] = dict(tool)  # shallow copy preserves all fields
+
+        # id — canonical identifier (same as name)
+        enriched["id"] = tool["name"]
+
+        # danger_level — derived from destructive/readOnly flags
+        if tool.get("destructive", False):
+            enriched["danger_level"] = "destructive"
+        elif tool.get("readOnly", True):
+            enriched["danger_level"] = "read_only"
+        else:
+            enriched["danger_level"] = "write"
+
+        # requires_confirmation — snake_case alias of requiresConfirmation
+        enriched["requires_confirmation"] = tool.get("requiresConfirmation", False)
+
+        # input_schema — the OpenAI function schema
+        enriched["input_schema"] = tool.get("schema")
+
+        # output_schema — not yet modeled for any tool
+        enriched["output_schema"] = None
+
+        # executable — True if the tool is a safe tool with a registered executor
+        enriched["executable"] = tool["name"] in EXECUTABLE_SAFE_TOOLS
+
+        result.append(enriched)
+
+    return result

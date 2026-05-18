@@ -31,6 +31,7 @@ from .tools import (
     SAFE_TOOLS,
     get_tool,
     list_tools,
+    list_tools_with_metadata,
     is_safe_tool,
     is_destructive_tool,
     validate_tool_arguments,
@@ -516,8 +517,8 @@ async def _check_dependency_health() -> dict[str, Any]:
 
 @router.get("/v1/tools")
 async def list_tools_endpoint() -> dict[str, Any]:
-    """Return all known tool definitions (frontend-friendly)."""
-    return {"ok": True, "tools": list_tools()}
+    """Return all known tool definitions (frontend-friendly, with metadata)."""
+    return {"ok": True, "tools": list_tools_with_metadata()}
 
 
 @router.get("/v1/tools/status")
